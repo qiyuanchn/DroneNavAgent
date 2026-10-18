@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vlm_nav"
+version = "0.1.0"
+description = "VLM-in-the-loop semantic navigation agent for 3D Gaussian splatting scenes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "BSD-3-Clause" }
+keywords = ["vlm", "navigation", "3dgs", "robotics", "agent"]
+dependencies = [
+  "numpy>=1.24",
+  "torch>=2.0",
+  "Pillow>=9.0",
+]
+
+[project.optional-dependencies]
+# Local Hugging Face inference (HFLocalVLM).
+hf = ["transformers>=4.45", "accelerate>=0.30"]
+# The OpenAI-compatible backend uses urllib from the standard library.
+openai = []
+# stdio MCP server.
+mcp = ["mcp>=1.0", "anyio>=4.0"]
+test = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+include = ["vlm_nav*"]
+exclude = ["tests*", "scripts*", "serving*", "data*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

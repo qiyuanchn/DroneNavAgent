@@ -1,0 +1,36 @@
+# Python / build artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Generated experiment artifacts (keep the small data/phase1 fixture)
+outputs/
+/models/
+/model/
+*.log
+
+# Checkpoints / scene payloads
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.spz
+
+# Environments and secrets
+.venv/
+venv/
+.env
+.env.*
+!.env.example
