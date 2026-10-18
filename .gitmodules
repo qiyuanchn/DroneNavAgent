@@ -1,0 +1,3 @@
+[submodule "third_party/diffaero"]
+	path = third_party/diffaero
+	url = git@github.com:zxh0916/diffaero.git
