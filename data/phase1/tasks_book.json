@@ -1,0 +1,20 @@
+[
+  {
+    "name": "book_near",
+    "instruction": "找到木桌上的书，飞到它旁边停下",
+    "target_name": "book",
+    "target_pos": [-0.4, 0.6, 0.6],
+    "target_radius": 0.3,
+    "start_pos": [-1.5, 0.0, 1.0],
+    "success_dist": 0.9
+  },
+  {
+    "name": "book_far",
+    "instruction": "找到木桌上的书，飞到它旁边停下",
+    "target_name": "book",
+    "target_pos": [-0.4, 0.6, 0.6],
+    "target_radius": 0.3,
+    "start_pos": [-2.8, 0.0, 1.0],
+    "success_dist": 1.2
+  }
+]
