@@ -972,7 +972,8 @@ class SplatWorldDepthTest(unittest.TestCase):
         u = (float(cols.float().mean()) + 0.5) / world.width * 1000.0
         v = (float(rows.float().mean()) + 0.5) / world.height * 1000.0
         reply = json.dumps(
-            {"candidates": [{"box": [u - 40.0, v - 40.0, 80.0, 80.0], "confidence": 0.8}]}
+            {"candidates": [{"box": [u - 40.0, v - 40.0, 80.0, 80.0], "confidence": 0.8,
+                             "attrs": {"color": "red"}, "size_m": 0.5}]}
         )
         grounded = ground_target(
             ctx,

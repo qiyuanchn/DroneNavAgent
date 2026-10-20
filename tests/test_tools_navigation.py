@@ -1111,6 +1111,25 @@ class ApproachCandidateTest(unittest.TestCase):
         self.assertEqual(result.data["outcome"], "arrived")
         self.assertNotEqual(len(ctx.world.applied), 0)
 
+    def test_an_instance_suspect_candidate_is_not_approached(self):
+        """A grounding-time instance check can condemn a box (wall/background
+        or an ambiguous second instance): the approach must refuse it instead
+        of flying to the wrong place."""
+        ctx = make_context(FakeWorld())
+        store_candidate(ctx, "cand_1", position=[4.0, 0.0, 0.0])
+        record = ctx.extra[CANDIDATE_STORE_KEY]["cand_1"]
+        record["instance_suspect"] = True
+        record["instance_suspect_reason"] = "description_mismatch"
+
+        result = registry().call("approach_candidate", {"candidate_id": "cand_1"}, ctx)
+
+        self.assertEqual(result.status, STATUS_BLOCKED)
+        self.assertEqual(result.data["reason"], "candidate_instance_suspect")
+        self.assertEqual(result.data["blocked_reason"], "candidate_instance_suspect")
+        self.assertEqual(result.data["next_action"]["tool"], "ground_target")
+        self.assertEqual(ctx.world.applied, [])
+        self.assertNotIn("nav_tasks", ctx.extra)
+
     def test_a_long_approach_is_flown_in_segments(self):
         ctx = make_context(FakeWorld())
         store_candidate(ctx, "cand_1", position=[20.0, 0.0, 0.0])
@@ -2779,7 +2798,13 @@ class GroundTargetChainTest(unittest.TestCase):
 
     def test_a_candidate_without_a_position_is_reported_as_unresolved(self):
         ctx = make_context(FakeWorld(depth=None))  # no depth, no distance_m given
-        grounded = self.ground(ctx)
+        # size/attrs are present so the candidate is instance-verified; this
+        # test is about the missing position, not the instance gate
+        grounded = self.ground(
+            ctx,
+            '{"candidates": [{"box": [450, 450, 100, 100], '
+            '"attrs": {"color": "gray"}, "size_m": 0.5}]}',
+        )
         self.assertNotIn("position_flu", grounded.data["candidates"][0])
 
         result = registry().call("approach_candidate", {"candidate_id": "cand_1"}, ctx)

@@ -1055,7 +1055,7 @@ class MechanismSwitchTest(unittest.TestCase):
         self.assertEqual(
             {"recovery": "off", "state_block": "off", "search_skill": "off",
              "spatial_memory": "on", "episodic_memory": "on",
-             "identity_memory": "on"},
+             "identity_memory": "on", "detector": "off"},
             summary["switches"]["requested"],
         )
         applied = summary["switches"]["applied"]
@@ -1075,7 +1075,7 @@ class MechanismSwitchTest(unittest.TestCase):
         self.assertEqual(
             {"recovery": "on", "state_block": "on", "search_skill": "on",
              "spatial_memory": "on", "episodic_memory": "on",
-             "identity_memory": "on"},
+             "identity_memory": "on", "detector": "off"},
             summary["switches"]["requested"],
         )
         applied = summary["switches"]["applied"]

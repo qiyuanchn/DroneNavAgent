@@ -204,6 +204,7 @@ from vlm_nav.tools import (
     parse_tool_call,
     tool_state,
 )
+from vlm_nav.detectors import resolve_detector
 from vlm_nav.vlm import MockVLM, frame_to_pil, make_backend
 from vlm_nav.world import (
     EnvWorld,
@@ -517,6 +518,7 @@ def switch_report(args: argparse.Namespace) -> dict:
         "spatial_memory": switch_token(getattr(args, "memory_spatial", DEFAULT_SWITCH)),
         "episodic_memory": switch_token(getattr(args, "memory_episodic", DEFAULT_SWITCH)),
         "identity_memory": switch_token(getattr(args, "memory_identity", DEFAULT_SWITCH)),
+        "detector": str(getattr(args, "detector", "off") or "off"),
     }
 
 
@@ -942,6 +944,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="model name for the openai backend")
     parser.add_argument("--base-url", type=str, default=None)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--detector", type=str, default="off",
+                        help="optional grounding detector: off (VLM-only) | "
+                             "sam3 (SAM3 masks + DINOv2 crop features) | "
+                             "module:factory")
     parser.add_argument("--max-new-tokens", type=int, default=192)
     parser.add_argument("--image-size", type=int, nargs=2, default=(640, 360),
                         metavar=("W", "H"), help="VLM input resize")
@@ -2783,6 +2789,26 @@ def run_episode(world: Any, vlm: Any, args: argparse.Namespace, out_dir: Path,
         identity_memory=switch_enabled(requested["identity_memory"]),
     )
     seed_memory_identities(memory, ctx_extra)
+    # optional independent detection backend: off is the VLM-only path; a
+    # backend that cannot load is reported and the episode keeps running
+    detector_spec = str(getattr(args, "detector", "off") or "off")
+    if detector_spec.strip().lower() not in ("", "off", "none", "null", "0", "false"):
+        try:
+            detector = resolve_detector(
+                detector_spec,
+                device=(
+                    args.device
+                    if str(getattr(args, "device", "cpu")).startswith("cuda")
+                    else "cuda:0"
+                ),
+            )
+            ctx_extra = dict(ctx_extra or {})
+            ctx_extra["perception.detector"] = detector
+            print(f"[vlm_nav_tools] detector: {detector_spec} "
+                  f"(available={bool(detector.available())})", flush=True)
+        except Exception as exc:  # noqa: BLE001 - an optional backend must not stop the run
+            print(f"[vlm_nav_tools] detector {detector_spec!r} failed to build: "
+                  f"{type(exc).__name__}: {exc}", flush=True)
     if registry_factory is not None:
         built = registry_factory(modules, vlm)
         if isinstance(built, tuple):

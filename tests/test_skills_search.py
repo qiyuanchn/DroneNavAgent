@@ -253,7 +253,7 @@ def make_ctx(world, **extra):
 
 CANDIDATES = (
     '{"candidates": [{"box": [400, 400, 600, 600], "confidence": 0.85, '
-    '"attrs": {"color": "red"}}]}'
+    '"attrs": {"color": "red"}, "anchor_visible": true}]}'
 )
 
 

@@ -3142,5 +3142,479 @@ class GroundingStallTest(unittest.TestCase):
         self.assertFalse(result.data.get("repeated_grounding", False))
 
 
+class InstanceConsistencyTest(unittest.TestCase):
+    """Grounding must not hand the agent the wall or a second instance.
+
+    The final2 attribution: far candidates reported a 3 m range but landed
+    10-22 m from the instructed stage - the box was the wall/support surface,
+    not the object. These tests pin the three gates: the model's own
+    description check, the box-geometry/range contradiction, and the multi-
+    instance rank.
+    """
+
+    class NoRetryVLM(FakeVLM):
+        allow_box_retry = False
+
+    def _ground(self, reply, *, world=None, instruction="黑色办公椅"):
+        world = world or FakeWorld(
+            width=200, height=100, yaw_deg=0.0, hfov_deg=90.0,
+            depth=lambda pixel: 3.0 if float(pixel[0]) >= 600.0 else 12.0,
+        )
+        ctx = make_ctx(world)
+        observed = observe(ctx, {"mode": "forward"})
+        result = ground_target(
+            ctx,
+            {"instruction": instruction, "observation_id": observed.data["observation_id"]},
+            vlm=self.NoRetryVLM(reply),
+        )
+        return result, ctx
+
+    def test_a_wall_box_is_marked_suspect_and_the_target_stays_approvable(self):
+        reply = json.dumps(
+            {
+                "candidates": [
+                    {
+                        "box": [650, 300, 750, 700],
+                        "attrs": {"color": "black"},
+                        "confidence": 0.9,
+                        "distance_m": 3.0,
+                        "size_m": 0.9,
+                        "matches_description": True,
+                        "match_reason": "black office chair",
+                    },
+                    {
+                        "box": [0, 0, 600, 1000],
+                        "attrs": {"color": "white"},
+                        "confidence": 0.8,
+                        "distance_m": 3.0,
+                        "matches_description": False,
+                        "match_reason": "the wall behind the chair",
+                    },
+                ]
+            }
+        )
+        result, ctx = self._ground(reply)
+
+        self.assertEqual(result.status, "ok", result.data)
+        candidates = {item["id"]: item for item in result.data["candidates"]}
+        self.assertFalse(candidates["cand_1"]["instance_suspect"])
+        self.assertEqual(candidates["cand_1"]["instance_rank"], 1)
+        self.assertTrue(candidates["cand_2"]["instance_suspect"])
+        self.assertIn("description_mismatch", candidates["cand_2"]["instance_suspect_reason"])
+        self.assertIn("attribute_conflict", candidates["cand_2"]["instance_suspect_reason"])
+        self.assertEqual(result.data["instance_filter"]["approvable"], ["cand_1"])
+        # the suspect box stays in the store as evidence, but is not offered
+        store = ctx.extra[CANDIDATE_STORE_KEY]
+        self.assertTrue(store["cand_2"]["instance_suspect"])
+
+    def test_two_matching_instances_only_the_best_is_approvable(self):
+        world = FakeWorld(
+            width=200, height=100, yaw_deg=0.0, hfov_deg=90.0,
+            depth=lambda pixel: 3.0 if float(pixel[0]) < 300.0 else 4.0,
+        )
+        reply = json.dumps(
+            {
+                "candidates": [
+                    {
+                        "box": [100, 300, 200, 700],
+                        "attrs": {"color": "brown"},
+                        "confidence": 0.9,
+                        "distance_m": 3.0,
+                        "size_m": 0.9,
+                        "matches_description": True,
+                    },
+                    {
+                        "box": [600, 300, 700, 700],
+                        "attrs": {"color": "brown"},
+                        "confidence": 0.7,
+                        "distance_m": 4.0,
+                        "size_m": 0.9,
+                        "matches_description": True,
+                    },
+                ]
+            }
+        )
+        result, _ctx = self._ground(reply, world=world, instruction="椅子")
+
+        self.assertEqual(result.status, "ok", result.data)
+        candidates = {item["id"]: item for item in result.data["candidates"]}
+        self.assertFalse(candidates["cand_1"]["instance_suspect"])
+        self.assertTrue(candidates["cand_2"]["instance_suspect"])
+        self.assertEqual(candidates["cand_2"]["instance_suspect_reason"], "not_best_match")
+        self.assertEqual(result.data["instance_filter"]["approvable"], ["cand_1"])
+
+    def test_a_full_width_box_at_three_metres_is_not_a_chair(self):
+        """A box 5.6 m wide at the model's 3 m range is the wall/support
+        surface: the size prior turns the far-candidate failure into a
+        suspect flag instead of a 10-22 m flight leg."""
+        world = FakeWorld(
+            width=200, height=100, yaw_deg=0.0, hfov_deg=86.0, depth=3.0,
+        )
+        reply = json.dumps(
+            {
+                "candidates": [
+                    {
+                        "box": [0, 100, 1000, 500],
+                        "attrs": {"color": "brown"},
+                        "confidence": 0.9,
+                        "distance_m": 3.0,
+                        "matches_description": True,
+                    }
+                ]
+            }
+        )
+        result, _ctx = self._ground(reply, world=world, instruction="椅子")
+
+        candidate = result.data["candidates"][0]
+        self.assertTrue(candidate["instance_suspect"])
+        self.assertEqual(
+            candidate["instance_size_conflict"]["kind"], "distance_size_prior"
+        )
+        self.assertGreater(candidate["instance_size_conflict"]["ratio"], 4.0)
+        self.assertEqual(result.data["instance_filter"]["approvable"], [])
+
+    def test_a_box_only_retry_without_attributes_is_unverified_not_approvable(self):
+        """The final3 bypass: 12 retry/crop candidates carried no match, size
+        or attribute fields, so every deterministic gate was silent and they
+        passed. An unverified candidate is now suspect; ``matches_description:
+        true`` does not make it verified."""
+        class RetryVLM(FakeVLM):
+            def __init__(self):
+                super().__init__(None)
+                self.replies = [
+                    '{"candidates": []}',
+                    '{"candidates": [{"box": [450, 450, 100, 100], '
+                    '"confidence": 0.8, "matches_description": true}]}',
+                ]
+
+            def decide(self, frames, system_prompt, user_prompt, context=None):
+                self.calls.append(
+                    {"frames": frames, "system_prompt": system_prompt,
+                     "user_prompt": user_prompt, "context": context}
+                )
+                return self.replies.pop(0)
+
+        world = FakeWorld(position=(0.0, 0.0, 0.0), yaw_deg=0.0, depth=4.0)
+        ctx = make_ctx(world)
+        observed = observe(ctx, {"mode": "forward"})
+        result = ground_target(
+            ctx,
+            {"instruction": "黑色办公椅", "observation_id": observed.data["observation_id"]},
+            vlm=RetryVLM(),
+        )
+
+        self.assertEqual(result.status, "ok", result.data)
+        self.assertIs(result.data["grounding_retry"]["recovered"], True)
+        candidate = result.data["candidates"][0]
+        self.assertTrue(candidate["instance_suspect"])
+        self.assertIn("attribute_unknown:color", candidate["instance_suspect_reason"])
+        self.assertEqual(result.data["instance_filter"]["approvable"], [])
+        # the model's own true flag is recorded, never used to approve
+        self.assertEqual(result.data["instance_filter"]["model_match"]["true"], 1)
+
+    def test_two_views_of_different_sized_boxes_do_not_triangulate_an_instance(self):
+        """Final3's accepted error: two bearings met at a point 23 m out while
+        one box also covered the wall. The two views' implied physical sizes
+        disagree by 4x, so the triangulated candidate is suspect even though the
+        model said ``matches_description: true``."""
+        world = FakeWorld(position=(0.0, 0.0, 1.0), yaw_deg=0.0, depth=5.0, hfov_deg=90.0)
+        ctx = make_ctx(world)
+        first_obs = observe(ctx, {"mode": "forward"})
+        first = ground_target(
+            ctx,
+            {"instruction": "the red object", "observation_id": first_obs.data["observation_id"]},
+            vlm=FakeVLM(
+                '{"candidates": [{"box": [400, 450, 100, 100], "attrs": {"color": "red"}, '
+                '"distance_m": 5.0, "matches_description": true}]}'
+            ),
+        )
+        self.assertFalse(first.data["candidates"][0]["instance_suspect"], first.data)
+
+        world.state.position_flu = np.asarray([5.0, 5.0, 1.0])
+        world.state.yaw_rad = math.radians(-90.0)
+        second_obs = observe(ctx, {"mode": "forward"})
+        second = ground_target(
+            ctx,
+            {"instruction": "the red object", "observation_id": second_obs.data["observation_id"]},
+            vlm=FakeVLM(
+                '{"candidates": [{"box": [100, 450, 400, 100], "attrs": {"color": "red"}, '
+                '"distance_m": 5.0, "matches_description": true}]}'
+            ),
+        )
+
+        candidate = second.data["candidates"][0]
+        self.assertEqual(candidate["position_source"], "triangulated", candidate)
+        self.assertTrue(candidate["instance_suspect"], candidate)
+        self.assertEqual(
+            candidate["instance_two_view_conflict"]["kind"], "two_view_size"
+        )
+        self.assertGreaterEqual(candidate["instance_two_view_conflict"]["ratio"], 2.5)
+        self.assertEqual(second.data["instance_filter"]["approvable"], [])
+
+
+    def test_relation_anchor_covisibility_separates_a_desk_from_a_chair(self):
+        """The seed43/61 failure: a relation stage accepted an instance that the
+        instruction's anchor could not confirm. A desk candidate whose frame
+        shows the bookshelf and sits 1.1 m from it is approvable; a chair
+        candidate seen with the bookshelf behind the camera and 4.9 m away is
+        suspect, so it cannot be approached or confirmed."""
+        anchor = {
+            "id": "cand_9",
+            "instruction": "带书的书架",
+            "subtask_key": "stage:bookshelf",
+            "position_flu": [3.0, 0.0, 0.0],
+            "status": "sighted",
+            "matches_description": True,
+            "attrs": {"content": "books"},
+            "size_m": 1.2,
+            "distance_m": 3.0,
+        }
+        desk_world = FakeWorld(
+            width=200, height=100, yaw_deg=0.0, hfov_deg=90.0,
+            depth=lambda pixel: 2.0 if float(pixel[0]) >= 550.0 else 6.0,
+        )
+        desk_ctx = make_ctx(desk_world)
+        desk_ctx.extra[CANDIDATE_STORE_KEY] = {"cand_9": dict(anchor)}
+        desk_obs = observe(desk_ctx, {"mode": "forward"})
+        desk = ground_target(
+            desk_ctx,
+            {
+                "instruction": "书架旁的课桌",
+                "observation_id": desk_obs.data["observation_id"],
+            },
+            vlm=self.NoRetryVLM(
+                json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "box": [560, 400, 640, 700],
+                                "attrs": {"object_type": "desk"},
+                                "confidence": 0.9,
+                                "distance_m": 2.0,
+                                "size_m": 1.2,
+                                "matches_description": True,
+                            }
+                        ]
+                    }
+                )
+            ),
+        )
+
+        self.assertEqual(desk.status, "ok", desk.data)
+        desk_candidate = desk.data["candidates"][0]
+        self.assertFalse(desk_candidate["instance_suspect"], desk_candidate)
+        self.assertIsNone(desk_candidate.get("instance_anchor_conflict"))
+        self.assertEqual(desk_candidate["instance_anchor_visibility"]["source"], "geometry")
+        self.assertIs(desk_candidate["instance_anchor_visibility"]["visible"], True)
+        self.assertEqual(desk.data["instance_filter"]["anchor_relation"]["anchor"], "书架")
+        self.assertEqual(desk.data["instance_filter"]["anchors"], ["cand_9"])
+        self.assertEqual(desk.data["instance_filter"]["approvable"], ["cand_2"])
+
+        chair_world = FakeWorld(
+            width=200, height=100, yaw_deg=180.0, hfov_deg=90.0,
+            depth=lambda pixel: 2.0 if float(pixel[0]) >= 550.0 else 6.0,
+        )
+        chair_ctx = make_ctx(chair_world)
+        chair_ctx.extra[CANDIDATE_STORE_KEY] = {"cand_9": dict(anchor)}
+        chair_obs = observe(chair_ctx, {"mode": "forward"})
+        chair = ground_target(
+            chair_ctx,
+            {
+                "instruction": "书架旁的课桌",
+                "observation_id": chair_obs.data["observation_id"],
+            },
+            vlm=self.NoRetryVLM(
+                json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "box": [560, 400, 640, 700],
+                                "attrs": {"object_type": "chair"},
+                                "confidence": 0.9,
+                                "distance_m": 2.0,
+                                "size_m": 0.9,
+                                "matches_description": True,
+                                "anchor_visible": False,
+                            }
+                        ]
+                    }
+                )
+            ),
+        )
+
+        self.assertEqual(chair.status, "ok", chair.data)
+        chair_candidate = chair.data["candidates"][0]
+        self.assertTrue(chair_candidate["instance_suspect"], chair_candidate)
+        self.assertIn("anchor_not_visible", chair_candidate["instance_suspect_reason"])
+        self.assertIn(
+            "anchor_distance_conflict", chair_candidate["instance_suspect_reason"]
+        )
+        self.assertIs(chair_candidate["instance_anchor_visibility"]["visible"], False)
+        self.assertEqual(chair.data["instance_filter"]["approvable"], [])
+
+    def test_a_relation_candidate_far_from_a_visible_anchor_is_suspect(self):
+        """Adjacency is a 3 m relation, not the old 8 m any-anchor bound: a
+        candidate 4 m from the visible bookshelf cannot be "next to" it."""
+        world = FakeWorld(
+            width=200, height=100, yaw_deg=0.0, hfov_deg=90.0, depth=5.6
+        )
+        ctx = make_ctx(world)
+        ctx.extra[CANDIDATE_STORE_KEY] = {
+            "cand_9": {
+                "id": "cand_9",
+                "instruction": "带书的书架",
+                "subtask_key": "stage:bookshelf",
+                "position_flu": [3.0, 0.0, 0.0],
+                "status": "sighted",
+                "attrs": {"content": "books"},
+            }
+        }
+        observed = observe(ctx, {"mode": "forward"})
+        result = ground_target(
+            ctx,
+            {
+                "instruction": "书架旁的课桌",
+                "observation_id": observed.data["observation_id"],
+            },
+            vlm=self.NoRetryVLM(
+                json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "box": [0, 400, 100, 700],
+                                "attrs": {"object_type": "desk"},
+                                "confidence": 0.9,
+                                "distance_m": 5.6,
+                                "size_m": 1.2,
+                                "matches_description": True,
+                                "anchor_visible": True,
+                            }
+                        ]
+                    }
+                )
+            ),
+        )
+
+        self.assertEqual(result.status, "ok", result.data)
+        candidate = result.data["candidates"][0]
+        self.assertTrue(candidate["instance_suspect"], candidate)
+        self.assertEqual(
+            candidate["instance_anchor_conflict"]["kind"], "anchor_distance"
+        )
+        self.assertEqual(candidate["instance_anchor_conflict"]["limit_m"], 3.0)
+        self.assertGreater(candidate["instance_anchor_conflict"]["distance_m"], 3.0)
+        self.assertIs(candidate["instance_anchor_visibility"]["visible"], True)
+        self.assertIn("anchor_distance_conflict", candidate["instance_suspect_reason"])
+        self.assertEqual(result.data["instance_filter"]["approvable"], [])
+
+    def test_anchor_visibility_answer_carries_when_no_anchor_position_is_known(self):
+        """A first-stage relation ("窗边的木椅") has no earlier candidate to
+        project, so the grounding answer's ``anchor_visible`` decides: false is
+        suspect, true is approvable."""
+        world = FakeWorld(
+            width=200, height=100, yaw_deg=0.0, hfov_deg=90.0, depth=2.0
+        )
+        ctx = make_ctx(world)
+        observed = observe(ctx, {"mode": "forward"})
+        instruction = "窗边的木椅"
+
+        blocked = ground_target(
+            ctx,
+            {"instruction": instruction, "observation_id": observed.data["observation_id"]},
+            vlm=self.NoRetryVLM(
+                json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "box": [450, 400, 550, 700],
+                                "attrs": {"material": "wood"},
+                                "distance_m": 2.0,
+                                "size_m": 0.9,
+                                "matches_description": True,
+                                "anchor_visible": False,
+                            }
+                        ]
+                    }
+                )
+            ),
+        )
+        blocked_candidate = blocked.data["candidates"][0]
+        self.assertTrue(blocked_candidate["instance_suspect"], blocked_candidate)
+        self.assertIn("anchor_not_visible", blocked_candidate["instance_suspect_reason"])
+        self.assertEqual(
+            blocked_candidate["instance_anchor_visibility"]["source"], "model"
+        )
+        self.assertIs(blocked_candidate["instance_anchor_visibility"]["visible"], False)
+        self.assertEqual(blocked.data["instance_filter"]["approvable"], [])
+
+        allowed = ground_target(
+            ctx,
+            {"instruction": instruction, "observation_id": observed.data["observation_id"]},
+            vlm=self.NoRetryVLM(
+                json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "box": [450, 400, 550, 700],
+                                "attrs": {"material": "wood"},
+                                "distance_m": 2.0,
+                                "size_m": 0.9,
+                                "matches_description": True,
+                                "anchor_visible": True,
+                            }
+                        ]
+                    }
+                )
+            ),
+        )
+        allowed_candidate = allowed.data["candidates"][0]
+        self.assertFalse(allowed_candidate["instance_suspect"], allowed_candidate)
+        self.assertEqual(allowed.data["instance_filter"]["approvable"], ["cand_2"])
+
+
+    def test_a_stage_goal_with_bare_edge_keeps_its_relation_anchor(self):
+        """The seed61 bypass: re-grounding with the stage goal
+        "在卧室窗边找到木椅（地标）" used the bare ``边`` form, which the first
+        parser missed; the lamp candidate then slipped through. The goal form
+        must keep the window anchor and block an anchor-invisible candidate."""
+        world = FakeWorld(
+            width=200, height=100, yaw_deg=0.0, hfov_deg=90.0, depth=2.0
+        )
+        ctx = make_ctx(world)
+        observed = observe(ctx, {"mode": "forward"})
+        result = ground_target(
+            ctx,
+            {
+                "instruction": "在卧室窗边找到木椅（地标） - 一把木制靠背椅",
+                "observation_id": observed.data["observation_id"],
+            },
+            vlm=self.NoRetryVLM(
+                json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "box": [450, 400, 550, 700],
+                                "attrs": {"material": "wood"},
+                                "distance_m": 2.0,
+                                "size_m": 0.9,
+                                "matches_description": True,
+                                "anchor_visible": False,
+                            }
+                        ]
+                    }
+                )
+            ),
+        )
+
+        self.assertEqual(result.status, "ok", result.data)
+        self.assertEqual(
+            result.data["instance_filter"]["anchor_relation"]["anchor"], "卧室窗"
+        )
+        candidate = result.data["candidates"][0]
+        self.assertTrue(candidate["instance_suspect"], candidate)
+        self.assertIn("anchor_not_visible", candidate["instance_suspect_reason"])
+        self.assertEqual(result.data["instance_filter"]["approvable"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

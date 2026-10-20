@@ -682,6 +682,30 @@ class ConfirmCandidateTest(unittest.TestCase):
         self.assertFalse(result.data["position_check"].get("candidate_distance_conflict") is None)
         self.assertEqual(record["distance_uncertain_confirms"], 1)
 
+    def test_an_instance_suspect_candidate_is_refused_before_any_view(self):
+        """A box the grounding instance check condemned is not confirmed: a new
+        view cannot turn the wall/background into the instructed object."""
+        world = ConfirmWorld(position=(0.0, 0.0, 0.0), target=(1.5, 0.0, 0.0), depth=1.5)
+        vlm = ScriptedVLM([ACCEPTED])
+        ctx = make_context(world, vlm)
+        registry = make_registry(vlm)
+        record = store_candidate(ctx, position=(1.5, 0.0, 0.0))
+        record.update(
+            instance_suspect=True,
+            instance_suspect_reason="description_mismatch",
+        )
+
+        result = registry.call(
+            "confirm_candidate",
+            {"candidate_id": "cand_1", "instruction": "the wooden cabinet"},
+            ctx,
+        )
+
+        self.assertEqual(result.status, STATUS_BLOCKED)
+        self.assertEqual(result.data["reason"], "candidate_instance_suspect")
+        self.assertEqual(result.data["next_action"]["tool"], "ground_target")
+        self.assertEqual(vlm.calls, [])
+
     def test_a_second_distance_uncertain_confirm_stalls_and_requires_reground(self):
         """The same stale candidate confirmed twice is downgraded, not retried.
 

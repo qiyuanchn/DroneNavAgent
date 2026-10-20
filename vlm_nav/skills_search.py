@@ -1001,6 +1001,15 @@ def _ground_summary(result: ToolResult) -> dict:
         summary["tighten_retry"] = _kept(
             tighten, ("attempted", "accepted", "vlm_calls")
         )
+    if isinstance(data.get("instance_filter"), Mapping):
+        instance_filter = data["instance_filter"]
+        summary["instance_filter"] = _kept(
+            instance_filter, ("n_candidates", "n_suspect", "approvable", "reasons")
+        )
+        summary["instance_suspect"] = [
+            dict(item) for item in instance_filter.get("suspect") or []
+            if isinstance(item, Mapping)
+        ]
     if isinstance(data.get("strategy_change"), Mapping):
         summary["strategy_change"] = dict(data["strategy_change"])
     candidates = data.get("candidates") or []
@@ -1159,6 +1168,14 @@ def _candidate_summary(candidate: Mapping) -> dict:
             "distance_source",
             "distance_uncertain",
             "distance_conflict",
+            "instance_rank",
+            "instance_suspect",
+            "instance_suspect_reason",
+            "matches_description",
+            "match_reason",
+            "size_m",
+            "instance_size_conflict",
+            "instance_anchor_conflict",
             "triangulation",
             "view_change_advice",
             "border_large_box",
@@ -1184,6 +1201,8 @@ def _candidate_trustworthy(candidate: Mapping) -> bool:
     """
     if str(candidate.get("status") or "") == "rejected":
         return False
+    if bool(candidate.get("instance_suspect")):
+        return False
     if str(candidate.get("position_source") or "") == "triangulated":
         return True
     return not bool(candidate.get("distance_uncertain")) and str(
@@ -1204,6 +1223,7 @@ def _best_candidate(candidates: list) -> dict:
     return max(
         (dict(item) for item in candidates if isinstance(item, Mapping)),
         key=lambda item: (
+            0 if item.get("instance_suspect") else 1,
             1 if str(item.get("position_source") or "") == "triangulated" else 0,
             _as_float(item.get("confidence"), -1.0) or -1.0,
         ),
@@ -1423,6 +1443,11 @@ def search_target(
                 if any(_candidate_trustworthy(item) for item in found):
                     candidate_id = str(_best_candidate(found).get("id") or "")
                     break
+                if all(item.get("instance_suspect") for item in found):
+                    # every box is the wall/background or an ambiguous second
+                    # instance: this view holds no usable candidate, look in
+                    # the next view instead of reporting one to the agent
+                    continue
                 # every candidate from this view is distance-uncertain: another
                 # heading at the same pose has no baseline to triangulate it, so
                 # do not stop here - fly to an offset viewpoint and ground again
@@ -1491,6 +1516,8 @@ def search_target(
                             found = zoomed_found
                             candidate_id = str(_best_candidate(found).get("id") or "")
                             break
+                        if all(item.get("instance_suspect") for item in zoomed_found):
+                            continue
                         uncertain_found = zoomed_found
                         break
         if reason == "no_vlm_backend":

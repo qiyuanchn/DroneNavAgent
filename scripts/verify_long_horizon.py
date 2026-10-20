@@ -923,6 +923,7 @@ RUNNER_RUN_FLAGS: tuple[tuple[str, str], ...] = (
     ("model", "--model"),
     ("base_url", "--base-url"),
     ("device", "--device"),
+    ("detector", "--detector"),
     ("max_new_tokens", "--max-new-tokens"),
     ("image_size", "--image-size"),
     ("num_threads", "--num-threads"),
@@ -5498,6 +5499,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", type=str, default=None)
     parser.add_argument("--base-url", type=str, default=None, dest="base_url")
     parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--detector", type=str, default=None,
+                        help="optional grounding detector forwarded to the runner: "
+                             "off | sam3 | module:factory")
     parser.add_argument("--max-new-tokens", type=int, default=None, dest="max_new_tokens")
     parser.add_argument("--image-size", type=int, nargs=2, default=None, dest="image_size")
     parser.add_argument("--num-threads", type=int, default=None, dest="num_threads")

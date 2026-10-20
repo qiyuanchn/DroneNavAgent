@@ -678,6 +678,8 @@ def _candidate_ids(ctx: ToolContext, limit: int = 8) -> tuple[list[str], list[st
             continue
         if _candidate_status(entry) == "rejected":
             continue  # a rejected candidate is not offered for another approach
+        if isinstance(entry, dict) and bool(entry.get("instance_suspect")):
+            continue  # wall/background or an ambiguous second instance
         (resolved if _entry_position(entry) is not None else unresolved).append(key)
     return resolved[-limit:], unresolved[-limit:]
 
@@ -705,6 +707,8 @@ def _candidate_position(ctx: ToolContext, candidate_id: Any) -> np.ndarray | Non
             continue
         if _candidate_status(entry) == "rejected":
             return None  # a rejected instance resolves nowhere, tracker or store
+        if isinstance(entry, dict) and bool(entry.get("instance_suspect")):
+            return None  # a wall/background or ambiguous instance has no place to fly to
         pos = _entry_position(entry)
         if pos is not None:
             return pos
@@ -2917,6 +2921,41 @@ def _tool_approach_candidate(ctx: ToolContext, args: dict) -> ToolResult:
                 "hint": (
                     "that candidate was rejected by confirm_candidate: ground the "
                     "target again instead of approaching the rejected place"
+                ),
+                "next_action": _ground_again_action(
+                    ctx, str((record or {}).get("observation_id") or "")
+                ),
+                "available_targets": resolved,
+                "unresolved_targets": unresolved,
+            },
+        )
+    if bool((record or {}).get("instance_suspect")):
+        # the grounding box failed the instance check: it is the wall, a
+        # neighbouring object, or a second ambiguous instance. Flying to it
+        # would burn the leg on the wrong place, so refuse and ask for a fresh
+        # grounding instead (the record stays as evidence in the store).
+        resolved, unresolved = _candidate_ids(ctx)
+        return ToolResult(
+            STATUS_BLOCKED,
+            {
+                "reason": "candidate_instance_suspect",
+                "candidate_id": candidate_id,
+                "status": PROGRESS_BLOCKED,
+                "outcome": "candidate_instance_suspect",
+                "blocked_reason": "candidate_instance_suspect",
+                "progress_m": 0.0,
+                "turn_deg": 0.0,
+                "remaining_m": None,
+                "task_id": "",
+                "last_observation_id": _observation_id(ctx),
+                "instance_suspect_reason": str(
+                    (record or {}).get("instance_suspect_reason") or ""
+                ),
+                "hint": (
+                    "that candidate failed the instance check (it may be the "
+                    "wall/background or a different object): ground the "
+                    "instructed instance again from another view instead of "
+                    "approaching it"
                 ),
                 "next_action": _ground_again_action(
                     ctx, str((record or {}).get("observation_id") or "")

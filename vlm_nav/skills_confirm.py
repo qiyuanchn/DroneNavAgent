@@ -1416,6 +1416,7 @@ def confirm_candidate(
             record for record in store.values()
             if isinstance(record, Mapping)
             and str(record.get("status") or "") != CONFIRMATION_REJECTED
+            and not record.get("instance_suspect")
             and record.get("id")
         ]
         if live:
@@ -1463,6 +1464,32 @@ def confirm_candidate(
                     "ground_target",
                     {"instruction": _instruction(ctx, args)},
                     "a rejected candidate is not re-used: ground the target again",
+                ),
+            },
+        )
+
+    if bool(record.get("instance_suspect")):
+        # the box failed the grounding-time instance check: a confirmation from
+        # a new view cannot turn the wall/background into the instructed object
+        return ToolResult(
+            STATUS_BLOCKED,
+            {
+                "reason": "candidate_instance_suspect",
+                "candidate_id": candidate_id,
+                "verdict": CONFIRMATION_REJECTED,
+                "missing": ["identity"],
+                "instance_suspect_reason": str(
+                    record.get("instance_suspect_reason") or ""
+                ),
+                "hint": (
+                    "that candidate is not the instructed instance (wall, "
+                    "background or a different object); ground the target again "
+                    "from another view instead of confirming it"
+                ),
+                "next_action": _next_action(
+                    "ground_target",
+                    {"instruction": _instruction(ctx, args)},
+                    "a suspect instance is not confirmed: re-ground the target",
                 ),
             },
         )

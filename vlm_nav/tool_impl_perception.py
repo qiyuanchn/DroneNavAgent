@@ -166,6 +166,7 @@ import torch
 import torch.nn.functional as F
 
 from .actions import body_delta_to_world
+from .detectors import DetectorBackend, target_labels
 from .observations import (
     CANDIDATE_ID_TYPE,
     CANDIDATE_STORE_KEY,
@@ -283,6 +284,25 @@ DIRECTION_UNKNOWN = "unknown"
 #: grounding ledger reads it to suggest a concrete direction when a query keeps
 #: coming back empty
 VIEW_COVERAGE_KEY = "perception.view_coverage"
+
+#: ``ctx.extra`` key of the optional detector backend (``vlm_nav.detectors``).
+DETECTOR_CONTEXT_KEY = "perception.detector"
+#: Geometry half of the detector gate: same instance when the boxes overlap
+#: this much, one mostly contains the other, or the proposal fills most of a
+#: slightly larger VLM box (a box that includes the object's background).
+DETECTOR_MATCH_IOU = 0.25
+DETECTOR_MATCH_CONTAINMENT = 0.6
+DETECTOR_PROPOSAL_IN_BOX = 0.8
+DETECTOR_PROPOSAL_AREA_SHARE = 0.5
+#: A detector proposal at/above this score is authoritative: a VLM box that
+#: matches none of them is not the instructed instance and is not offered.
+#: SAM3 is bimodal on these renders (0.03-0.1 on a textureless wall, 0.4-0.9 on
+#: an object), so 0.45 separates the two populations without needing a second
+#: calibration run.
+DETECTOR_AUTHORITATIVE_SCORE = 0.45
+#: At most this many detector-only candidates are added when the VLM reply has
+#: no accepted box (a rescue, not a second candidate list).
+DETECTOR_EXTRA_CANDIDATES = 2
 
 # --------------------------------------------------------------------------
 # grounding attempt ledger (the anti-loop of goal.md section 5)
@@ -454,12 +474,22 @@ POSITION_NO_WORLD = "no_world"
 BOX_ONLY_SYSTEM_PROMPT = (
     "You are the target-grounding module of a drone navigation agent. "
     "Return ONE JSON object and nothing else: "
-    '{"candidates": [{"box": [x1, y1, x2, y2], "confidence": 0.0}]}. '
+    '{"candidates": [{"box": [x1, y1, x2, y2], "attrs": {"color": "...", '
+    '"material": "..."}, "distance_m": 0.0, "size_m": 0.0, '
+    '"matches_description": true, "anchor_visible": true, "confidence": 0.0}]}. '
     "box is a corner box [x1, y1, x2, y2] in normalized 0-1000 image "
     "coordinates (x1, y1 = top-left, x2, y2 = bottom-right). "
-    "Return the box of the target even when you are unsure about its attributes "
-    'or distance. Return {"candidates": []} only when the target is truly not '
-    "visible in the frame."
+    '"attrs" are the visible attributes of the boxed object (colour, material, '
+    'content); "distance_m" is the rough camera-to-object range in metres; '
+    '"size_m" is the object\'s estimated largest dimension in metres; '
+    '"matches_description" must be true only when the box is the instructed '
+    "instance itself - not the wall, floor, ceiling, a support surface or a "
+    'neighbouring object; "anchor_visible" says whether the instruction\'s '
+    "relation anchor is visible in this same frame. Return the box of the "
+    "target even when attributes or "
+    "distance are uncertain; the downstream instance check treats a missing "
+    'attribute as unverified. Return {"candidates": []} only when the target is '
+    "truly not visible in the frame."
 )
 
 BOX_ONLY_USER_PROMPT = (
@@ -499,14 +529,23 @@ GROUND_SYSTEM_PROMPT = (
     "You are the target-grounding module of a drone navigation agent. "
     "Reply with ONE JSON object and nothing else: "
     '{"candidates": [{"box": [x1, y1, x2, y2], "attrs": {"color": "..."}, '
-    '"confidence": 0.0, "distance_m": 0.0, '
+    '"confidence": 0.0, "distance_m": 0.0, "size_m": 0.0, '
+    '"matches_description": true, "match_reason": "...", '
+    '"anchor_visible": true, '
     '"uncertainty": "<what is still unclear>"}]}. '
     "box is a corner box [x1, y1, x2, y2] in normalized 0-1000 image "
     "coordinates: x1, y1 = top-left corner, x2, y2 = bottom-right corner "
     "(the older size form [u, v, w, h] is also understood, but only the corner "
     "form is exact). Keep at most 3 candidates, most likely first; "
     '"distance_m" is your rough estimate of how far the box is from the camera '
-    "in meters (0 when you cannot tell); use "
+    "in meters (0 when you cannot tell); "
+    '"size_m" is the object\'s estimated real size (largest dimension, meters); '
+    '"matches_description" must be true only when this box is the instructed '
+    "instance itself - not the wall, floor, ceiling, a support surface or a "
+    "neighbouring object; \"match_reason\" names the attributes and the "
+    'relation that support or contradict that judgement; "anchor_visible" '
+    'answers whether the instruction\'s relation anchor (the bookshelf in '
+    '"the desk next to the bookshelf") is visible in this same frame; use '
     '{"candidates": []} when the instruction target is not visible.'
 )
 
@@ -2692,8 +2731,10 @@ def _triangulate_candidate(
         current_check = _range_check(candidate, geometry["range_a_m"])
         other_check = _range_check(other, geometry["range_b_m"])
         available = [check for check in (current_check, other_check) if check.get("available")]
-        consistent = [check for check in available if check.get("consistent")]
-        if available and not consistent:
+        # every available single-view range has to agree with the intersection:
+        # one consistent view does not make the other view's 2.7x disagreement
+        # disappear (final3 classroom seed37 accepted exactly such a pair)
+        if available and not all(check.get("consistent") for check in available):
             continue
         key = (geometry["residual_m"], -geometry["angle_deg"])
         if best is None or key < best[0]:
@@ -2718,6 +2759,9 @@ def _triangulate_candidate(
             "baseline_m": geometry["baseline_m"],
             "angle_deg": geometry["angle_deg"],
             "residual_m": geometry["residual_m"],
+            "range_a_m": geometry["range_a_m"],
+            "range_b_m": geometry["range_b_m"],
+            "merged_box": other.get("box"),
             "range_checks": checks,
             "range_check_consistent": all(
                 check.get("consistent", True) for check in checks.values()
@@ -3966,13 +4010,25 @@ def _observation_pixels_missing(ctx: ToolContext, observation_id: str) -> dict:
 # --------------------------------------------------------------------------
 
 
-def _ground_user_prompt(instruction: str) -> str:
+def _ground_user_prompt(instruction: str, relation: Mapping | None = None) -> str:
+    anchor_line = ""
+    if relation is not None:
+        anchor_line = (
+            f' The instruction locates the target by the relation '
+            f'"{(relation.get("anchor") or "")}" ({relation.get("relation")}). '
+            'For every box, also report whether that anchor object is actually '
+            'visible in this image ("anchor_visible": true/false); a candidate '
+            'whose anchor is not visible cannot be verified.'
+        )
     return (
         f"Instruction: {instruction}\n"
-        "Return the normalized box (0-1000), the attributes and the rough "
-        'distance in meters ("distance_m"; 0 if you cannot tell) of every '
-        "visible instance of that target; report what you are unsure about in "
-        '"uncertainty".'
+        "Return the normalized box (0-1000), the attributes, the rough "
+        'distance in meters ("distance_m"; 0 if you cannot tell), the estimated '
+        'real size ("size_m"), and for every box say whether it is the '
+        'instructed instance itself ("matches_description": true/false, with '
+        '"match_reason"); report what you are unsure about in "uncertainty". '
+        "Do not present a wall, floor, support surface or neighbouring object "
+        "as a match." + anchor_line
     )
 
 
@@ -4038,13 +4094,22 @@ def _norm_attrs(value) -> dict:
     return {"text": text[:120]} if text else {}
 
 
-def _normalize_candidates(items: list, store: dict, *, width=None, height=None) -> list[dict]:
+def _normalize_candidates(
+    items: list,
+    store: dict,
+    *,
+    width=None,
+    height=None,
+    default_anchor_visible=None,
+) -> list[dict]:
     """Model reply -> candidate records with canonical ``[x1, y1, x2, y2]`` boxes.
 
     Each record keeps the format it was written in (``box_format``: the legacy
     ``[u, v, w, h]`` reading is normalized here, not silently re-guessed later),
     plus the legacy ``[u, v, w, h]`` view of the same box in ``box_uvwh`` so a
     consumer that still speaks the old shape does not have to convert.
+    ``default_anchor_visible`` is a top-level answer the model gave instead of
+    repeating it inside every candidate.
     """
     candidates = []
     next_index = len(store) + 1
@@ -4070,6 +4135,20 @@ def _normalize_candidates(items: list, store: dict, *, width=None, height=None) 
         if distance is not None and not (MIN_RANGE_M < distance <= MAX_RANGE_M):
             distance = None
         uncertainty = item.get("uncertainty", item.get("uncertain", item.get("notes", "")))
+        match = item.get(
+            "matches_description",
+            item.get("match", item.get("is_target", item.get("matches"))),
+        )
+        size = _as_float(
+            item.get("size_m", item.get("size", item.get("object_size_m"))), None
+        )
+        if size is not None and not (MIN_RANGE_M < size <= MAX_RANGE_M):
+            size = None
+        anchor_visible = _as_match_flag(
+            item.get("anchor_visible", item.get("anchor_in_frame", item.get("anchor_seen")))
+        )
+        if anchor_visible is None:
+            anchor_visible = default_anchor_visible
         candidates.append(
             {
                 "id": candidate_id,
@@ -4080,10 +4159,812 @@ def _normalize_candidates(items: list, store: dict, *, width=None, height=None) 
                 "attrs": _norm_attrs(item.get("attrs", item.get("attributes"))),
                 "confidence": confidence,
                 "distance_m": None if distance is None else round(distance, 2),
+                "size_m": None if size is None else round(size, 3),
+                "matches_description": _as_match_flag(match),
+                "anchor_visible": anchor_visible,
+                "match_reason": str(
+                    item.get("match_reason", item.get("reason", "")) or ""
+                )[:160],
                 "uncertainty": "" if uncertainty is None else str(uncertainty)[:120],
+                "instance_rank": None,
+                "instance_suspect": False,
+                "instance_suspect_reason": "",
             }
         )
     return candidates
+
+
+# --------------------------------------------------------------------------
+# instance consistency: is the box the instructed instance, or the wall?
+# --------------------------------------------------------------------------
+
+#: A box whose geometry at the claimed range implies an object this many times
+#: larger than the model's own size (or the target noun's prior) is not that
+#: instance: it is the wall/support surface around it.
+INSTANCE_SIZE_RATIO = 4.0
+#: Two views triangulating one point must see the same physical object. The
+#: physical size implied by each view's box at that view's triangulated range is
+#: a scale-free identity check: a box that also covers the wall behind the
+#: object implies a much larger object than the other view does. A clipped box
+#: can only under-state its object, so the check only fires when the *larger*
+#: view is unclipped, or when the clipped box is the larger one (its implied
+#: size is then a lower bound that already exceeds the other view).
+INSTANCE_TWO_VIEW_SIZE_RATIO = 2.5
+#: A relation ("next to the chair") should put the target within a few metres
+#: of the anchor instance. Farther than this from every known anchor is a weak
+#: contradiction, not proof; it is recorded as suspect.
+INSTANCE_ANCHOR_MAX_M = 8.0
+#: An explicit adjacency ("书架旁的课桌", "next to") is tighter than the weak
+#: any-anchor bound: the relatum is a few metres away, not across the room.
+INSTANCE_ADJACENT_MAX_M = 3.0
+#: "附近的"/"near" is looser than strict adjacency.
+INSTANCE_NEAR_MAX_M = 4.0
+#: A projected anchor only has to fall inside the field of view, not inside the
+#: candidate's box, so the FOV test keeps this much slack.
+ANCHOR_VISIBILITY_MARGIN_DEG = 3.0
+#: A known anchor farther than this cannot be a relatum visible in the frame.
+ANCHOR_VISIBILITY_MAX_M = 40.0
+
+#: (token, (width_m, height_m)) of common instructed objects. Rough on purpose:
+#: the check only rejects order-of-magnitude contradictions (a 5 m "chair").
+INSTANCE_SIZE_PRIORS = (
+    ("bookshelf", (1.2, 1.9)), ("书架", (1.2, 1.9)),
+    ("office chair", (0.65, 1.0)), ("办公椅", (0.65, 1.0)),
+    ("armchair", (0.8, 0.9)), ("扶手椅", (0.8, 0.9)),
+    ("chair", (0.55, 0.95)), ("椅子", (0.55, 0.95)), ("椅", (0.55, 0.95)),
+    ("bottle", (0.08, 0.25)), ("瓶", (0.08, 0.25)),
+    ("desk", (1.3, 0.75)), ("课桌", (1.3, 0.75)), ("桌", (1.2, 0.75)),
+    ("lamp", (0.35, 0.5)), ("灯", (0.35, 0.5)),
+    ("door", (0.9, 2.0)), ("门", (0.9, 2.0)),
+    ("cabinet", (1.0, 1.8)), ("柜", (1.0, 1.8)),
+)
+
+_COLOR_ALIASES = {
+    "black": ("black", "黑"),
+    "white": ("white", "白"),
+    "brown": ("brown", "棕", "褐", "木", "wood"),
+    "gray": ("gray", "grey", "灰", "silver", "银"),
+    "blue": ("blue", "蓝"),
+    "green": ("green", "绿"),
+    "red": ("red", "红"),
+    "yellow": ("yellow", "黄"),
+}
+_MATERIAL_ALIASES = {
+    "wood": ("wood", "wooden", "木"),
+    "metal": ("metal", "steel", "iron", "金属", "钢", "铁"),
+    "plastic": ("plastic", "塑料", "塑"),
+    "glass": ("glass", "玻璃"),
+    "fabric": ("fabric", "cloth", "布"),
+}
+_RELATION_TOKENS = (
+    "旁边", "旁的", "边的", "附近的", "next to", "beside", "near ", "near the",
+    " by the",
+)
+_TARGET_SPLIT = re.compile(
+    r"(?:旁边的|旁的|边的|附近的|旁边的|的|next to|beside|near the|near)",
+    re.IGNORECASE,
+)
+
+#: Relation half of an instruction: ``anchor + rel`` in Chinese ("书架旁的
+#: 课桌"). The bare ``边``/``旁`` forms are the ones stage goals use ("在卧室
+#: 窗边找到木椅"), so they must parse too - a re-grounding with the goal must
+#: not lose the anchor the shorter label carried.
+_CJK_RELATION_RE = re.compile(
+    r"(?P<anchor>[^，。；;、\s]{1,14}?)"
+    r"(?P<rel>旁边的|附近的|旁的|边的|旁边|附近|旁|边)"
+)
+#: English puts the target first ("the desk next to the bookshelf"), so the
+#: relatum is the captured group after the relation.
+_EN_RELATION_RE = re.compile(
+    r"(?P<target>[a-z0-9 ,'\-]{2,60}?)\s+(?P<rel>next\s+to|beside|near)\s+"
+    r"(?P<anchor>[a-z0-9 ,'\-]{2,60})",
+    re.IGNORECASE,
+)
+_ANCHOR_PREFIX_RE = re.compile(r"^(?:在|到|找到|寻找)\s*")
+#: Object nouns a relation can name. Categories let "带书的书架" match "书架"
+#: and "办公椅" match "椅子" without merging a chair with its desk anchor.
+_ANCHOR_NOUNS = (
+    ("bookshelf", ("书架", "书柜", "shelf", "bookcase")),
+    ("desk", ("课桌", "书桌", "桌子", "桌", "desk", "table")),
+    ("chair", ("办公椅", "木椅", "椅子", "椅", "chair")),
+    ("bottle", ("瓶子", "瓶", "bottle")),
+    ("lamp", ("台灯", "灯", "lamp", "light")),
+    ("window", ("窗", "window")),
+    ("door", ("门", "door")),
+    ("cabinet", ("柜", "cabinet")),
+)
+
+
+def _as_match_flag(value) -> bool | None:
+    """The model's own instance judgement (None when it did not say)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if text in {"true", "yes", "1", "match", "matches", "matched", "same", "是", "匹配", "一致"}:
+        return True
+    if text in {"false", "no", "0", "mismatch", "different", "否", "不是", "不匹配", "不一致"}:
+        return False
+    return None
+
+
+def _target_phrase(instruction: str) -> str:
+    """The part of a relation instruction that names the target instance.
+
+    ``木椅旁边的灯`` is a lamp next to a chair: colour/material/size checks must
+    read the head phrase, not the anchor noun, or every wooden anchor would
+    "conflict" with the target's own colour.
+    """
+    text = str(instruction or "").strip()
+    parts = [part for part in _TARGET_SPLIT.split(text) if part and part.strip()]
+    return parts[-1].strip("（）()：: ，,。.") if parts else text
+
+
+def _canonical_terms(text: str, aliases: Mapping[str, tuple]) -> set[str]:
+    lowered = str(text or "").lower()
+    return {
+        canonical for canonical, words in aliases.items()
+        if any(word.lower() in lowered for word in words)
+    }
+
+
+def _attribute_conflict(instruction: str, attrs: Mapping) -> str:
+    """Colour/material attrs that contradict the target phrase ("" when none)."""
+    if not isinstance(attrs, Mapping) or not attrs:
+        return ""
+    phrase = _target_phrase(instruction)
+    attr_text = " ".join(f"{key} {value}" for key, value in attrs.items())
+    wanted = _canonical_terms(phrase, _COLOR_ALIASES)
+    seen = _canonical_terms(attr_text, _COLOR_ALIASES)
+    if wanted and seen and not (wanted & seen):
+        return f"color {sorted(wanted)} vs {sorted(seen)}"
+    wanted = _canonical_terms(phrase, _MATERIAL_ALIASES)
+    seen = _canonical_terms(attr_text, _MATERIAL_ALIASES)
+    if wanted and seen and not (wanted & seen):
+        return f"material {sorted(wanted)} vs {sorted(seen)}"
+    return ""
+
+
+def _attribute_unknown(instruction: str, attrs: Mapping) -> str:
+    """Named colour/material the candidate's attributes do not cover ("" ok).
+
+    The model's ``matches_description`` flag is not evidence (final3: 28/28
+    candidates said ``true``, including a 5.6 m "bookshelf"). When the
+    instruction names a colour or material, a hard deterministic answer is
+    required: either the box's attributes contain that category or the candidate
+    is unverified. An explicitly conflicting value is reported by
+    :func:`_attribute_conflict` first; this function only reports silence.
+    """
+    phrase = _target_phrase(instruction)
+    attr_text = " ".join(
+        f"{key} {value}" for key, value in (attrs or {}).items()
+    ) if isinstance(attrs, Mapping) else ""
+    missing = []
+    if _canonical_terms(phrase, _COLOR_ALIASES) and not _canonical_terms(
+        attr_text, _COLOR_ALIASES
+    ):
+        missing.append("color")
+    if _canonical_terms(phrase, _MATERIAL_ALIASES) and not _canonical_terms(
+        attr_text, _MATERIAL_ALIASES
+    ):
+        missing.append("material")
+    return ",".join(missing)
+
+
+def _target_size_prior(instruction: str) -> tuple[float, float] | None:
+    """Rough (width, height) of the target noun, latest/most specific match."""
+    phrase = _target_phrase(instruction).lower()
+    best = None
+    best_key = (-1, -1)
+    for token, size in INSTANCE_SIZE_PRIORS:
+        position = phrase.rfind(token.lower())
+        if position < 0:
+            continue
+        key = (position, len(token))
+        if key > best_key:
+            best, best_key = size, key
+    return best
+
+
+def _implied_box_size(box, distance_m: float | None, intrinsics: Mapping) -> dict | None:
+    """Physical width/height a box subtends at the claimed range (metres)."""
+    if distance_m is None or not (MIN_RANGE_M < float(distance_m) <= MAX_RANGE_M):
+        return None
+    if not isinstance(box, (list, tuple)) or len(box) < 4:
+        return None
+    try:
+        x1, y1, x2, y2 = (float(value) for value in box[:4])
+        hfov = float(intrinsics.get("hfov_deg"))
+        width = float(intrinsics.get("width"))
+        height = float(intrinsics.get("height"))
+    except (TypeError, ValueError):
+        return None
+    if hfov <= 0.0 or width <= 0.0 or height <= 0.0:
+        return None
+    distance = float(distance_m)
+    tan_h = math.tan(math.radians(hfov) / 2.0)
+    tan_v = tan_h * (height / width)
+    implied_w = 2.0 * distance * tan_h * max(0.0, x2 - x1) / 1000.0
+    implied_h = 2.0 * distance * tan_v * max(0.0, y2 - y1) / 1000.0
+    return {
+        "width_m": round(implied_w, 3),
+        "height_m": round(implied_h, 3),
+        "largest_m": round(max(implied_w, implied_h), 3),
+    }
+
+
+def _size_conflict(candidate: Mapping, intrinsics: Mapping) -> dict | None:
+    """Range vs the size the same box says the object has.
+
+    A *converged depth* reading is a measurement of the surface the box sits on:
+    the box may include a support surface, so this model-vs-geometry check does
+    not override it. A triangulated range is not exempt: two bearings can agree
+    on a point while at least one box also covers the wall behind the object
+    (final3 classroom seed37 accepted a 23 m "bookshelf" this way), so the box
+    still has to be plausible at the range it was measured at.
+    """
+    if str(candidate.get("distance_source") or "") == DISTANCE_DEPTH_CONSISTENT:
+        return None
+    distance = candidate.get("range_m")
+    if str(candidate.get("distance_source") or "") == DISTANCE_TRIANGULATED:
+        triangulation = candidate.get("triangulation")
+        if isinstance(triangulation, Mapping):
+            distance = triangulation.get("range_a_m", distance)
+    if distance is None:
+        distance = candidate.get("distance_m")
+    implied = _implied_box_size(candidate.get("box"), distance, intrinsics)
+    if implied is None:
+        return None
+    claimed = _as_float(candidate.get("size_m"), None)
+    if claimed is not None and claimed > 0.0:
+        ratio = implied["largest_m"] / claimed
+        if ratio > INSTANCE_SIZE_RATIO or ratio < 1.0 / INSTANCE_SIZE_RATIO:
+            return {
+                "kind": "distance_size",
+                "implied_m": implied["largest_m"],
+                "claimed_m": round(claimed, 3),
+                "ratio": round(max(ratio, 1.0 / ratio), 2),
+            }
+    prior = _target_size_prior(str(candidate.get("instruction") or ""))
+    if prior is not None:
+        prior_w, _prior_h = prior
+        factor = 6.0 if prior_w < 0.2 else INSTANCE_SIZE_RATIO
+        if implied["width_m"] > prior_w * factor:
+            return {
+                "kind": "distance_size_prior",
+                "implied_width_m": implied["width_m"],
+                "prior_width_m": prior_w,
+                "ratio": round(implied["width_m"] / prior_w, 2),
+            }
+    return None
+
+
+def _two_view_size_conflict(candidate: Mapping, intrinsics: Mapping) -> dict | None:
+    """Two triangulating boxes must imply the same physical object.
+
+    A triangulated point is only as good as the two boxes it came from. Each
+    view's box is converted to physical width/height at that view's own
+    triangulated range; the same object gives the same numbers, while a box
+    that also covers the wall/background gives a much larger one. The check is
+    one-sided where a box touches the frame border: clipping can only make a
+    box under-state its object, so a ratio is decisive when the larger implied
+    size comes from a clipped box (a lower bound already too large) or when
+    neither box is clipped; it is skipped when the *smaller* side is clipped
+    (its true size, and therefore the ratio, is unknown).
+    """
+    triangulation = candidate.get("triangulation")
+    if not isinstance(triangulation, Mapping):
+        return None
+    range_a = _as_float(
+        triangulation.get("range_a_m"), _as_float(candidate.get("range_m"), None)
+    )
+    range_b = _as_float(triangulation.get("range_b_m"), None)
+    merged_box = triangulation.get("merged_box")
+    if range_a is None or range_b is None or merged_box is None:
+        return None
+    current = _implied_box_size(candidate.get("box"), range_a, intrinsics)
+    other = _implied_box_size(merged_box, range_b, intrinsics)
+    if current is None or other is None:
+        return None
+    ratios = {
+        "width": max(
+            current["width_m"] / max(other["width_m"], 1e-6),
+            other["width_m"] / max(current["width_m"], 1e-6),
+        ),
+        "height": max(
+            current["height_m"] / max(other["height_m"], 1e-6),
+            other["height_m"] / max(current["height_m"], 1e-6),
+        ),
+    }
+    dimension, ratio = max(ratios.items(), key=lambda item: item[1])
+    if ratio <= INSTANCE_TWO_VIEW_SIZE_RATIO:
+        return None
+    current_box = parse_box(candidate.get("box"), box_format=BOX_FORMAT_XYXY)[0]
+    other_parsed = parse_box(merged_box, box_format=BOX_FORMAT_XYXY)[0]
+    clipped = {
+        "current": bool(current_box is not None and _box_geometry(current_box)["border_touching"]),
+        "merged": bool(other_parsed is not None and _box_geometry(other_parsed)["border_touching"]),
+    }
+    larger = "current" if current[dimension + "_m"] >= other[dimension + "_m"] else "merged"
+    smaller = "merged" if larger == "current" else "current"
+    if clipped[smaller] and not clipped[larger]:
+        # the smaller box is a lower bound: the true ratio may fall below the gate
+        return None
+    return {
+        "kind": "two_view_size",
+        "dimension": dimension,
+        "ratio": round(ratio, 2),
+        "limit": INSTANCE_TWO_VIEW_SIZE_RATIO,
+        "current_m": round(current[dimension + "_m"], 3),
+        "merged_m": round(other[dimension + "_m"], 3),
+        "range_a_m": round(float(range_a), 3),
+        "range_b_m": round(float(range_b), 3),
+        "clipped": clipped,
+    }
+
+
+def _relation_named(instruction: str) -> bool:
+    text = str(instruction or "").lower()
+    return any(token in text for token in _RELATION_TOKENS)
+
+
+def _instance_point(value) -> tuple[float, float, float] | None:
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        return None
+    try:
+        point = (float(value[0]), float(value[1]), float(value[2]))
+    except (TypeError, ValueError):
+        return None
+    return point if all(math.isfinite(item) for item in point) else None
+
+
+def _relation_anchor(instruction: str) -> dict | None:
+    """The relatum an instruction names ("书架" in "书架旁的课桌"), if any."""
+    text = str(instruction or "").strip()
+    if not text:
+        return None
+    match = _CJK_RELATION_RE.search(text)
+    if match is not None:
+        anchor = _ANCHOR_PREFIX_RE.sub("", match.group("anchor")).strip(" 的")
+        if anchor:
+            relation = match.group("rel")
+            limit = (
+                INSTANCE_NEAR_MAX_M
+                if relation in ("附近的", "附近")
+                else INSTANCE_ADJACENT_MAX_M
+            )
+            return {"anchor": anchor[:24], "relation": relation, "limit_m": limit}
+    match = _EN_RELATION_RE.search(text)
+    if match is not None:
+        anchor = match.group("anchor").strip(" ,.;")
+        anchor = re.sub(r"^(?:the|a|an)\s+", "", anchor, flags=re.IGNORECASE)
+        if anchor:
+            relation = " ".join(match.group("rel").lower().split())
+            limit = (
+                INSTANCE_NEAR_MAX_M
+                if relation == "near"
+                else INSTANCE_ADJACENT_MAX_M
+            )
+            return {"anchor": anchor[:40], "relation": relation, "limit_m": limit}
+    return None
+
+
+def _anchor_category(text: str) -> str:
+    """Coarse object category of a relation phrase or a candidate record."""
+    lowered = str(text or "").lower()
+    for category, tokens in _ANCHOR_NOUNS:
+        if any(token.lower() in lowered for token in tokens):
+            return category
+    return ""
+
+
+def _anchor_record_category(record: Mapping) -> str:
+    """Category of the instance a record grounded (its target, not its anchor).
+
+    A record's instruction can name both its own target and its relation anchor
+    ("书架旁的课桌"), so the target phrase leads and attributes are the fallback.
+    """
+    instruction = str(record.get("instruction") or record.get("target") or "")
+    phrase = _target_phrase(instruction) if instruction else ""
+    attrs = record.get("attrs")
+    attr_text = (
+        " ".join(str(value) for value in attrs.values())
+        if isinstance(attrs, Mapping)
+        else ""
+    )
+    category = _anchor_category(f"{phrase} {attr_text}")
+    if category:
+        return category
+    return _anchor_category(instruction) if not phrase else ""
+
+
+def _matching_anchors(anchors: list[dict], relation: Mapping | None) -> list[dict]:
+    """Known candidates that are the relation's relatum, nearest-agnostic."""
+    if relation is None or not anchors:
+        return []
+    category = _anchor_category(str(relation.get("anchor") or ""))
+    if category:
+        return [anchor for anchor in anchors if anchor.get("category") == category]
+    phrase = str(relation.get("anchor") or "").casefold()
+    if not phrase:
+        return []
+    return [
+        anchor
+        for anchor in anchors
+        if phrase in str(anchor.get("text") or "").casefold()
+    ]
+
+
+def _anchor_geometry(
+    ctx: ToolContext, record: PerceptionObservation, anchor: Mapping
+) -> dict | None:
+    """Project a known anchor position into this frame's field of view.
+
+    ``None`` means the geometry could not be evaluated (unknown pose/intrinsics);
+    otherwise ``visible`` says whether the anchor lies in front of the camera
+    and inside the frame (or the crop region) used for this grounding.
+    """
+    position = record.position_flu
+    yaw = record.yaw_rad
+    point = _instance_point(anchor.get("position")) if isinstance(anchor, Mapping) else None
+    if position is None or yaw is None or point is None:
+        return None
+    intrinsics = _observation_intrinsics(ctx, record)
+    hfov = _as_float(intrinsics.get("hfov_deg"), None)
+    width = int(intrinsics.get("width") or 0)
+    height = int(intrinsics.get("height") or 0)
+    if hfov is None or width <= 0 or height <= 0:
+        return None
+    dx = point[0] - float(position[0])
+    dy = point[1] - float(position[1])
+    dz = point[2] - float(position[2])
+    cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+    bx = cos_yaw * dx + sin_yaw * dy
+    by = -sin_yaw * dx + cos_yaw * dy
+    bz = dz
+    distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+    half_h = math.radians(hfov) / 2.0
+    half_v = math.atan(math.tan(half_h) * height / width)
+    margin = math.radians(ANCHOR_VISIBILITY_MARGIN_DEG)
+    bearing = math.atan2(by, bx)
+    elevation = math.atan2(bz, math.hypot(bx, by))
+    detail = {
+        "anchor_m": round(distance, 2),
+        "bearing_deg": round(math.degrees(bearing), 1),
+        "elevation_deg": round(math.degrees(elevation), 1),
+        "hfov_deg": round(hfov, 1),
+    }
+    if bx <= 0.05:
+        return {"visible": False, "reason": "behind_camera", **detail}
+    if distance > ANCHOR_VISIBILITY_MAX_M:
+        return {"visible": False, "reason": "beyond_view_range", **detail}
+    pitch = math.radians(
+        float((record.metadata or {}).get("pitch_down_deg") or 0.0)
+    )
+    if abs(bearing) > half_h + margin or abs(elevation + pitch) > half_v + margin:
+        return {"visible": False, "reason": "outside_fov", **detail}
+    region = record.region
+    if region:
+        try:
+            ru, rv, rw, rh = (float(value) for value in list(region)[:4])
+            u = 500.0 - 500.0 * (by / bx) / math.tan(half_h)
+            v = 500.0 - 500.0 * (bz / bx) / math.tan(half_v)
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+        else:
+            detail.update({"u": round(u, 1), "v": round(v, 1)})
+            if not (
+                ru - 10.0 <= u <= ru + rw + 10.0
+                and rv - 10.0 <= v <= rv + rh + 10.0
+            ):
+                return {"visible": False, "reason": "outside_crop", **detail}
+    return {"visible": True, "reason": "in_view", **detail}
+
+
+def _anchor_visibility(
+    ctx: ToolContext,
+    record: PerceptionObservation,
+    candidate: Mapping,
+    anchor: Mapping | None,
+) -> dict:
+    """Whether the relation anchor is visible in the candidate's evidence.
+
+    The model's ``anchor_visible`` answer and the geometric projection are two
+    independent observations; the anchor is visible when either says so, and
+    not visible only when the model says it is not visible and the geometry
+    cannot place it in the frame. An unverifiable relation is not approved.
+    """
+    model_flag = candidate.get("anchor_visible")
+    model_flag = model_flag if isinstance(model_flag, bool) else None
+    geometry = _anchor_geometry(ctx, record, anchor) if isinstance(anchor, Mapping) else None
+    geometric = None if geometry is None else bool(geometry.get("visible"))
+    if model_flag is True:
+        visible, source = True, "model"
+    elif geometric is True:
+        visible, source = True, "geometry"
+    elif model_flag is False:
+        visible, source = False, "model"
+    elif geometric is False:
+        visible, source = False, "geometry"
+    else:
+        visible, source = None, "unknown"
+    return {
+        "visible": visible,
+        "source": source,
+        "model_anchor_visible": model_flag,
+        "anchor_candidate": (
+            None if not isinstance(anchor, Mapping) else str(anchor.get("id") or "")
+        ),
+        "geometric": geometry,
+    }
+
+
+def _known_anchors(ctx: ToolContext, subtask_key: str) -> list[dict]:
+    """Earlier-stage candidate positions usable as relation anchors."""
+    anchors: list[dict] = []
+    for key, record in _candidate_store(ctx).items():
+        if not isinstance(record, Mapping):
+            continue
+        if str(record.get("subtask_key") or "") == str(subtask_key or ""):
+            continue
+        if record.get("instance_suspect") or record.get("distance_uncertain"):
+            continue
+        if str(record.get("status") or "") in ("rejected", "merged", "superseded"):
+            continue
+        point = _instance_point(record.get("position_flu"))
+        if point is None:
+            continue
+        attrs = record.get("attrs")
+        text = " ".join(
+            [
+                str(record.get("instruction") or ""),
+                " ".join(str(value) for value in attrs.values())
+                if isinstance(attrs, Mapping)
+                else "",
+            ]
+        ).strip()
+        anchors.append(
+            {
+                "id": str(record.get("id") or key),
+                "position": point,
+                "category": _anchor_record_category(record),
+                "text": text[:200],
+            }
+        )
+    return anchors
+
+
+def _anchor_conflict(
+    instruction: str,
+    candidate: Mapping,
+    anchors: list[dict],
+    relation: Mapping | None = None,
+) -> dict | None:
+    """Distance from the candidate to its relatum, against the relation's bound.
+
+    When the relation names a known anchor ("书架"), only that anchor's distance
+    is judged, and adjacency (3 m) or nearness (4 m) sets the bound. Without a
+    matching known anchor the older, weak any-anchor bound still catches a
+    candidate that landed across the room from every recorded instance.
+    """
+    if not anchors:
+        return None
+    relation = relation if relation is not None else _relation_anchor(instruction)
+    matched = _matching_anchors(anchors, relation)
+    pool = matched or anchors
+    limit = (
+        float(relation["limit_m"])
+        if relation is not None and matched
+        else INSTANCE_ANCHOR_MAX_M
+    )
+    point = _instance_point(candidate.get("position_flu"))
+    if point is None:
+        return None
+    nearest = min(
+        pool,
+        key=lambda anchor: math.dist(point, anchor["position"]),
+    )
+    distance = math.dist(point, nearest["position"])
+    if distance <= limit:
+        return None
+    conflict = {
+        "kind": "anchor_distance",
+        "anchor_candidate": nearest["id"],
+        "distance_m": round(distance, 2),
+        "limit_m": limit,
+    }
+    if relation is not None:
+        conflict["relation"] = relation["relation"]
+        conflict["anchor_phrase"] = relation["anchor"]
+        conflict["anchor_matched"] = bool(matched)
+    return conflict
+
+
+def _same_instance(first: Mapping, second: Mapping) -> bool:
+    """Two boxes describe the same instance (overlap, no attr contradiction)."""
+    box_a = parse_box(first.get("box"), box_format=BOX_FORMAT_XYXY)[0]
+    box_b = parse_box(second.get("box"), box_format=BOX_FORMAT_XYXY)[0]
+    if box_a is not None and box_b is not None:
+        iou = _iou(box_a.to_list(), box_b.to_list())
+        if iou >= IOU_SAME:
+            return True
+    return False
+
+
+def _confidence_of(candidate: Mapping) -> float:
+    value = _as_float(candidate.get("confidence"), None)
+    return -1.0 if value is None else value
+
+
+def _instance_consistency(
+    ctx: ToolContext,
+    record: PerceptionObservation,
+    instruction: str,
+    candidates: list[dict],
+) -> dict:
+    """Filter/rank grounded boxes by whether they are the instructed instance.
+
+    Deterministic judgements carry the gate; the model's self-report does not:
+
+    - the instruction's colour/material attributes against the box attributes.
+      A conflict is suspect, and *silence* is suspect too when the instruction
+      names an attribute: an unverified candidate is not an approved one;
+    - the range against the size its own box subtends and the target noun's
+      rough size (a "chair" whose box would be 5 m wide at 3 m is a
+      wall/support surface); triangulated candidates are not exempt;
+    - for a triangulated candidate, the physical size implied by each view's
+      box at that view's range: two bearings that see different-sized objects
+      are not two views of one instance;
+    - the relation to a known earlier-stage candidate ("the lamp next to the
+      chair" landing 15 m from that chair);
+    - the relation anchor's co-visibility in the candidate's own frame/crop:
+      an instruction like "书架旁的课桌" is only verified where the bookshelf
+      is actually visible (the model's ``anchor_visible`` answer or a projection
+      of the known anchor position), and the candidate must sit inside the
+      relation's distance bound (3 m for adjacency, 4 m for "near");
+    - a candidate with no signal at all (no match flag, no attributes, no size
+      and no range) is unverified and therefore suspect.
+
+    ``matches_description`` is recorded (``model_match``) but never lets a
+    candidate through: final3's model reported ``true`` for 28/28 candidates,
+    including a 5.6 m "bookshelf". Its only effect is that an explicit
+    ``false`` adds ``description_mismatch``.
+
+    A candidate that fails any check is stored with ``instance_suspect=true``
+    and cannot be approached or accepted by a confirmation. When several
+    distinct instances survive, only the best match is approachable: a frame
+    with two chairs and no relation cannot say which one the instruction means,
+    so the others are marked ``not_best_match`` instead of being flown to.
+    """
+    intrinsics = _observation_intrinsics(ctx, record)
+    subtask_key = str((candidates[0] if candidates else {}).get("subtask_key") or "")
+    anchors = _known_anchors(ctx, subtask_key)
+    relation = _relation_anchor(instruction)
+    matched_anchors = _matching_anchors(anchors, relation)
+    reasons: dict[str, int] = {}
+    model_match = {"true": 0, "false": 0, "missing": 0}
+    for candidate in candidates:
+        found: list[str] = []
+        # a detector-verified candidate was proposed by SAM3 *conditioned on*
+        # the instruction's object phrase (colour/material included), so the
+        # VLM's own attribute report is not the identity evidence here
+        detector_verified = bool(candidate.get("detector_verified"))
+        match_flag = candidate.get("matches_description")
+        if match_flag is True:
+            model_match["true"] += 1
+        elif match_flag is False:
+            model_match["false"] += 1
+            if not detector_verified:
+                found.append("description_mismatch")
+        else:
+            model_match["missing"] += 1
+        if not detector_verified:
+            attr = _attribute_conflict(instruction, candidate.get("attrs") or {})
+            if attr:
+                found.append(f"attribute_conflict:{attr}")
+            else:
+                missing_attrs = _attribute_unknown(
+                    instruction, candidate.get("attrs") or {}
+                )
+                if missing_attrs:
+                    candidate["instance_attribute_unknown"] = missing_attrs
+                    found.append(f"attribute_unknown:{missing_attrs}")
+        size = _size_conflict(candidate, intrinsics)
+        if size is not None:
+            candidate["instance_size_conflict"] = size
+            found.append(f"distance_size_conflict:{size['kind']}")
+        two_view = _two_view_size_conflict(candidate, intrinsics)
+        if two_view is not None:
+            candidate["instance_two_view_conflict"] = two_view
+            found.append("two_view_size_conflict")
+        anchor = _anchor_conflict(instruction, candidate, anchors, relation)
+        if anchor is not None:
+            candidate["instance_anchor_conflict"] = anchor
+            found.append("anchor_distance_conflict")
+        if relation is not None:
+            visibility_anchor = None
+            if matched_anchors:
+                point = _instance_point(candidate.get("position_flu"))
+                visibility_anchor = (
+                    min(
+                        matched_anchors,
+                        key=lambda item: math.dist(point, item["position"]),
+                    )
+                    if point is not None
+                    else matched_anchors[0]
+                )
+            visibility = _anchor_visibility(
+                ctx, record, candidate, visibility_anchor
+            )
+            candidate["instance_anchor_visibility"] = visibility
+            if visibility["visible"] is not True:
+                # no model answer and no projection that places the anchor in
+                # this frame: the relation is unverified, not approved
+                found.append("anchor_not_visible")
+        distance = _as_float(
+            candidate.get("range_m"), _as_float(candidate.get("distance_m"), None)
+        )
+        # a retry/crop candidate that comes back with neither a match flag nor
+        # any attribute has no identity evidence at all, only box geometry. That
+        # is "unverified", not "approved" (12/40 final3 retry/crop candidates
+        # took exactly this path). Direct grounding replies keep the older
+        # behaviour: the prompt asks for the fields, but a missing field there is
+        # not by itself proof against the instance.
+        is_retry = bool(candidate.get("grounding_retry"))
+        if (
+            not found
+            and not detector_verified
+            and is_retry
+            and match_flag is None
+            and not (candidate.get("attrs") or {})
+        ):
+            found.append("instance_fields_unknown")
+        # no size and no range means even the geometry check could not run
+        elif (
+            not found
+            and not detector_verified
+            and is_retry
+            and candidate.get("size_m") is None
+            and (distance is None or distance <= MIN_RANGE_M)
+        ):
+            found.append("size_unknown")
+        if found:
+            candidate["instance_suspect"] = True
+            candidate["instance_suspect_reason"] = "; ".join(found)[:200]
+            for reason in found:
+                key = reason.split(":", 1)[0]
+                reasons[key] = reasons.get(key, 0) + 1
+    survivors = [candidate for candidate in candidates if not candidate.get("instance_suspect")]
+    # most likely first: the prompt asks for the most likely candidate first, so
+    # order breaks ties and confidence refines it
+    survivors.sort(key=_confidence_of, reverse=True)
+    for rank, candidate in enumerate(survivors, 1):
+        candidate["instance_rank"] = rank
+    if len(survivors) >= 2 and not _same_instance(survivors[0], survivors[1]):
+        for candidate in survivors[1:]:
+            candidate["instance_suspect"] = True
+            candidate["instance_suspect_reason"] = "not_best_match"
+            candidate["instance_rank"] = None
+            reasons["not_best_match"] = reasons.get("not_best_match", 0) + 1
+    return {
+        "filter": "instance_consistency",
+        "n_candidates": len(candidates),
+        "n_suspect": sum(1 for item in candidates if item.get("instance_suspect")),
+        "suspect": [
+            {"id": item.get("id"), "reason": item.get("instance_suspect_reason")}
+            for item in candidates
+            if item.get("instance_suspect")
+        ],
+        "approvable": [
+            item.get("id") for item in candidates if not item.get("instance_suspect")
+        ],
+        "reasons": reasons,
+        "model_match": model_match,
+        "anchors": [anchor["id"] for anchor in anchors],
+        "anchor_relation": relation,
+        "anchor_candidates": [anchor["id"] for anchor in matched_anchors],
+    }
 
 
 # --------------------------------------------------------------------------
@@ -4372,6 +5253,381 @@ def _conflict_stagnant_result(
 
 
 # --------------------------------------------------------------------------
+# detector gate: an independent instance proposal for the same frame
+# --------------------------------------------------------------------------
+
+
+def _detector_from_ctx(ctx: ToolContext) -> DetectorBackend | None:
+    extra = _extra(ctx)
+    detector = extra.get(DETECTOR_CONTEXT_KEY)
+    if detector is None:
+        detector = extra.get("detector")
+    return detector if hasattr(detector, "detect") else None
+
+
+def _next_candidate_id(store: Mapping) -> str:
+    index = 1
+    while f"cand_{index}" in store:
+        index += 1
+    return f"cand_{index}"
+
+
+def _detector_embedding_similarity(left, right) -> float | None:
+    if left is None or right is None:
+        return None
+    try:
+        a = np.asarray(left, dtype=np.float64).reshape(-1)
+        b = np.asarray(right, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if a.size == 0 or a.size != b.size:
+        return None
+    denominator = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denominator <= 0.0:
+        return None
+    return float(np.dot(a, b) / denominator)
+
+
+def _box_area(box: Sequence[float]) -> float:
+    return max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
+
+
+def _containment(inner: Sequence[float], outer: Sequence[float]) -> float:
+    ix1 = max(float(inner[0]), float(outer[0]))
+    iy1 = max(float(inner[1]), float(outer[1]))
+    ix2 = min(float(inner[2]), float(outer[2]))
+    iy2 = min(float(inner[3]), float(outer[3]))
+    intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    area = _box_area(inner)
+    return intersection / area if area > 0 else 0.0
+
+
+def _proposal_match(
+    candidate_box: Sequence[float], proposal_box: Sequence[float], dino_similarity: float | None
+) -> dict:
+    """One VLM box against one detector proposal (geometry + feature)."""
+    iou = _box_iou(candidate_box, proposal_box)
+    candidate_inside = _containment(candidate_box, proposal_box)
+    proposal_inside = _containment(proposal_box, candidate_box)
+    candidate_area = _box_area(candidate_box)
+    proposal_area = _box_area(proposal_box)
+    area_share = proposal_area / candidate_area if candidate_area > 0 else 0.0
+    geometric = bool(
+        iou >= DETECTOR_MATCH_IOU
+        or candidate_inside >= DETECTOR_MATCH_CONTAINMENT
+        or (
+            proposal_inside >= DETECTOR_PROPOSAL_IN_BOX
+            and area_share >= DETECTOR_PROPOSAL_AREA_SHARE
+        )
+    )
+    feature_ok = dino_similarity is None or dino_similarity >= 0.25
+    score = iou + 0.5 * candidate_inside + 0.25 * proposal_inside
+    if dino_similarity is not None:
+        score += max(0.0, dino_similarity)
+    return {
+        "matched": bool(geometric and feature_ok),
+        "geometric": geometric,
+        "feature_ok": feature_ok,
+        "iou": round(iou, 3),
+        "candidate_inside": round(candidate_inside, 3),
+        "proposal_inside": round(proposal_inside, 3),
+        "area_share": round(area_share, 3),
+        "dino_similarity": (
+            None if dino_similarity is None else round(float(dino_similarity), 3)
+        ),
+        "_score": score,
+    }
+
+
+def _proposal_boxes(detections: list) -> list[list[float] | None]:
+    """Boxes aligned with ``detections`` (``None`` for an unusable proposal)."""
+    boxes: list[list[float] | None] = []
+    for detection in detections:
+        box = getattr(detection, "box", None)
+        if not isinstance(box, (list, tuple)) or len(box) < 4:
+            boxes.append(None)
+            continue
+        try:
+            boxes.append([float(value) for value in list(box)[:4]])
+        except (TypeError, ValueError):
+            boxes.append(None)
+    return boxes
+
+
+def _apply_detector_gate(
+    ctx: ToolContext,
+    record: PerceptionObservation,
+    instruction: str,
+    candidates: list[dict],
+    depth_fn: Any,
+    depth_reason: str,
+    subtask_key: str = "",
+) -> tuple[list[dict], dict]:
+    """Ground ``candidates`` against an independent detector proposal set.
+
+    When the backend is off/unavailable/non-productive the candidates keep their
+    current behaviour (``proposal_source="vlm"``). When it produced proposals:
+
+    - a VLM box that matches a proposal (IoU/containment + DINOv2 crop
+      similarity) is ``proposal_source="vlm+detector"``;
+    - a VLM box that matches none of the *authoritative* proposals is not the
+      instructed instance and is dropped (recorded in the gate report);
+    - when no VLM candidate survives, the best proposals become candidates of
+      their own (``proposal_source="detector"``) so a VLM miss can still be
+      localized;
+    - proposals below the authoritative score are recorded but never drop a VLM
+      candidate (a weak detector must not erase the VLM path).
+    """
+    from .detectors import detector_report
+
+    store = _candidate_store(ctx)
+    detector = _detector_from_ctx(ctx)
+    if detector is None:
+        for candidate in candidates:
+            candidate.setdefault("proposal_source", "vlm")
+        return candidates, detector_report(None, "off", fallback="vlm", labels=[])
+    name = str(getattr(detector, "name", "detector") or "detector")
+    try:
+        available = bool(detector.available())
+    except Exception as exc:  # noqa: BLE001 - availability is a finding, not a crash
+        for candidate in candidates:
+            candidate.setdefault("proposal_source", "vlm")
+        return candidates, detector_report(
+            detector, "error", fallback="vlm", error=f"{type(exc).__name__}: {exc}"
+        )
+    if not available:
+        for candidate in candidates:
+            candidate.setdefault("proposal_source", "vlm")
+        return candidates, detector_report(
+            detector,
+            "off" if name in ("null", "none") else "unavailable",
+            fallback="vlm",
+            labels=[],
+        )
+    labels = target_labels(instruction, candidates)
+    if not labels:
+        for candidate in candidates:
+            candidate.setdefault("proposal_source", "vlm")
+        return candidates, detector_report(
+            detector, "no_labels", fallback="vlm", labels=[], note="no object phrase"
+        )
+    started = time.time()
+    try:
+        detections = list(
+            detector.detect(record.frame, instruction, labels=labels)
+        )
+    except Exception as exc:  # noqa: BLE001 - the VLM path stays usable
+        for candidate in candidates:
+            candidate.setdefault("proposal_source", "vlm")
+        return candidates, detector_report(
+            detector,
+            "error",
+            fallback="vlm",
+            labels=labels,
+            error=f"{type(exc).__name__}: {exc}",
+            elapsed_s=round(time.time() - started, 3),
+        )
+    elapsed = round(time.time() - started, 3)
+    aligned = [
+        (detection, box)
+        for detection, box in zip(detections, _proposal_boxes(detections))
+        if box is not None
+    ]
+    detections = [item[0] for item in aligned]
+    proposal_boxes = [item[1] for item in aligned]
+    if not proposal_boxes:
+        for candidate in candidates:
+            candidate.setdefault("proposal_source", "vlm")
+        return candidates, detector_report(
+            detector,
+            "no_proposal",
+            fallback="vlm",
+            labels=labels,
+            n_proposals=0,
+            elapsed_s=elapsed,
+        )
+    # positions are logged for offline proposal-vs-GT attribution
+    proposal_rows: list[dict] = []
+    for detection, box in zip(detections, proposal_boxes):
+        row = detection.to_dict() if hasattr(detection, "to_dict") else {"box": box}
+        row["box"] = [round(float(value), 1) for value in box]
+        parsed = parse_box(box, box_format=BOX_FORMAT_XYXY)[0]
+        if parsed is not None:
+            row.update(_candidate_location(ctx, record, parsed, None, depth_fn, depth_reason))
+        proposal_rows.append(row)
+    # DINOv2 crop features: the VLM box once, one vector per proposal
+    embeddings = None
+    embed_fn = getattr(detector, "embed_boxes", None)
+    if callable(embed_fn):
+        try:
+            embeddings = embed_fn(
+                record.frame, [candidate["box"] for candidate in candidates] + proposal_boxes
+            )
+        except Exception:  # noqa: BLE001 - features are optional
+            embeddings = None
+    candidate_vectors: list[Any] = []
+    proposal_vectors: list[Any] = []
+    if isinstance(embeddings, (list, tuple)) and len(embeddings) == len(candidates) + len(proposal_boxes):
+        candidate_vectors = list(embeddings[: len(candidates)])
+        proposal_vectors = list(embeddings[len(candidates):])
+    # a proposal that runs into the frame border with a large area has no
+    # trustworthy range/identity (its centre reads the surface behind it): it
+    # stays in the report but cannot verify or reject a VLM box
+    usable_indexes = [
+        index
+        for index, row in enumerate(proposal_rows)
+        if not row.get("border_large_box")
+    ]
+    authoritative = [
+        detections[index]
+        for index in usable_indexes
+        if float(getattr(detections[index], "confidence", 0.0) or 0.0)
+        >= DETECTOR_AUTHORITATIVE_SCORE
+    ]
+    kept: list[dict] = []
+    rejected: list[dict] = []
+    matched_proposal_indexes: set[int] = set()
+    for index, candidate in enumerate(candidates):
+        candidate_box = parse_box(candidate.get("box"), box_format=BOX_FORMAT_XYXY)[0]
+        best = None
+        if candidate_box is not None:
+            for proposal_index in usable_indexes:
+                detection = detections[proposal_index]
+                proposal_box = proposal_boxes[proposal_index]
+                similarity = None
+                if candidate_vectors and proposal_vectors:
+                    similarity = _detector_embedding_similarity(
+                        candidate_vectors[index], proposal_vectors[proposal_index]
+                    )
+                match = _proposal_match(
+                    candidate_box.to_list(), proposal_box, similarity
+                )
+                if match["matched"] and (
+                    best is None or match["_score"] > best[0]["_score"]
+                ):
+                    best = (match, proposal_index, detection)
+        if best is not None:
+            match, proposal_index, detection = best
+            matched_proposal_indexes.add(proposal_index)
+            match.pop("_score", None)
+            match["proposal_index"] = proposal_index
+            match["proposal_label"] = str(getattr(detection, "label", ""))
+            match["proposal_confidence"] = (
+                None
+                if getattr(detection, "confidence", None) is None
+                else round(float(detection.confidence), 3)
+            )
+            match["proposal_box"] = proposal_rows[proposal_index]["box"]
+            candidate["proposal_source"] = "vlm+detector"
+            candidate["detector_verified"] = True
+            candidate["detector_match"] = match
+            kept.append(candidate)
+            continue
+        if authoritative:
+            rejected_row = {
+                "id": candidate.get("id"),
+                "box": [round(float(value), 1) for value in candidate.get("box") or []],
+                "confidence": candidate.get("confidence"),
+                "reason": "detector_unmatched",
+                "n_authoritative": len(authoritative),
+            }
+            # a rejected VLM box is still measured, so the offline audit can
+            # say whether the gate removed a wrong object or the right one
+            rejected_box = parse_box(candidate.get("box"), box_format=BOX_FORMAT_XYXY)[0]
+            if rejected_box is not None:
+                rejected_location = _candidate_location(
+                    ctx, record, rejected_box, candidate.get("distance_m"),
+                    depth_fn, depth_reason,
+                )
+                for key in ("position_flu", "position_source", "range_m", "range_status"):
+                    if key in rejected_location:
+                        rejected_row[key] = rejected_location[key]
+            rejected.append(rejected_row)
+            continue
+        candidate["proposal_source"] = "vlm"
+        candidate["detector_gate"] = "unmatched_low_confidence"
+        kept.append(candidate)
+    detector_candidates: list[dict] = []
+    if not kept:
+        for proposal_index, detection in enumerate(detections):
+            if proposal_index not in usable_indexes:
+                continue
+            confidence = float(getattr(detection, "confidence", 0.0) or 0.0)
+            if confidence < DETECTOR_AUTHORITATIVE_SCORE:
+                continue
+            if proposal_index in matched_proposal_indexes:
+                continue
+            candidate_id = _next_candidate_id(store)
+            row = proposal_rows[proposal_index]
+            detector_candidates.append(
+                {
+                    "id": candidate_id,
+                    "box": [round(float(value), 1) for value in proposal_boxes[proposal_index]],
+                    "box_format": BOX_FORMAT_OUT,
+                    "box_format_used": BOX_FORMAT_OUT,
+                    "box_uvwh": [
+                        round(float(proposal_boxes[proposal_index][0]), 1),
+                        round(float(proposal_boxes[proposal_index][1]), 1),
+                        round(
+                            float(proposal_boxes[proposal_index][2])
+                            - float(proposal_boxes[proposal_index][0]),
+                            1,
+                        ),
+                        round(
+                            float(proposal_boxes[proposal_index][3])
+                            - float(proposal_boxes[proposal_index][1]),
+                            1,
+                        ),
+                    ],
+                    "attrs": {
+                        "label": str(getattr(detection, "label", "")),
+                        "source": name,
+                    },
+                    "confidence": round(confidence, 2),
+                    "distance_m": None,
+                    "size_m": None,
+                    "matches_description": True,
+                    "anchor_visible": None,
+                    "match_reason": f"detector proposal ({getattr(detection, 'label', '')})",
+                    "uncertainty": "",
+                    "instance_rank": len(detector_candidates) + 1,
+                    "instance_suspect": False,
+                    "instance_suspect_reason": "",
+                    "proposal_source": "detector",
+                    "detector_verified": True,
+                    "detector_proposal": {
+                        "label": str(getattr(detection, "label", "")),
+                        "confidence": round(confidence, 3),
+                        "mask_area_frac": row.get("mask_area_frac"),
+                    },
+                    "subtask_key": str(subtask_key or ""),
+                    "instruction": instruction[:120],
+                }
+            )
+            store[candidate_id] = detector_candidates[-1]
+            if len(detector_candidates) >= DETECTOR_EXTRA_CANDIDATES:
+                break
+    for candidate in kept:
+        candidate.setdefault("proposal_source", "vlm")
+    report = detector_report(
+        detector,
+        "ok",
+        labels=labels,
+        n_proposals=len(detections),
+        n_usable_proposals=len(usable_indexes),
+        proposals=proposal_rows[:5],
+        n_matched=sum(1 for candidate in kept if candidate.get("detector_match")),
+        n_rejected=len(rejected),
+        rejected=rejected[:8],
+        n_detector_candidates=len(detector_candidates),
+        authoritative=len(authoritative),
+        fallback=None,
+        elapsed_s=elapsed,
+    )
+    return kept + detector_candidates, report
+
+
+# --------------------------------------------------------------------------
 # ground_target
 # --------------------------------------------------------------------------
 
@@ -4460,9 +5716,10 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
             },
         )
 
+    relation = _relation_anchor(instruction)
     vlm_calls = 0
     try:
-        reply = ask(GROUND_SYSTEM_PROMPT, _ground_user_prompt(instruction))
+        reply = ask(GROUND_SYSTEM_PROMPT, _ground_user_prompt(instruction, relation))
         vlm_calls += 1
     except Exception as exc:  # noqa: BLE001 - backend failures are reported
         return ToolResult(
@@ -4479,11 +5736,21 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
     subtask_key = _subtask_key(ctx)
     frame_width = int(record.frame.shape[-1])
     frame_height = int(record.frame.shape[-2])
-    raw_items = _candidate_items(
-        _extract_json(reply if isinstance(reply, str) else str(reply))
+    payload = _extract_json(reply if isinstance(reply, str) else str(reply))
+    raw_items = _candidate_items(payload)
+    default_anchor_visible = (
+        _as_match_flag(payload.get("anchor_visible"))
+        if isinstance(payload, Mapping)
+        else None
     )
     candidates = (
-        _normalize_candidates(raw_items, store, width=frame_width, height=frame_height)
+        _normalize_candidates(
+            raw_items,
+            store,
+            width=frame_width,
+            height=frame_height,
+            default_anchor_visible=default_anchor_visible,
+        )
         if raw_items is not None
         else []
     )
@@ -4506,6 +5773,12 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
         retry_anchor_box: list[float] | None = None
         hint_box, hint_mode = _retry_hint_box(ctx, record, instruction, subtask_key)
         retry_prompt = BOX_ONLY_USER_PROMPT.format(instruction=instruction)
+        if relation is not None:
+            retry_prompt += (
+                f'\nThe instruction locates the target by the relation '
+                f'"{relation.get("anchor")}". Also set "anchor_visible" to '
+                "whether that anchor object is visible in the attached image."
+            )
         if hint_box is not None:
             # draw the previous candidate's box on a copy: the model gets a
             # visual anchor to correct instead of the v6 blind second look
@@ -4530,14 +5803,25 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
         try:
             retry_reply = ask(BOX_ONLY_SYSTEM_PROMPT, retry_prompt, [retry_frame])
             retry_calls = 1
-            retry_items = _candidate_items(
-                _extract_json(retry_reply if isinstance(retry_reply, str) else str(retry_reply))
+            retry_payload = _extract_json(
+                retry_reply if isinstance(retry_reply, str) else str(retry_reply)
             )
+            retry_items = _candidate_items(retry_payload)
         except Exception:  # noqa: BLE001 - a failed retry is just no candidate
+            retry_payload = None
             retry_items = None
+        retry_anchor_visible = (
+            _as_match_flag(retry_payload.get("anchor_visible"))
+            if isinstance(retry_payload, Mapping)
+            else None
+        )
         retry_candidates = (
             _normalize_candidates(
-                retry_items, store, width=frame_width, height=frame_height
+                retry_items,
+                store,
+                width=frame_width,
+                height=frame_height,
+                default_anchor_visible=retry_anchor_visible,
             )
             if retry_items is not None
             else []
@@ -4567,7 +5851,19 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
         if retry_anchor_box is not None:
             retry["anchor_box"] = list(retry_anchor_box)
         if retry_candidates:
+            # mark the retry origin: these candidates are the ones that used to
+            # arrive without match/size/attrs and slip past the instance gate
+            for retry_candidate in retry_candidates:
+                retry_candidate["grounding_retry"] = True
+                retry_candidate["retry_mode"] = retry_mode
             candidates = retry_candidates
+    # an independent proposal set for the same frame: no-op when the optional
+    # backend is off/unavailable, authoritative when it produced usable boxes.
+    # It runs before the empty branch so a VLM miss can still become a candidate.
+    depth_fn, depth_reason = _frame_depth_reader(ctx, record)
+    candidates, detector_result = _apply_detector_gate(
+        ctx, record, instruction, candidates, depth_fn, depth_reason, subtask_key
+    )
     if not candidates:
         # one more empty answer on this evidence: the 2nd consecutive one carries
         # the "look somewhere else" alternatives, and a 3rd call is refused above
@@ -4605,6 +5901,7 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
             "scope_note": _scope_text(visibility),
             "memory_negative": negative_write,
             "vlm_calls": vlm_calls,
+            "detector": detector_result,
         }
         if retry is not None:
             data["grounding_retry"] = retry
@@ -4639,7 +5936,6 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
     attempt["successes"] = int(attempt.get("successes", 0)) + 1
     attempt["last_observation_id"] = record.observation_id
     attempt["last_reason"] = "candidate"
-    depth_fn, depth_reason = _frame_depth_reader(ctx, record)
     for candidate in candidates:
         candidate["observation_id"] = record.observation_id
         candidate["source"] = "ground_target"
@@ -4738,6 +6034,11 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
         else:  # pragma: no cover - the record's box came from this parser
             candidate["position_source"] = POSITION_NO_RANGE
             candidate["range_status"] = "unknown"
+    # every located candidate is judged before anything can consume it: a box
+    # that is the wall/neighbouring object (or a second, ambiguous instance)
+    # stays in the store as evidence but carries ``instance_suspect``.
+    instance_filter = _instance_consistency(ctx, record, instruction, candidates)
+    for candidate in candidates:
         store[candidate["id"]] = candidate
     conflict_ids = [
         str(candidate["id"])
@@ -4771,7 +6072,22 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
         "intrinsics": _observation_intrinsics(ctx, record),
         "memory_sighting": sighting_write,
         "vlm_calls": vlm_calls,
+        "instance_filter": instance_filter,
+        "detector": detector_result,
     }
+    suspect_ids = [
+        str(item.get("id")) for item in candidates if item.get("instance_suspect")
+    ]
+    if suspect_ids:
+        data["instance_suspect_candidates"] = suspect_ids
+    if instance_filter.get("approvable"):
+        data["approvable_candidates"] = list(instance_filter["approvable"])
+    if suspect_ids and not instance_filter.get("approvable"):
+        data["hint"] = (
+            "every box in this reply failed the instance check (wall/background, "
+            "attribute conflict or size/range contradiction): change viewpoint "
+            "and ground the object itself instead of approaching one of these"
+        )
     if retry is not None:
         data["grounding_retry"] = retry
     if tighten_retry is not None:
@@ -4784,12 +6100,13 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
             ]
     if conflict_ids:
         data["distance_conflict_candidates"] = conflict_ids
-        data["hint"] = (
+        hint = (
             "these candidates' depth contradicts the model's distance estimate "
             "(the box is likely background): confirmation will keep them "
             "uncertain - observe from a different heading/altitude and ground "
             "the object's support point instead of repeating this view"
         )
+        data["hint"] = f"{data['hint']} {hint}" if data.get("hint") else hint
     return ToolResult(STATUS_OK, data, evidence)
 
 
