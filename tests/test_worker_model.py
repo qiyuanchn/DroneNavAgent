@@ -467,7 +467,7 @@ class WorkerModelPluginTest(unittest.TestCase):
         self.assertEqual(plugin.manifest.id, PLUGIN_ID)
         self.assertEqual(plugin.manifest.provides, (MODEL_SERVICE,))
         self.assertEqual(plugin.manifest.background_tasks, ("worker",))
-        self.assertEqual(plugin.manifest.isolation, "inproc")
+        self.assertEqual(plugin.manifest.isolation, "worker")
 
         command = plugin.worker_command()
 

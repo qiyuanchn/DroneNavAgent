@@ -326,7 +326,7 @@ class WorkerModelProviderPlugin(WorkerPlugin):
         version="0.1.0",
         provides=(MODEL_SERVICE,),
         background_tasks=(WORKER_TASK_NAME,),
-        isolation="inproc",
+        isolation="worker",
     )
 
     def __init__(

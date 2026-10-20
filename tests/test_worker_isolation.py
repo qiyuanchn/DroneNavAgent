@@ -57,7 +57,7 @@ class EchoWorkerPlugin(WorkerPlugin):
         id="demo.worker.echo",
         version="0.1.0",
         background_tasks=("worker",),
-        isolation="inproc",
+        isolation="worker",
     )
 
     def worker_spec(self, ctx) -> WorkerSpec:
@@ -73,7 +73,7 @@ class FailingConfigurePlugin(EchoWorkerPlugin):
         id="demo.worker.fail",
         version="0.1.0",
         background_tasks=("worker",),
-        isolation="inproc",
+        isolation="worker",
     )
 
     def configure(self, worker: ManagedWorker, ctx) -> None:

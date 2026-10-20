@@ -550,19 +550,19 @@ class ManagedWorker:
 class WorkerPlugin(Plugin):
     """Plugin base whose heavy work runs in a managed child process.
 
-    Subclasses set ``manifest`` (declaring ``background_tasks=("worker",)``) and
-    override :meth:`worker_spec` and/or :meth:`configure`. The host stays
-    in-process (``isolation="inproc"``); the child process is owned here, and
-    ``activate``/``deactivate``/``uninstall`` all funnel through
-    :meth:`ManagedWorker.stop`, so a deactivated plugin never leaves a process
-    behind.
+    Subclasses set ``manifest`` (declaring ``background_tasks=("worker",)`` and
+    ``isolation="worker"``) and override :meth:`worker_spec` and/or
+    :meth:`configure`. The plugin object runs in the controller, but its work
+    runs in the managed child; ``activate``/``deactivate``/``uninstall`` all
+    funnel through :meth:`ManagedWorker.stop`, so a deactivated plugin never
+    leaves a process behind.
     """
 
     manifest = PluginManifest(
         id="worker.base",
         version="0.1.0",
         background_tasks=(WORKER_TASK_NAME,),
-        isolation="inproc",
+        isolation="worker",
     )
 
     def __init__(
