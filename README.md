@@ -23,6 +23,9 @@ AgentRuntime ── 决策循环、预算、恢复、轨迹与 summary
         │     └── task: plan / execute_subtask / resume_plan（自规划与语义完成条件）
         ├── observations  统一 observation / candidate / viewpoint id 与图像存储
         ├── memory        identity/anchor-first 工作记忆、空间语义地图、episodic 证据
+        ├── motion        任务级 move / turn / hover / photo、执行状态与恢复
+        ├── plugins       插件生命周期宿主（manifest / service / cleanup / uninstall）
+        │    └── plugins/motion.py  第一个完整动作插件（motion.service@1）
         └── world         CPU splat / HiGS GPU / 生产 EnvWorld / SUPER
         │
         ▼
@@ -30,7 +33,12 @@ MCP stdio server（同一 registry、同一 session）或脚本直接调用
 ```
 
 - `vlm_nav/runtime.py`：主决策循环，负责 prompt、工具调用、失败恢复、完成判定。
-- `vlm_nav/tools.py`：工具协议、registry、预算、证据与结果渲染。
+- `vlm_nav/tools.py`：工具协议、registry、预算、证据与结果渲染；插件通过
+  `register` / `unregister` 增删工具。
+- `vlm_nav/motion.py`：任务级动作 schema 与执行器；长距离分段、固定朝向目标、
+  仿真时间悬停、取消/恢复。
+- `vlm_nav/plugins/`：M0 插件宿主（manifest、服务接口、作用域注册、资源引用计数、
+  停用/卸载/数据清除），以及 `plugins/motion.py` 基础动作插件。
 - `vlm_nav/tool_impl_*.py`：按感知 / 导航 / 任务拆分的工具实现。
 - `vlm_nav/skills_approach.py`、`skills_search.py`、`skills_confirm.py`：接近、
   搜索与主动候选确认技能。
@@ -46,23 +54,24 @@ MCP stdio server（同一 registry、同一 session）或脚本直接调用
 DroneNavAgent/
 ├── README.md
 ├── pyproject.toml              # 包名 vlm_nav；extras: hf / openai / mcp / test
-├── vlm_nav/                    # 核心 agent 包（20 个模块）
+├── vlm_nav/                    # 核心 agent 包（21 个模块 + plugins 子包）
 │   ├── runtime.py  tools.py  actions.py  candidates.py
-│   ├── observations.py  memory.py  world.py  cpu_renderer.py
+│   ├── motion.py  observations.py  memory.py  world.py  cpu_renderer.py
 │   ├── tool_impl_perception.py  tool_impl_navigation.py  tool_impl_task.py
 │   ├── skills_approach.py  skills_search.py  skills_confirm.py
 │   ├── detectors.py  vlm.py  prompts.py  harness.py
+│   ├── plugins/__init__.py  plugins/motion.py
 │   └── mcp_server.py
 ├── scripts/                    # 运行、对比、验证、诊断与资源画像驱动
 │   ├── run_vlm_nav_tools.py  run_vlm_nav_m2_memory.py  run_vlm_nav_3dgs.py
-│   ├── compare_agent_configs.py  compare_decision_loop.py
+│   ├── run_motion_mission.py  compare_agent_configs.py  compare_decision_loop.py
 │   ├── verify_phase1.py  verify_long_horizon.py  diagnose_grounding.py
 │   ├── profile_resources.py  replay_frames.py  build_replay_window_chair.py
 │   ├── check_memory_identity.py  summarize_plan_ablation.py
 │   └── vlm_nav_make_scene.py  vlm_nav_eval.py
 ├── docs/                       # 资源画像 / 4090 检查清单
 ├── serving/                    # Qwen-VL vLLM 启服脚本与说明
-├── tests/                      # agent 侧测试（26 个文件）
+├── tests/                      # agent 侧测试（28 个文件）
 ├── data/phase1/                # book/synth 场景的任务 JSON 与小型冒烟 PLY
 └── third_party/diffaero        # git submodule：3DGS/HiGS/SUPER 验证环境
 ```
@@ -88,6 +97,53 @@ DroneNavAgent/
 - **资源画像与冻结回放**：`scripts/profile_resources.py` 测量显存、首调/稳态
   延迟和 token 速率，`scripts/replay_frames.py` 提供跨机器可比的冻结观测集；
   见 `docs/vlm_nav_resource_profile_20261020.md` 的 4090 检查清单。
+- **任务级动作（M1）**：`motion` 把“前进 5 米、悬停 3 秒、转向后继续移动”
+  作为带完成条件的任务链执行。5 米会按 ≤2 米分段，但目标是完整 5 米；
+  被场景边界截断时返回 `blocked` 和剩余距离，不会虚报完成。朝向在动作开始时
+  固定，悬停推进仿真时钟而不是等待模型调用墙钟，取消/恢复按已执行进度续跑。
+- **插件生命周期（M0）**：manifest 声明服务、工具、提示词、事件、后台任务和
+  数据/缓存目录；注册均返回可撤销句柄。停用保留用户数据，卸载移除私有缓存，
+  `purge_data` 才删除私有数据；共享资源按引用计数释放；清理失败保留为
+  `residual` 并支持重试。
+
+## 任务级动作与插件生命周期（M0/M1）
+
+mission schema（`drone.motion.mission/1`）：
+
+```json
+{
+  "mission_id": "m1_acceptance",
+  "instruction": "前进 5 米，悬停 3 秒，左转 90 度，继续前进 1 米并拍照",
+  "steps": [
+    {"kind": "move", "direction": "forward", "meters": 5.0},
+    {"kind": "hover", "seconds": 3.0},
+    {"kind": "turn", "direction": "left", "degrees": 90},
+    {"kind": "move", "direction": "forward", "meters": 1.0},
+    {"kind": "photo", "label": "after_turn"}
+  ]
+}
+```
+
+`move` 的 `forward/backward/left/right/up/down` 指该动作开始时机体水平朝向；
+`meters` 是目标位移而不是累计航程；`turn` 正角度为左转（FLU 逆时针）；
+`hover` 的 `seconds` 是仿真/飞控时间。工具面为
+`motion_mission / motion_move / motion_turn / motion_hover / motion_photo /
+motion_cancel / motion_resume / motion_state`；也可通过
+`motion.service@1` 服务被其他插件调用。
+
+安装、运行、停用、卸载一次走完：
+
+```bash
+python scripts/run_motion_mission.py \
+  --artifacts-dir outputs/motion_missions \
+  --plugin-root outputs/motion_plugins \
+  --out outputs/motion_missions/run
+```
+
+脚本复用 agent 的 `ToolRegistry`，输出 `summary.json`（每步状态、剩余距离/
+角度/时间、照片路径）以及 deactivate/uninstall 报告。照片与 `*.state.json`
+位于 `artifacts-dir`，不受插件卸载影响；恢复时已完成的步骤不会重放，
+已存在的照片不会重拍。`--resume-state` 可从保存的状态继续。
 
 ## 快速开始
 
@@ -190,7 +246,10 @@ pytest tests -q
 ```
 
 测试覆盖 core、perception、navigation、planning、memory、vlm、MCP、
-confirmation、relation chain、detectors 和 scripts/drivers。源仓库中属于验证侧
+confirmation、relation chain、detectors、插件生命周期、任务级动作和
+scripts/drivers。`test_motion_mission.py` 固定了长距离分段、边界截断报告、
+固定朝向、仿真时间悬停以及取消/恢复不重放；`test_plugin_lifecycle.py`
+覆盖依赖解析、活跃任务保护、共享资源引用计数、失败回滚与清理重试。源仓库中属于验证侧
 的 `test_low_altitude_envelope.py`、`test_task_rewriter.py`、
 `test_waypoint_*.py` 留在 diffaero，不随本仓库复制。
 唯一需要 diffaero 的 agent 测试是 `test_vlm_nav_frames_contract.py` 中的

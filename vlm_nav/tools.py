@@ -1854,6 +1854,17 @@ class ToolRegistry:
             raise ValueError(f"tool already registered: {spec.name}")
         self._tools[spec.name] = spec
 
+    def unregister(self, name: str) -> ToolSpec:
+        """Remove one tool; the plugin lifecycle host calls this on deactivate.
+
+        A missing name is an error: the host treats a registration handle whose
+        tool already vanished as a cleanup failure instead of silently
+        shrinking the catalogue.
+        """
+        if name not in self._tools:
+            raise KeyError(f"unknown tool: {name}")
+        return self._tools.pop(name)
+
     def get(self, name: str) -> ToolSpec:
         if name not in self._tools:
             raise KeyError(f"unknown tool: {name}")
