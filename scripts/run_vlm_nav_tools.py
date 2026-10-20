@@ -986,6 +986,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="on (default): the registry carries the search_target "
                              "routine; off: it is not registered (the model cannot "
                              "see or call it)")
+    parser.add_argument("--mission-plugin", type=str, default="off",
+                        dest="mission_plugin", choices=["off", "on"],
+                        help="off (default): the pre-plugin tool registry only; "
+                             "on: install the motion/planner/mixed mission plugins "
+                             "(and the semantic service when the search/approach/"
+                             "confirm tools are in the registry)")
     parser.add_argument("--executor-auto-steps", type=str, default=DEFAULT_SWITCH,
                         dest="executor_auto_steps", choices=list(SWITCH_CHOICES),
                         help="on (default): a routine turn whose plan names a "
@@ -2825,6 +2831,30 @@ def run_episode(world: Any, vlm: Any, args: argparse.Namespace, out_dir: Path,
     # the catalogue both runtimes render is state-aware: the registry reads the
     # live context, and the runtime is budgeted so the listing arrives whole
     registry.attach_state(lambda: ctx.extra, limit=CATALOG_CHARS)
+    mission_host = None
+    if str(getattr(args, "mission_plugin", "off") or "off").lower() == "on":
+        from vlm_nav.plugins.bootstrap import install_mission_stack  # noqa: PLC0415
+
+        try:
+            mission_host = install_mission_stack(
+                registry,
+                out_dir / "mission_plugins",
+                artifacts_dir=out_dir / "mission_artifacts",
+            )
+            print(
+                "[vlm_nav_tools] mission plugins: "
+                + ", ".join(
+                    str(item.get("id")) for item in mission_host.plugins()
+                ),
+                flush=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - the base tool loop must still run
+            print(
+                f"[vlm_nav_tools] mission plugin install failed, continuing "
+                f"without it: {type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            mission_host = None
     state_before = tool_state(ctx.extra)
     catalog_before = registry.catalog()
     print(f"[vlm_nav_tools] catalogue: state={state_before.name} "
@@ -3120,6 +3150,18 @@ def run_episode(world: Any, vlm: Any, args: argparse.Namespace, out_dir: Path,
             "frames": "frames",
         },
     }
+    if mission_host is not None:
+        summary["mission_plugins"] = {
+            "active": [
+                item["id"] for item in mission_host.plugins()
+                if item.get("status") == "active"
+            ],
+            "tools": [
+                name for name in registry.names()
+                if name.startswith("mission_") or name == "plan_mission"
+            ],
+            "services": sorted(mission_host.services.catalog()),
+        }
     with open(out_dir / "summary.json", "w") as handle:
         json.dump(summary, handle, indent=2, default=str)
     print(f"[vlm_nav_tools] episode done: success={summary['success']} "

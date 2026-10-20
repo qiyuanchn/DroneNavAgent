@@ -24,8 +24,18 @@ AgentRuntime ── 决策循环、预算、恢复、轨迹与 summary
         ├── observations  统一 observation / candidate / viewpoint id 与图像存储
         ├── memory        identity/anchor-first 工作记忆、空间语义地图、episodic 证据
         ├── motion        任务级 move / turn / hover / photo、执行状态与恢复
+        ├── mixed_mission 一句话任务链：动作 + 语义搜索/接近/确认/验证 + 控制
+        ├── semantic      对现有 search/approach/confirm/verify 工具的服务化封装
+        ├── task_planner  中英文确定性任务解析（可选 VLM 回退）
+        ├── hardware      GPU/4090 资源画像与容量判定
         ├── plugins       插件生命周期宿主（manifest / service / cleanup / uninstall）
-        │    └── plugins/motion.py  第一个完整动作插件（motion.service@1）
+        │    ├── plugins/motion.py     flight-motion（motion.service@1）
+        │    ├── plugins/mixed.py      task-executor（mission.service@1）
+        │    ├── plugins/semantic.py   semantic-navigation（semantic.service@1）
+        │    ├── plugins/legacy.py     perception / navigation / task / memory / model
+        │    ├── plugins/worker.py     受管理 worker 进程（重型模型隔离）
+        │    ├── plugins/profiles.py   motion-only / semantic-nav / mixed-mission / 4090-local
+        │    └── plugins/infra.py      resource-manager / world-service / mcp-adapter
         └── world         CPU splat / HiGS GPU / 生产 EnvWorld / SUPER
         │
         ▼
@@ -54,25 +64,31 @@ MCP stdio server（同一 registry、同一 session）或脚本直接调用
 DroneNavAgent/
 ├── README.md
 ├── pyproject.toml              # 包名 vlm_nav；extras: hf / openai / mcp / test
-├── vlm_nav/                    # 核心 agent 包（21 个模块 + plugins 子包）
+├── vlm_nav/                    # 核心 agent 包（27 个模块 + plugins 子包）
 │   ├── runtime.py  tools.py  actions.py  candidates.py
-│   ├── motion.py  observations.py  memory.py  world.py  cpu_renderer.py
+│   ├── motion.py  mixed_mission.py  task_planner.py  semantic.py  hardware.py
+│   ├── observations.py  memory.py  world.py  cpu_renderer.py
 │   ├── tool_impl_perception.py  tool_impl_navigation.py  tool_impl_task.py
 │   ├── skills_approach.py  skills_search.py  skills_confirm.py
 │   ├── detectors.py  vlm.py  prompts.py  harness.py
-│   ├── plugins/__init__.py  plugins/motion.py
+│   ├── plugins/__init__.py  plugins/{motion,mixed,semantic,task_planner}.py
+│   ├── plugins/{legacy,profiles,worker,worker_model,infra,bootstrap}.py
+│   ├── worker_echo.py  worker_model.py
 │   └── mcp_server.py
 ├── scripts/                    # 运行、对比、验证、诊断与资源画像驱动
 │   ├── run_vlm_nav_tools.py  run_vlm_nav_m2_memory.py  run_vlm_nav_3dgs.py
-│   ├── run_motion_mission.py  compare_agent_configs.py  compare_decision_loop.py
+│   ├── run_motion_mission.py  run_mixed_mission.py  run_mixed_missions.py
+│   ├── compare_agent_configs.py  compare_decision_loop.py
 │   ├── verify_phase1.py  verify_long_horizon.py  diagnose_grounding.py
-│   ├── profile_resources.py  replay_frames.py  build_replay_window_chair.py
+│   ├── profile_resources.py  check_hardware_profile.py
+│   ├── replay_frames.py  build_replay_window_chair.py
 │   ├── check_memory_identity.py  summarize_plan_ablation.py
 │   └── vlm_nav_make_scene.py  vlm_nav_eval.py
-├── docs/                       # 资源画像 / 4090 检查清单
+├── docs/                       # 资源画像 / 4090 检查清单 / 混合任务契约
 ├── serving/                    # Qwen-VL vLLM 启服脚本与说明
-├── tests/                      # agent 侧测试（28 个文件）
+├── tests/                      # agent 侧测试（41 个文件）
 ├── data/phase1/                # book/synth 场景的任务 JSON 与小型冒烟 PLY
+├── data/mixed_missions/        # M4 的 2/4/8 阶段动作/语义/混合任务
 └── third_party/diffaero        # git submodule：3DGS/HiGS/SUPER 验证环境
 ```
 
@@ -105,6 +121,20 @@ DroneNavAgent/
   数据/缓存目录；注册均返回可撤销句柄。停用保留用户数据，卸载移除私有缓存，
   `purge_data` 才删除私有数据；共享资源按引用计数释放；清理失败保留为
   `residual` 并支持重试。
+- **一句话混合任务（M2）**：中英文确定性 planner 把
+  “前进 5 米、悬停 3 秒、找到窗边的木椅、飞到它旁边并拍照”解析成有序任务链；
+  动作步走 M1 执行器，语义步走既有 `search_target`/`approach_candidate`/
+  `confirm_candidate`/`verify_goal`。语义步只有拿到 candidate / arrived /
+  accepted / verified 证据才算完成，纯动作不会冒充语义目标完成。
+- **插件迁移、worker 与 profile（M3）**：现有 perception/navigation/task/
+  memory/model 模块通过 adapter plugin 注册，`registry_view()` 保证停用后无
+  残留工具；重型 VLM 可放入受管理 worker 进程（JSON-line RPC、超时、进程组
+  SIGTERM/SIGKILL、卸载即回收）；内置 `motion-only`、`semantic-nav`、
+  `mixed-mission`、`4090-local` profile。
+- **长程矩阵与 4090（M4）**：`run_mixed_missions.py` 跑 action / semantic /
+  mixed × 2/4/8 阶段 × 种子的矩阵，记录成功率、错误完成、工具调用、恢复行为
+  和峰值显存；`check_hardware_profile.py` 用 4090 24 GiB 预算判定组合驻留，
+  CPU/无 CUDA 时明确返回 unavailable。
 
 ## 任务级动作与插件生命周期（M0/M1）
 
@@ -144,6 +174,75 @@ python scripts/run_motion_mission.py \
 角度/时间、照片路径）以及 deactivate/uninstall 报告。照片与 `*.state.json`
 位于 `artifacts-dir`，不受插件卸载影响；恢复时已完成的步骤不会重放，
 已存在的照片不会重拍。`--resume-state` 可从保存的状态继续。
+
+## 一句话混合任务（M2）
+
+默认指令就是 goal.md 的示例：
+
+```bash
+python scripts/run_mixed_mission.py --semantic mock \
+  --artifacts-dir outputs/mixed_missions \
+  --plugin-root outputs/mixed_plugins \
+  --out outputs/mixed_missions/run
+```
+
+- `--semantic mock`：无 VLM/GPU 的确定性语义服务，跑通完整
+  plan → install → activate → run → deactivate → uninstall。
+- `--semantic real`：安装 perception/navigation/semantic 插件，走真实
+  `search_target`→`approach_candidate`→`confirm_candidate`→`verify_goal`；
+  没有模型后端时会在 search 步诚实失败，不降级成 mock。
+- `--motion-only`：只跑动作链，用于排除视觉因素。
+- 在现有 tool-loop runner 中启用同一套插件：
+  `python -m scripts.run_vlm_nav_tools ... --mission-plugin on`。它会向
+  已经构建好的 registry 注册 `motion_*`、`mission_*`、`plan_mission` 工具；
+  若 registry 已有 search/approach/confirm/verify，还会提供
+  `semantic.service@1`（默认关闭，保持既有实验基线不变）。
+
+任务 schema（`drone.mixed_mission/1`）在动作步之外支持
+`search / approach / confirm / verify / revisit / goto`，以及
+`takeoff / land / orbit / patrol`（只有 world 暴露对应方法时才执行，
+否则明确报 `unsupported_capability`）。`mission_run` 每步后更新
+`ctx.extra["subgoal"]` 与 `ctx.extra["mission.progress"]`，runtime 的
+Structured state 会显示 `mission=... step=.../... done=...`。
+
+## 插件迁移、worker 与 profile（M3）
+
+- adapter plugins：`perception.core`（6 工具）、`navigation.core`（12 工具）、
+  `task.tools`（2 工具）、`memory.store`、`model.provider`。
+- `PluginContext.registry_view()` 让既有 `register_*_tools()` 直接接入插件
+  作用域；停用后工具、服务、事件、worker 全部撤销。
+- `plugins/worker.py` 提供 `ManagedWorker`/`WorkerPlugin`：独立进程、
+  JSON-line RPC、启动握手、请求超时、stderr 日志、进程组 SIGTERM→SIGKILL。
+  `plugins/worker_model.py` 把 VLM 后端放到 worker，并通过
+  `model.provider@1` 暴露给 perception/navigation。
+- profile：
+
+```python
+from vlm_nav.plugins.profiles import BUILTIN_PROFILES, activate_profile
+# motion-only / semantic-nav / mixed-mission / 4090-local
+```
+
+`4090-local` 使用 `model.provider.worker`、4-bit 量化配置和本地 detector；
+具体模型路径由 profile factory 提供。
+
+## 长程矩阵与 4090（M4）
+
+```bash
+# 2/4/8 阶段 × action/semantic/mixed，CPU mock，可中断恢复
+python scripts/run_mixed_missions.py \
+  --groups action,semantic,mixed --stages 2,4,8 --seeds 1 \
+  --interrupt-step 2 --out outputs/mixed_missions/matrix
+
+# 4090 容量判定（无 CUDA 时返回 exit 2，不会伪造显存数字）
+python scripts/check_hardware_profile.py --profile 4090-local --device cuda
+```
+
+`report.json` / `report.md` 记录每组每阶段：`success_rate`、
+`false_completion`、`tool_calls`、`vlm_calls`、`wall_time_s`、峰值显存、
+`resume_recovered`、`replayed_steps`，以及卸载后的资源稳定性
+（工具/服务/worker 进程/residual）。语义组和混合组的 mock 服务只用于
+CPU 矩阵与编排回归；真实语义能力由 `--semantic real` 或
+`run_mixed_mission.py --semantic real` 验证。
 
 ## 快速开始
 
@@ -249,7 +348,12 @@ pytest tests -q
 confirmation、relation chain、detectors、插件生命周期、任务级动作和
 scripts/drivers。`test_motion_mission.py` 固定了长距离分段、边界截断报告、
 固定朝向、仿真时间悬停以及取消/恢复不重放；`test_plugin_lifecycle.py`
-覆盖依赖解析、活跃任务保护、共享资源引用计数、失败回滚与清理重试。源仓库中属于验证侧
+覆盖依赖解析、活跃任务保护、共享资源引用计数、失败回滚与清理重试；
+`test_mixed_mission*.py` / `test_task_planner.py` 覆盖混合任务 schema、
+planner、证据门控和插件工具；`test_semantic_*.py` 覆盖 search→approach→
+confirm→verify 的 retry/next_action/不虚报；`test_worker_*.py` 覆盖 worker
+启动/停止/超时/进程回收；`test_run_mixed_missions.py` 覆盖 2 阶段矩阵与
+中断恢复；`test_hardware.py` 覆盖 4090 容量判定与无 CUDA 的诚实降级。源仓库中属于验证侧
 的 `test_low_altitude_envelope.py`、`test_task_rewriter.py`、
 `test_waypoint_*.py` 留在 diffaero，不随本仓库复制。
 唯一需要 diffaero 的 agent 测试是 `test_vlm_nav_frames_contract.py` 中的

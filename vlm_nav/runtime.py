@@ -2091,6 +2091,18 @@ class AgentRuntime:
             except Exception:
                 pass
         lines.append(f"current_observation={self.ctx.extra.get('current_observation')}")
+        mission = self.ctx.extra.get("mission.progress")
+        if isinstance(mission, dict):
+            total = int(mission.get("steps_total") or 0)
+            done = int(mission.get("steps_done") or 0)
+            current = int(mission.get("current_step") or 0)
+            lines.append(
+                "mission="
+                f"{mission.get('mission_id', 'n/a')} "
+                f"status={mission.get('status', 'n/a')} "
+                f"step={min(current + 1, total) if total else 0}/{total} "
+                f"done={done}"
+            )
         store = observation_store(self.ctx, create=False)
         if store is not None and len(store):
             # the observation ids that exist right now: the model references

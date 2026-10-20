@@ -1,0 +1,82 @@
+{
+  "schema": "vlm_nav.mixed_missions.tasks/1",
+  "stages": 4,
+  "groups": {
+    "action": [
+      {
+        "name": "action_four_motion",
+        "instruction": "上升 0.5 米，向前飞 1 米，右转 90 度，悬停 0.2 秒。",
+        "steps": [
+          {"kind": "move", "direction": "up", "meters": 0.5},
+          {"kind": "move", "direction": "forward", "meters": 1.0},
+          {"kind": "turn", "direction": "right", "degrees": 90},
+          {"kind": "hover", "seconds": 0.2}
+        ]
+      },
+      {
+        "name": "action_turn_photo",
+        "instruction": "左转 90 度，向前飞 1 米，悬停 0.2 秒，拍照。",
+        "steps": [
+          {"kind": "turn", "direction": "left", "degrees": 90},
+          {"kind": "move", "direction": "forward", "meters": 1.0},
+          {"kind": "hover", "seconds": 0.2},
+          {"kind": "photo", "label": "turn_photo"}
+        ]
+      }
+    ],
+    "semantic": [
+      {
+        "name": "semantic_window_chair_full",
+        "instruction": "找到窗边的木椅，飞到它旁边，确认它，然后验证完成。",
+        "steps": [
+          {"kind": "search", "target": "窗边的木椅", "relation": "窗边"},
+          {"kind": "approach", "target": "last", "standoff_m": 1.2},
+          {"kind": "confirm", "target": "last", "max_views": 2},
+          {"kind": "verify", "target": "last", "success_dist_m": 1.2}
+        ]
+      },
+      {
+        "name": "semantic_kitchen_table_full",
+        "instruction": "找到厨房的桌子，飞到它旁边，确认它，然后验证完成。",
+        "steps": [
+          {"kind": "search", "target": "厨房的桌子", "relation": "厨房"},
+          {"kind": "approach", "target": "last", "standoff_m": 1.2},
+          {"kind": "confirm", "target": "last", "max_views": 2},
+          {"kind": "verify", "target": "last", "success_dist_m": 1.2}
+        ]
+      },
+      {
+        "name": "semantic_revisit_after_confirm",
+        "instruction": "找到窗边的木椅，飞到它旁边，确认它，然后回到起点。",
+        "steps": [
+          {"kind": "search", "target": "窗边的木椅", "relation": "窗边"},
+          {"kind": "approach", "target": "last", "standoff_m": 1.2},
+          {"kind": "confirm", "target": "last", "max_views": 2},
+          {"kind": "revisit", "position": [0.0, 0.0, 1.0]}
+        ]
+      }
+    ],
+    "mixed": [
+      {
+        "name": "mixed_move_search_hover_approach",
+        "instruction": "向前飞 1 米，找到窗边的木椅，悬停 0.2 秒，飞到它旁边。",
+        "steps": [
+          {"kind": "move", "direction": "forward", "meters": 1.0},
+          {"kind": "search", "target": "窗边的木椅", "relation": "窗边"},
+          {"kind": "hover", "seconds": 0.2},
+          {"kind": "approach", "target": "last", "standoff_m": 1.2}
+        ]
+      },
+      {
+        "name": "mixed_search_move_approach_photo",
+        "instruction": "找到厨房的桌子，向左移动 1 米，飞到它旁边，拍照。",
+        "steps": [
+          {"kind": "search", "target": "厨房的桌子", "relation": "厨房"},
+          {"kind": "move", "direction": "left", "meters": 1.0},
+          {"kind": "approach", "target": "last", "standoff_m": 1.2},
+          {"kind": "photo", "label": "near_table"}
+        ]
+      }
+    ]
+  }
+}

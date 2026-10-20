@@ -708,8 +708,29 @@ class MotionExecutor:
                     record.error = self._cancel_reason
                     record.end_sim_s = self.clock.now_s()
                     record.end_pose = self._pose()
+                    self._refresh_cancel_progress(record)
             self._persist()
         return state
+
+    def _refresh_cancel_progress(self, record: StepRecord) -> None:
+        """Recompute the cancelled step's remaining work from the actual pose.
+
+        A chunk updates ``moved_m`` before the loop sees the cancel flag, so
+        without this the state would report the *requested* remaining distance
+        instead of the distance actually left to fly.
+        """
+        target = record.progress.get("target")
+        start = record.progress.get("start_pose") or record.start_pose
+        if record.kind == STEP_MOVE and target is not None and start is not None:
+            current = np.asarray(self._pose(), dtype=np.float64)
+            target_vec = np.asarray(target, dtype=np.float64)
+            record.progress["remaining_m"] = round(
+                float(np.linalg.norm(target_vec - current)), 6
+            )
+            record.progress["moved_m"] = round(
+                float(np.linalg.norm(current - np.asarray(start, dtype=np.float64))),
+                6,
+            )
 
     # -- state machine ---------------------------------------------------- #
 
@@ -895,6 +916,9 @@ class MotionExecutor:
             )
             record.progress["last_feedback"] = last_feedback
             record.progress["last_chunk_m"] = round(measured, 6)
+            record.progress["remaining_m"] = round(
+                float(np.linalg.norm(target_vec - after)), 6
+            )
             self._notify("step.chunk", index=index, kind=STEP_MOVE)
             if measured <= 1e-6 or float(np.linalg.norm(target_vec - after)) >= remaining - 1e-6:
                 no_progress += 1

@@ -24,10 +24,10 @@ Failure is reported, not hidden: cleanup errors stay in the record as
 ``residual`` entries and :meth:`PluginHost.retry_cleanup` retries them. A
 plugin that is being used by an active task cannot be deactivated unless the
 caller explicitly forces it; the forced path calls the plugin's abort hooks
-and records the interruption. Heavy ``worker`` isolation is declared in the
-manifest but rejected for now - M1 only needs in-process plugins, and pretending
-to manage a worker process we did not start would make the uninstall contract
-untrue.
+and records the interruption. ``worker`` isolation may be declared in the
+manifest; the host still runs the plugin object in-process, while the managed
+worker plugin is responsible for spawning and stopping the actual child
+process so the uninstall contract stays true.
 """
 
 from __future__ import annotations
@@ -166,11 +166,6 @@ class PluginManifest:
         if self.isolation not in ("inproc", "worker"):
             raise LifecycleError(
                 f"plugin {self.id}: unknown isolation {self.isolation!r}"
-            )
-        if self.isolation == "worker":
-            raise LifecycleError(
-                f"plugin {self.id}: worker isolation is not implemented yet; "
-                "an uninstall that cannot stop the worker would be a false promise"
             )
         for contract in tuple(self.provides) + tuple(self.requires) + tuple(
             self.optional_requires
@@ -333,11 +328,20 @@ class ServiceRegistry:
             entry = self._entries.get(name)
         return entry is not None and entry.version == version
 
-    def get(self, contract: str, requester: str = "") -> Any:
+    def get(
+        self,
+        contract: str,
+        requester: str = "",
+        optional: bool = False,
+        default: Any = None,
+    ) -> Any:
+        """Resolve one service; ``optional=True`` returns ``default`` when absent."""
         name, version = split_contract(contract)
         with self._lock:
             entry = self._entries.get(name)
         if entry is None or entry.version != version:
+            if optional:
+                return default
             who = f" for {requester}" if requester else ""
             raise LifecycleError(f"required service {contract!r} is not available{who}")
         return entry.value
@@ -576,6 +580,39 @@ class ToolRegistrar:
         return sorted(self._declared - set(self._names))
 
 
+class RegistryView:
+    """The tool surface a plugin may use, with registration still scoped.
+
+    ``register`` goes through the plugin's :class:`ToolRegistrar`, so the
+    manifest declaration remains enforced and deactivation revokes what was
+    added. ``names``/``get``/``call``/``batch`` read and execute against the
+    host's shared registry. The view is intentionally thin: existing
+    ``register_*_tools(registry, ...)`` functions accept it unchanged.
+    """
+
+    def __init__(self, registrar: ToolRegistrar, registry: ToolRegistry) -> None:
+        self._registrar = registrar
+        self._registry = registry
+
+    def register(self, spec: ToolSpec) -> Disposable:
+        return self._registrar.register(spec)
+
+    def names(self) -> list[str]:
+        return self._registry.names()
+
+    def get(self, name: str) -> ToolSpec:
+        return self._registry.get(name)
+
+    def call(self, name: str, args: Mapping | None, ctx: Any) -> Any:
+        return self._registry.call(name, args, ctx)
+
+    def batch(self, args: Mapping | None, ctx: Any) -> Any:
+        return self._registry.batch(args, ctx)
+
+    def __contains__(self, name: object) -> bool:
+        return str(name) in self._registry.names()
+
+
 class PromptRegistrar:
     def __init__(
         self,
@@ -751,6 +788,14 @@ class PluginContext:
             )
         return self.cache_dir / name
 
+    def registry_view(self) -> RegistryView:
+        """A registration-scoped facade over the host tool registry."""
+        return RegistryView(self.tools, self.host.tools)
+
+    def optional_service(self, contract: str, default: Any = None) -> Any:
+        """Resolve an optional service; return ``default`` when it is absent."""
+        return self.services.get(contract, self.plugin_id, optional=True, default=default)
+
 
 class Plugin:
     """Base class; ``activate``/``deactivate`` may be omitted."""
@@ -922,6 +967,90 @@ class PluginHost:
             plugin_id=manifest.id, action="install", status=record.status,
             detail="installed (not active)",
         )
+
+    def install_bundle(
+        self, plugins: Mapping[str, Any] | Sequence[Any]
+    ) -> list[LifecycleReport]:
+        """Install a group of plugins; activation stays explicit.
+
+        The caller does not have to order the bundle: a plugin whose required
+        services are provided later in the same bundle is installed after its
+        provider. Plugins already installed in this host are reported as
+        skipped, so composing a profile is idempotent.
+        """
+        if isinstance(plugins, Mapping):
+            items = list(plugins.values())
+        else:
+            items = list(plugins)
+        manifests: list[PluginManifest] = []
+        for plugin in items:
+            manifest = getattr(plugin, "manifest", None)
+            if not isinstance(manifest, PluginManifest):
+                raise LifecycleError("plugin must expose a PluginManifest as .manifest")
+            manifest.validate()
+            manifests.append(manifest)
+        ids = [manifest.id for manifest in manifests]
+        duplicates = sorted(
+            plugin_id for plugin_id in set(ids) if ids.count(plugin_id) > 1
+        )
+        if duplicates:
+            raise LifecycleError(f"duplicate plugins in bundle: {', '.join(duplicates)}")
+
+        reports: list[LifecycleReport] = []
+        pending: list[tuple[PluginManifest, Any]] = []
+        for manifest, plugin in zip(manifests, items):
+            existing = self._records.get(manifest.id)
+            if existing is not None and existing.status != PLUGIN_UNINSTALLED:
+                reports.append(LifecycleReport(
+                    manifest.id, "install", existing.status,
+                    detail="already installed; skipped",
+                ))
+                continue
+            pending.append((manifest, plugin))
+
+        available = [
+            contract
+            for record in self._records.values()
+            if record.status != PLUGIN_UNINSTALLED
+            for contract in record.manifest.provides
+        ]
+        while pending:
+            ready = [
+                (manifest, plugin)
+                for manifest, plugin in pending
+                if all(
+                    self._bundle_requirement_met(contract, available)
+                    for contract in manifest.requires
+                )
+            ]
+            if not ready:
+                manifest = pending[0][0]
+                missing = [
+                    contract for contract in manifest.requires
+                    if not self._bundle_requirement_met(contract, available)
+                ]
+                raise LifecycleError(
+                    f"plugin {manifest.id} requires unavailable services: "
+                    f"{', '.join(missing)}"
+                )
+            installed_ids = set()
+            for manifest, plugin in ready:
+                reports.append(self.install(plugin))
+                installed_ids.add(id(plugin))
+                available.extend(manifest.provides)
+            pending = [
+                (manifest, plugin)
+                for manifest, plugin in pending
+                if id(plugin) not in installed_ids
+            ]
+        return reports
+
+    def _bundle_requirement_met(
+        self, contract: str, available: Sequence[str]
+    ) -> bool:
+        if self.services.has(contract) or self._provider_of(contract) is not None:
+            return True
+        return any(contracts_compatible(contract, provided) for provided in available)
 
     def activate(self, plugin_id: str) -> LifecycleReport:
         with self._lock:

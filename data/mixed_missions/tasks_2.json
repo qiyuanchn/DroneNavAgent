@@ -1,0 +1,68 @@
+{
+  "schema": "vlm_nav.mixed_missions.tasks/1",
+  "stages": 2,
+  "groups": {
+    "action": [
+      {
+        "name": "action_lift_hover",
+        "instruction": "上升 1 米，悬停 0.2 秒。",
+        "steps": [
+          {"kind": "move", "direction": "up", "meters": 1.0},
+          {"kind": "hover", "seconds": 0.2}
+        ]
+      },
+      {
+        "name": "action_forward_turn",
+        "instruction": "向前飞 1 米，右转 90 度。",
+        "steps": [
+          {"kind": "move", "direction": "forward", "meters": 1.0},
+          {"kind": "turn", "direction": "right", "degrees": 90}
+        ]
+      }
+    ],
+    "semantic": [
+      {
+        "name": "semantic_window_chair",
+        "instruction": "找到窗边的木椅，然后飞到它旁边。",
+        "steps": [
+          {"kind": "search", "target": "窗边的木椅", "relation": "窗边"},
+          {"kind": "approach", "target": "last", "standoff_m": 1.2}
+        ]
+      },
+      {
+        "name": "semantic_kitchen_table",
+        "instruction": "找到厨房的桌子，然后飞到它旁边。",
+        "steps": [
+          {"kind": "search", "target": "厨房的桌子", "relation": "厨房"},
+          {"kind": "approach", "target": "last", "standoff_m": 1.2}
+        ]
+      },
+      {
+        "name": "semantic_revisit_start",
+        "instruction": "找到窗边的木椅，然后回到起点。",
+        "steps": [
+          {"kind": "search", "target": "窗边的木椅", "relation": "窗边"},
+          {"kind": "revisit", "position": [0.0, 0.0, 1.0]}
+        ]
+      }
+    ],
+    "mixed": [
+      {
+        "name": "mixed_move_search",
+        "instruction": "向前飞 1 米，找到窗边的木椅。",
+        "steps": [
+          {"kind": "move", "direction": "forward", "meters": 1.0},
+          {"kind": "search", "target": "窗边的木椅", "relation": "窗边"}
+        ]
+      },
+      {
+        "name": "mixed_search_move",
+        "instruction": "找到厨房的桌子，向左移动 1 米。",
+        "steps": [
+          {"kind": "search", "target": "厨房的桌子", "relation": "厨房"},
+          {"kind": "move", "direction": "left", "meters": 1.0}
+        ]
+      }
+    ]
+  }
+}
