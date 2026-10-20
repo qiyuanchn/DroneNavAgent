@@ -87,7 +87,7 @@ DroneNavAgent/
 │   └── vlm_nav_make_scene.py  vlm_nav_eval.py
 ├── docs/                       # 资源画像 / 4090 检查清单 / 混合任务契约
 ├── serving/                    # Qwen-VL vLLM 启服脚本与说明
-├── tests/                      # agent 侧测试（43 个文件）
+├── tests/                      # agent 侧测试（44 个文件）
 ├── data/phase1/                # book/synth 场景的任务 JSON 与小型冒烟 PLY
 ├── data/mixed_missions/        # M4 的 2/4/8 阶段动作/语义/混合任务
 └── third_party/diffaero        # git submodule：3DGS/HiGS/SUPER 验证环境
@@ -269,6 +269,21 @@ CPU 矩阵与编排回归；真实语义能力由 `--semantic real` 或
 - **可观测性**：vLLM `/metrics` 看 TTFT / inter-token latency / prompt 与
   generation tokens；客户端日志的 `usage_metrics` 记录
   `cached_tokens`，用于验证 prefix caching 和 contact sheet 的实际收益。
+- **replay 精度验收**：`scripts/replay_accuracy.py` 用 replay 集的已知位姿
+  投影出“目标在哪些视角可见”的真值，分别跑旧的逐帧 640×360 和新的 320×180
+  contact sheet，输出 `exact / visible / within-one` 精度、图片数、像素数、
+  prompt token 和 cached token：
+
+```bash
+python scripts/replay_accuracy.py \
+  --replay-dir outputs/vlm_nav/replay/window_chair \
+  --backend openai --model qwen3-vl-8b \
+  --base-url http://127.0.0.1:8000/v1 --repeat 3 \
+  --out outputs/vlm_nav/replay_accuracy
+```
+
+  `--dry-run` 不需要模型，只验证 replay 真值、拼图和真值投影；无模型/无
+  CUDA 时不会伪造精度。
 
 ## 快速开始
 
