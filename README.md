@@ -79,6 +79,7 @@ DroneNavAgent/
 ├── scripts/                    # 运行、对比、验证、诊断与资源画像驱动
 │   ├── run_vlm_nav_tools.py  run_vlm_nav_m2_memory.py  run_vlm_nav_3dgs.py
 │   ├── run_motion_mission.py  run_mixed_mission.py  run_mixed_missions.py
+│   ├── make_mixed_mission_video.py
 │   ├── compare_agent_configs.py  compare_decision_loop.py
 │   ├── verify_phase1.py  verify_long_horizon.py  diagnose_grounding.py
 │   ├── profile_resources.py  check_hardware_profile.py
@@ -215,18 +216,22 @@ Structured state 会显示 `mission=... step=.../... done=...`。
 # 仓库自带 CPU 场景（无外部数据）
 python scripts/make_mixed_mission_video.py --motion-only
 
-# 真实 3DGS 场景（示例：bedroom）
+# 真实 3DGS 场景 + DiffAero HiGS 生产渲染器（需要 GPU/diffaero）
 python scripts/make_mixed_mission_video.py \
   --mission-json /tmp/bedroom_mission.json \
   --ply /assets/scenes/bedroom.ply \
   --start-pos 0.2772 -0.0595 0.1254 --start-yaw-deg 90 \
-  --width 320 --height 180 --fps 4 \
-  --out outputs/vlm_nav/demo_mixed_mission/bedroom
+  --width 1280 --height 720 --fps 4 \
+  --renderer higs --device cuda:0 \
+  --out outputs/vlm_nav/demo_mixed_mission/bedroom_higs
 ```
 
 输出 `first_person_multi_stage.mp4`、逐帧 PNG 和 `video_summary.json`；
 `--motion-only` 是纯动作链，默认任务包含 mock 语义 search/approach 阶段。
-真实场景的起始位姿需要用该场景坐标；视频只是可视化 demo，不替代精度评测。
+`--renderer` 默认 `cpu`（可移植的 CPU fallback）；要匹配 DiffAero 生产
+sensor 的画质必须用 `--renderer higs`（`SplatWorldHiGS` +
+`HiGSUTRenderer`/`GaussianSplattingCamera`）。真实场景的起始位姿需要用该
+场景坐标；视频只是可视化 demo，不替代精度评测。
 
 ## 插件迁移、worker 与 profile（M3）
 
