@@ -45,7 +45,7 @@ from vlm_nav.motion import MotionExecutor  # noqa: E402
 from vlm_nav.tools import ToolContext, ToolRegistry  # noqa: E402
 from vlm_nav.vision import contact_sheet  # noqa: E402
 from vlm_nav.vlm import frame_to_pil  # noqa: E402
-from vlm_nav.world import SplatWorldCPU, TargetSpec  # noqa: E402
+from vlm_nav.world import SplatWorldCPU, SplatWorldHiGS, TargetSpec  # noqa: E402
 
 DEFAULT_FIXTURE = REPO / "data" / "phase1" / "scenes" / "scenario_scene.ply"
 DEFAULT_TARGET = (0.48, 1.404, 0.442)
@@ -157,24 +157,41 @@ def make_video(
     target: tuple[float, float, float] = DEFAULT_TARGET,
     start: tuple[float, float, float] = DEFAULT_START,
     start_yaw_deg: float = 0.0,
+    renderer: str = "cpu",
+    device: str = "cuda:0",
 ) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     frames_dir = out_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
     for old in frames_dir.glob("frame_*.png"):
         old.unlink()
-    world = SplatWorldCPU(
-        fixture,
-        TargetSpec("red object", target, radius_m=0.2),
-        start_flu=start,
-        start_yaw_deg=start_yaw_deg,
-        width=width,
-        height=height,
-        hfov_deg=86.0,
-        bound_radius=30.0,
-        z_min=0.05,
-        z_max=20.0,
-    )
+    if renderer == "higs":
+        world = SplatWorldHiGS(
+            fixture,
+            TargetSpec("red object", target, radius_m=0.2),
+            start_flu=start,
+            start_yaw_deg=start_yaw_deg,
+            width=width,
+            height=height,
+            hfov_deg=86.0,
+            bound_radius=30.0,
+            z_min=0.05,
+            z_max=20.0,
+            device=device,
+        )
+    else:
+        world = SplatWorldCPU(
+            fixture,
+            TargetSpec("red object", target, radius_m=0.2),
+            start_flu=start,
+            start_yaw_deg=start_yaw_deg,
+            width=width,
+            height=height,
+            hfov_deg=86.0,
+            bound_radius=30.0,
+            z_min=0.05,
+            z_max=20.0,
+        )
     registry = ToolRegistry()
     ctx = ToolContext(world=world, episode_id="demo_video")
     motion = MotionExecutor(world, artifacts_dir=out_dir / "artifacts")
@@ -225,7 +242,8 @@ def make_video(
         "DroneNavAgent - first-person multi-stage mission",
         [
             "Mission: " + instruction_text[:76],
-            "Rendered from the CPU 3DGS world; executor = MixedMissionExecutor.",
+            f"Rendered by the {'HiGS GPU' if renderer == 'higs' else 'CPU'} "
+            "3DGS renderer; executor = MixedMissionExecutor.",
             "Stages: " + " -> ".join(
                 _label(spec.steps[i], i, len(spec.steps))
                 for i in range(min(len(spec.steps), 8))
@@ -240,6 +258,9 @@ def make_video(
     state: MixedMissionState = executor.run(spec)
     capture({"clock_s": state.clock_s})
     # a short end card
+    display_out = str(out_dir)
+    if "/workspace/DroneNavAgent/" in display_out:
+        display_out = display_out.split("/workspace/DroneNavAgent/", 1)[1]
     frames.append(_card(
         width, height,
         "Mission finished: " + state.status,
@@ -247,7 +268,7 @@ def make_video(
             f"steps: {state.completed_steps()}/{len(state.steps)}",
             f"sim clock: {state.clock_s:.2f}s",
             f"position: {[round(float(v), 2) for v in world.position_flu]}",
-            "outputs: " + str(out_dir),
+            "outputs: " + display_out,
         ],
     ))
 
@@ -279,6 +300,8 @@ def make_video(
             for record in state.steps
         ],
         "frames": len(frames),
+        "renderer": renderer,
+        "device": device if renderer == "higs" else "cpu",
         "fps": fps,
         "duration_s": round(len(frames) / fps, 3),
         "video": str(video),
@@ -299,6 +322,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=360)
     parser.add_argument("--fps", type=int, default=8)
+    parser.add_argument("--renderer", choices=["cpu", "higs"], default="cpu",
+                        help="cpu: portable SplatWorldCPU; higs: DiffAero GPU renderer")
+    parser.add_argument("--device", default="cuda:0",
+                        help="device for --renderer higs")
     parser.add_argument("--ply", default=str(DEFAULT_FIXTURE))
     parser.add_argument("--target-pos", type=float, nargs=3, default=DEFAULT_TARGET)
     parser.add_argument("--start-pos", type=float, nargs=3, default=DEFAULT_START)
@@ -326,6 +353,8 @@ def main(argv: list[str] | None = None) -> int:
         target=tuple(args.target_pos),
         start=tuple(args.start_pos),
         start_yaw_deg=args.start_yaw_deg,
+        renderer=args.renderer,
+        device=args.device,
     )
     print(json.dumps({
         "video": summary["video"],
