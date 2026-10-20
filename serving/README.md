@@ -42,6 +42,33 @@ CONTAINER=vlm-nav \
   --hf-home /models/.cache/huggingface
 ```
 
+### 宿主机 + Docker GPU（无宿主机 vLLM 时）
+
+如果宿主机本身没有 CUDA/vLLM、GPU 只在 Docker 容器里，直接起一个带 vLLM
+的 GPU 容器，并把模型目录只读挂进去。本机验证过的命令（GPU 5，
+`/home/dataset-assist-0/models` 下已有 `Qwen3-VL-8B`）：
+
+```bash
+docker run -d --name qwen3-vl-8b --gpus '"device=5"' -p 8000:8000 \
+  -v /home/dataset-assist-0/models:/models_ro:ro \
+  -e HF_HUB_OFFLINE=1 \
+  vllm/vllm-openai:deepseekv4-flash-vision \
+  /models_ro/Qwen3-VL-8B \
+  --host 0.0.0.0 --port 8000 --served-model-name qwen3-vl-8b \
+  --max-model-len 16384 --max-num-seqs 8 --gpu-memory-utilization 0.85 \
+  --limit-mm-per-prompt '{"image": 16}' \
+  --enable-prefix-caching --enable-chunked-prefill \
+  --enable-auto-tool-choice --tool-call-parser qwen3_coder \
+  --default-chat-template-kwargs '{"enable_thinking": false}'
+```
+
+- `--limit-mm-per-prompt` 至少要覆盖 baseline scan 的 8 张图（这里用 16）。
+- `--max-model-len 16384`：完整工具目录 + 图像的 agent turn 实测约 9k token；
+  8192 会刚好超限，纯 scan/replay 可单独用 8192。
+- 模型路径以容器内 `/models_ro` 为准；宿主机没有 vLLM 时不要用
+  `--vllm-python` 去猜宿主机路径。
+- 停止：`docker rm -f qwen3-vl-8b`。
+
 常用参数：
 
 - `--served-model-name`：客户端请求里的 `model` 字段，必须与
@@ -63,8 +90,10 @@ CONTAINER=vlm-nav \
 
 ### 渲染/token 相关的默认值
 
-- `--max-model-len` 默认从 32768 降到 **8192**：导航 episode 的实际上下文远小于
-  此值，降低它可以减少 KV cache 配置压力。
+- `--max-model-len` 默认从 32768 降到 **16384**：scan/confirm 单次调用约
+  1–2k prompt token，完整工具目录 + 上下文图的 agent turn 实测约 9k token，
+  8192 会在加 96 个输出 token 时刚好超限；16384 留出余量，仍远低于 32768。
+  纯 scan/replay 服务可以显式用 `--max-model-len 8192`。
 - `--enable-prefix-caching` 默认开启（`--no-prefix-caching` 关闭）。system
   prompt、工具目录和重复图片的 prefill 可以复用。
 - `--enable-chunked-prefill` 默认开启（`--no-chunked-prefill` 关闭），多图

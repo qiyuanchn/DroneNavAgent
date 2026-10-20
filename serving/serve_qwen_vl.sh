@@ -28,7 +28,7 @@ GPU="${CUDA_VISIBLE_DEVICES:-0}"
 HOST="${QWEN_VL_HOST:-0.0.0.0}"
 PORT="${QWEN_VL_PORT:-8000}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-16384}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 LIMIT_MM_IMAGE="${LIMIT_MM_IMAGE:-4}"
 TENSOR_PARALLEL="${TENSOR_PARALLEL:-1}"
@@ -61,7 +61,7 @@ Options:
   -p, --port PORT             HTTP port (default 8000)
       --host ADDR             bind address (default 0.0.0.0)
       --gpu-mem-util FLOAT    vLLM GPU memory fraction (default 0.90)
-      --max-model-len N       context length (default 8192)
+      --max-model-len N       context length (default 16384)
       --max-num-seqs N        concurrent sequences (default 8)
       --tensor-parallel N     tensor parallel size (default 1)
       --limit-mm-image N      images per prompt (default 4, vision only)

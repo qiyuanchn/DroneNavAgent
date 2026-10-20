@@ -998,6 +998,12 @@ class OpenAIVLM(VLMBackend):
                     response = self._session.post(
                         url, json=payload, headers=headers, timeout=self.timeout_s
                     )
+            status = getattr(response, "status_code", None)
+            if isinstance(status, int) and status >= 400:
+                detail = str(getattr(response, "text", "") or "")[:1200]
+                raise RuntimeError(
+                    f"HTTP {status} from {url}: {detail or 'no error body'}"
+                )
             raise_for_status = getattr(response, "raise_for_status", None)
             if callable(raise_for_status):
                 raise_for_status()
