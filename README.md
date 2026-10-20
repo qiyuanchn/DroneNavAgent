@@ -206,6 +206,28 @@ python scripts/run_mixed_mission.py --semantic mock \
 `ctx.extra["subgoal"]` 与 `ctx.extra["mission.progress"]`，runtime 的
 Structured state 会显示 `mission=... step=.../... done=...`。
 
+## 第一视角多阶段 demo 视频
+
+`scripts/make_mixed_mission_video.py` 用 `MixedMissionExecutor` 真跑任务链，
+在每个 motion chunk/阶段边界抓第一人称帧并编码 MP4：
+
+```bash
+# 仓库自带 CPU 场景（无外部数据）
+python scripts/make_mixed_mission_video.py --motion-only
+
+# 真实 3DGS 场景（示例：bedroom）
+python scripts/make_mixed_mission_video.py \
+  --mission-json /tmp/bedroom_mission.json \
+  --ply /assets/scenes/bedroom.ply \
+  --start-pos 0.2772 -0.0595 0.1254 --start-yaw-deg 90 \
+  --width 320 --height 180 --fps 4 \
+  --out outputs/vlm_nav/demo_mixed_mission/bedroom
+```
+
+输出 `first_person_multi_stage.mp4`、逐帧 PNG 和 `video_summary.json`；
+`--motion-only` 是纯动作链，默认任务包含 mock 语义 search/approach 阶段。
+真实场景的起始位姿需要用该场景坐标；视频只是可视化 demo，不替代精度评测。
+
 ## 插件迁移、worker 与 profile（M3）
 
 - adapter plugins：`perception.core`（6 工具）、`navigation.core`（12 工具）、
