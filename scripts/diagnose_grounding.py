@@ -1764,6 +1764,11 @@ class RecordingBackend(VLMBackend):
         self.name = f"recording:{getattr(backend, 'name', type(backend).__name__)}"
         self.on_log = getattr(backend, "on_log", None)
 
+    @property
+    def allow_box_retry(self) -> bool:
+        """The bench records one answer per case/step: no automatic retry."""
+        return bool(getattr(self.backend, "allow_box_retry", True))
+
     def decide(self, frames, system_prompt, user_prompt, context=None):
         sent, record = self.recorder.prepare(frames)
         record["system_prompt"] = system_prompt
@@ -1800,6 +1805,8 @@ class KeyedMockVLM(VLMBackend):
     """
 
     name = "mock"
+    #: the answer key is locked per "case|strategy|step": no box-only retry
+    allow_box_retry = False
 
     def __init__(self, replies: Mapping[str, Any], default: str = ""):
         self.replies = {str(k): v for k, v in dict(replies or {}).items()}
@@ -1825,6 +1832,7 @@ class OracleReplyVLM(VLMBackend):
     """
 
     name = "mock_oracle"
+    allow_box_retry = False
 
     def decide(self, frames, system_prompt, user_prompt, context=None):
         diagnosis = (context or {}).get("diagnosis") or {}

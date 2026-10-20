@@ -153,9 +153,11 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+import hashlib
 import inspect
 import json
 import math
+import re
 import time
 from typing import Any, Iterator, Mapping
 
@@ -335,17 +337,85 @@ DISTANCE_CONSENSUS_SPREAD_M = 1.0
 #: trusted at its centre: the centre is very likely background, not the object.
 LARGE_BOX_FRACTION = 0.5
 BOX_BORDER_MARGIN = 20.0
+#: A border-touching box bigger than this is not measurable at *any* pixel by
+#: the ordinary centre/ground samples: the shelf/wall ambiguity (classroom v5:
+#: [480,0,999,400], area 0.208) makes both the centre and the support contact
+#: background. The bottom strip is scanned separately (see
+#: :func:`_border_scan_sample`); when that finds no near surface either, the
+#: candidate needs a dedicated second view.
+BORDER_LARGE_FRACTION = 0.15
+#: Bottom-edge scan of a border-large box: columns across the box width, several
+#: rows near the bottom; only a contiguous run of model-consistent readings is
+#: a surface (a single stray pixel is not).
+BORDER_SCAN_COLUMNS = 17
+BORDER_SCAN_ROW_INSETS = (0.015, 0.04, 0.09)
+BORDER_SCAN_MIN_RUN = 3
+BORDER_SCAN_SPREAD_M = 0.75
+BORDER_SCAN_MODEL_DIFF_M = 1.5
+BORDER_SCAN_MODEL_RATIO = 1.5
+#: A dedicated second view turns toward the frame edge the box occupies. The
+#: sign follows the observe convention (positive yaw = left / counter-clockwise)
+#: and the magnitude grows with the box centre's distance from the image centre.
+BORDER_SECOND_VIEW_MIN_DEG = 30.0
+BORDER_SECOND_VIEW_MAX_DEG = 45.0
+BORDER_SECOND_VIEW_STEP_M = 1.5
+
+
+#: Two grounded views triangulate one candidate only when the rays are a real
+#: stereo pair: a baseline and an angle large enough that the intersection is
+#: determined, a small closest-approach residual, and a range that agrees with
+#: the trusted measurement of each view.
+TRIANGULATION_MIN_BASELINE_M = 1.0
+#: A 5.15-deg pair in the v6 bedroom run was self-consistent (0.012 m residual)
+#: and biased by 1.6 m; below this angle the depth noise dominates the baseline
+#: and the intersection is not evidence.
+TRIANGULATION_MIN_ANGLE_DEG = 10.0
+TRIANGULATION_MAX_RESIDUAL_M = 0.75
+#: The intersection must agree with a trusted single-view range within 2x: a
+#: ratio is scale-free and catches a triangulation that lands on a different
+#: surface even when the absolute gap looks small at long range.
+TRIANGULATION_RANGE_RATIO = 2.0
+TRIANGULATION_RANGE_DIFF_M = 2.5
+#: Any terminal confirmation rejection is remembered: the same triangulation
+#: point (or the same bearing/box fingerprint) is not re-minted by a later
+#: re-grounding. v6/v7 bedroom seed37 re-created one 21.3-deg point five times
+#: because only ``position_inconsistent`` used to be remembered.
+TRIANGULATION_REJECTIONS_KEY = "perception.triangulation_rejections"
+TRIANGULATION_REJECTION_LIMIT = 64
+TRIANGULATION_REJECTION_RADIUS_M = 0.75
+TRIANGULATION_REJECTION_RAY_DEG = 3.0
+TRIANGULATION_REJECTION_ORIGIN_M = 0.75
+TRIANGULATION_REJECTION_BOX_IOU = 0.6
+#: Reasons a confirmation may end on (the memory records all of them; the tuple
+#: documents the vocabulary the confirmation routine uses).
+TERMINAL_REJECTION_REASONS = frozenset({
+    "different_instance",
+    "position_inconsistent",
+    "relation_not_supported",
+    "target_not_visible_from_confirmation_view",
+})
 
 #: ``distance_source`` values: how the range a candidate was placed at was chosen
 DISTANCE_DEPTH_CENTER = "depth_center"
 DISTANCE_DEPTH_GROUND = "depth_ground"
 DISTANCE_DEPTH_CONSISTENT = "depth_consistent"
+DISTANCE_DEPTH_BORDER = "depth_border_scan"
 DISTANCE_MODEL = "model"
 DISTANCE_CONFLICT = "conflict"
+DISTANCE_TRIANGULATED = "triangulated"
+#: A depth reading that may stand on its own: it is new measurement evidence
+#: and is not overridden by an earlier rejection of a triangulated point.
+TRUSTED_DEPTH_SOURCES = frozenset({
+    DISTANCE_DEPTH_CENTER,
+    DISTANCE_DEPTH_GROUND,
+    DISTANCE_DEPTH_CONSISTENT,
+    DISTANCE_DEPTH_BORDER,
+})
 
 #: ``position_source`` values of a candidate location
 POSITION_DEPTH = "depth"
 POSITION_MODEL_DISTANCE = "model_distance"
+POSITION_TRIANGULATED = "triangulated"
 POSITION_RAY = "ray"
 POSITION_INTRINSICS_UNKNOWN = "intrinsics_unknown"
 POSITION_CROP_SOURCE_UNKNOWN = "crop_source_unknown"
@@ -353,6 +423,28 @@ POSITION_NO_RANGE = "no_valid_depth"
 POSITION_PITCHED = "pitched_view"
 POSITION_POSE_UNKNOWN = "pose_unknown"
 POSITION_NO_WORLD = "no_world"
+
+#: One cheap retry when the first grounding reply contains no usable box: the
+#: first prompt asks for attributes and distance too, and a model can answer the
+#: judgement while omitting the box. This prompt asks for the box only (no new
+#: frame, no crop render) so the retry costs one model call, not a capture.
+BOX_ONLY_SYSTEM_PROMPT = (
+    "You are the target-grounding module of a drone navigation agent. "
+    "Return ONE JSON object and nothing else: "
+    '{"candidates": [{"box": [x1, y1, x2, y2], "confidence": 0.0}]}. '
+    "box is a corner box [x1, y1, x2, y2] in normalized 0-1000 image "
+    "coordinates (x1, y1 = top-left, x2, y2 = bottom-right). "
+    "Return the box of the target even when you are unsure about its attributes "
+    'or distance. Return {"candidates": []} only when the target is truly not '
+    "visible in the frame."
+)
+
+BOX_ONLY_USER_PROMPT = (
+    "Instruction: {instruction}\n"
+    "Your previous answer contained no usable bounding box. Look at the same "
+    "frame again and return only the box of the most likely instance of the "
+    "instruction (normalized 0-1000, corner form)."
+)
 
 GROUND_SYSTEM_PROMPT = (
     "You are the target-grounding module of a drone navigation agent. "
@@ -1298,6 +1390,108 @@ def _crop_frame(frame: torch.Tensor, region: list[float], target_short: int = CR
     return crop, [x1 - x0, y1 - y0], upscale, [x0, y0]
 
 
+def _draw_hint_box(
+    frame: torch.Tensor, box: list[float], color: tuple[float, float, float] = (1.0, 0.0, 0.0)
+) -> torch.Tensor:
+    """A copy of ``frame`` with ``box`` (normalized 0-1000) drawn as an outline.
+
+    The v6 ground retry asked the same question twice on the same pixels and
+    recovered nothing in 22 tries; a visible anchor gives the model something
+    to correct instead of a blind second look.
+    """
+    out = frame.clone() if torch.is_tensor(frame) else torch.as_tensor(frame).clone()
+    if out.ndim == 2:
+        out = out.unsqueeze(0)
+    height, width = int(out.shape[-2]), int(out.shape[-1])
+    if height <= 0 or width <= 0:
+        return out
+    try:
+        x1, y1, x2, y2 = [float(value) for value in list(box)[:4]]
+    except (TypeError, ValueError):
+        return out
+    if x2 < x1:
+        x1, x2 = x2, x1
+    if y2 < y1:
+        y1, y2 = y2, y1
+    px1 = max(0, min(width - 1, int(round(x1 / 1000.0 * width))))
+    px2 = max(px1 + 1, min(width, int(round(x2 / 1000.0 * width))))
+    py1 = max(0, min(height - 1, int(round(y1 / 1000.0 * height))))
+    py2 = max(py1 + 1, min(height, int(round(y2 / 1000.0 * height))))
+    top = max(0.0, 1.0 if out.is_floating_point() else 255.0)
+    sticker = torch.tensor(
+        [channel * top for channel in color], dtype=out.dtype, device=out.device
+    ).view(3, 1, 1)
+    if out.shape[0] == 1:
+        sticker = sticker[:1]
+    thickness = max(1, min(3, min(width, height) // 64))
+    out[:, py1:py1 + thickness, px1:px2] = sticker
+    out[:, max(py1, py2 - thickness):py2, px1:px2] = sticker
+    out[:, py1:py2, px1:px1 + thickness] = sticker
+    out[:, py1:py2, max(px1, px2 - thickness):px2] = sticker
+    return out
+
+
+def _map_box_from_region(box: list[float], region: list[float]) -> list[float] | None:
+    """Map a box in an enlarged crop's 0-1000 frame back into the source frame."""
+    try:
+        x1, y1, x2, y2 = [float(value) for value in list(box)[:4]]
+        u, v, w, h = [float(value) for value in list(region)[:4]]
+    except (TypeError, ValueError):
+        return None
+    return [
+        round(u + x1 / 1000.0 * w, 3),
+        round(v + y1 / 1000.0 * h, 3),
+        round(u + x2 / 1000.0 * w, 3),
+        round(v + y2 / 1000.0 * h, 3),
+    ]
+
+
+def _retry_hint_box(
+    ctx: ToolContext, record: PerceptionObservation, instruction: str, subtask_key: str
+) -> tuple[list[float] | None, str]:
+    """A previous candidate's box (same frame or projected) for a visual retry."""
+    candidates = [
+        candidate
+        for candidate in _candidate_store(ctx).values()
+        if isinstance(candidate, Mapping) and candidate.get("box")
+    ]
+    for candidate in reversed(candidates):
+        if str(candidate.get("observation_id") or "") != str(record.observation_id):
+            continue
+        same_stage = bool(subtask_key) and str(candidate.get("subtask_key") or "") == subtask_key
+        if same_stage or _same_target_instruction(
+            str(candidate.get("instruction") or ""), instruction
+        ):
+            try:
+                return [float(value) for value in list(candidate["box"])[:4]], "previous_box"
+            except (TypeError, ValueError):
+                continue
+    if record.position_flu is None or record.yaw_rad is None:
+        return None, ""
+    try:
+        from .skills_approach import world_to_pixel
+    except Exception:  # noqa: BLE001 - projection is best effort
+        return None, ""
+    intrinsics = record.intrinsics or _observation_intrinsics(ctx, record)
+    for candidate in reversed(candidates):
+        same_stage = bool(subtask_key) and str(candidate.get("subtask_key") or "") == subtask_key
+        if not same_stage and not _same_target_instruction(
+            str(candidate.get("instruction") or ""), instruction
+        ):
+            continue
+        position = candidate.get("position_flu")
+        if not isinstance(position, (list, tuple)) or len(position) < 3:
+            continue
+        pixel = world_to_pixel(
+            position, record.position_flu, float(record.yaw_rad), intrinsics
+        )
+        if pixel is None:
+            continue
+        u, v = float(pixel[0]), float(pixel[1])
+        return [u - 80.0, v - 80.0, u + 80.0, v + 80.0], "projected_previous_candidate"
+    return None, ""
+
+
 def _region_depth(depth_fn, region: list[float]) -> tuple[float | None, int]:
     """Median of a small pixel grid inside the region (axial depth, meters)."""
     u0, v0 = region[0] / 1000.0, region[1] / 1000.0
@@ -1639,6 +1833,626 @@ def _pixel_ray(
     }
 
 
+def _ray_vector(ray: Mapping | Any) -> np.ndarray | None:
+    """Unit direction of a stored ``ray`` (bearing/elevation in degrees)."""
+    if not isinstance(ray, Mapping):
+        return None
+    bearing = _as_float(ray.get("bearing_deg"), None)
+    if bearing is None:
+        return None
+    elevation = _as_float(ray.get("elevation_deg"), 0.0) or 0.0
+    bearing_rad = math.radians(bearing)
+    elevation_rad = math.radians(elevation)
+    horizontal = math.cos(elevation_rad)
+    return np.asarray(
+        [
+            horizontal * math.cos(bearing_rad),
+            horizontal * math.sin(bearing_rad),
+            math.sin(elevation_rad),
+        ],
+        dtype=np.float64,
+    )
+
+
+def _ray_origin(ray: Mapping | Any) -> np.ndarray | None:
+    if not isinstance(ray, Mapping):
+        return None
+    origin = ray.get("origin_flu")
+    if not isinstance(origin, (list, tuple)) or len(origin) < 3:
+        return None
+    try:
+        return np.asarray([float(value) for value in origin[:3]], dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+
+
+def _triangulate_rays(ray_a: Mapping, ray_b: Mapping) -> dict | None:
+    """Closest approach of two world rays (``None`` when they are degenerate).
+
+    Two views of the same object give two bearings through its centre; the
+    point where those rays meet is a position that does not depend on either
+    view's depth reading. The residual is the distance between the rays at
+    their closest approach - a large residual means two different objects
+    (or a bearing error too large to localise).
+    """
+    origin_a, origin_b = _ray_origin(ray_a), _ray_origin(ray_b)
+    direction_a, direction_b = _ray_vector(ray_a), _ray_vector(ray_b)
+    if origin_a is None or origin_b is None or direction_a is None or direction_b is None:
+        return None
+    baseline = float(np.linalg.norm(origin_b - origin_a))
+    if baseline < TRIANGULATION_MIN_BASELINE_M:
+        return None
+    cosine = float(np.clip(np.dot(direction_a, direction_b), -1.0, 1.0))
+    angle = math.degrees(math.acos(min(1.0, abs(cosine))))
+    if angle < TRIANGULATION_MIN_ANGLE_DEG:
+        return None
+    w0 = origin_a - origin_b
+    b = float(np.dot(direction_a, direction_b))
+    denom = 1.0 - b * b
+    if denom <= 1e-6:
+        return None
+    d = float(np.dot(direction_a, w0))
+    e = float(np.dot(direction_b, w0))
+    t_a = (b * e - d) / denom
+    t_b = (e - b * d) / denom
+    if t_a <= MIN_RANGE_M or t_b <= MIN_RANGE_M:
+        return None
+    point_a = origin_a + t_a * direction_a
+    point_b = origin_b + t_b * direction_b
+    point = 0.5 * (point_a + point_b)
+    residual = float(np.linalg.norm(point_a - point_b))
+    if residual > TRIANGULATION_MAX_RESIDUAL_M:
+        return None
+    return {
+        "point": [round(float(value), 3) for value in point],
+        "range_a_m": round(t_a, 3),
+        "range_b_m": round(t_b, 3),
+        "baseline_m": round(baseline, 3),
+        "angle_deg": round(angle, 2),
+        "residual_m": round(residual, 3),
+    }
+
+
+def _expected_range(candidate: Mapping) -> float | None:
+    """The range a view trusts: a normal depth measurement, else the model."""
+    if bool(candidate.get("distance_uncertain")) or str(
+        candidate.get("distance_source") or ""
+    ) == DISTANCE_CONFLICT:
+        value = _as_float(candidate.get("distance_m"), None)
+        return None if value is None or value <= MIN_RANGE_M else value
+    value = _as_float(candidate.get("range_m"), None)
+    if value is not None and value > MIN_RANGE_M:
+        return value
+    value = _as_float(candidate.get("distance_m"), None)
+    return None if value is None or value <= MIN_RANGE_M else value
+
+
+def _range_check(candidate: Mapping, triangulated_m: float) -> dict:
+    expected = _expected_range(candidate)
+    if expected is None:
+        return {"available": False}
+    ratio = max(triangulated_m / expected, expected / triangulated_m)
+    # a scale-free 2x gate: an absolute escape would let a 1 m range agree
+    # with a 3.5 m intersection at close range
+    consistent = ratio <= TRIANGULATION_RANGE_RATIO
+    return {
+        "available": True,
+        "expected_m": round(float(expected), 3),
+        "source": (
+            "model"
+            if bool(candidate.get("distance_uncertain"))
+            or str(candidate.get("distance_source") or "") == DISTANCE_CONFLICT
+            else "depth"
+        ),
+        "ratio": round(ratio, 3),
+        "difference_m": round(abs(triangulated_m - expected), 3),
+        "consistent": bool(consistent),
+    }
+
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_PAREN_RE = re.compile(r"[（(][^）)]*[）)]")
+#: Instruction words that carry no object identity. Removing them keeps the
+#: noun overlap between "带书的书架" and "一个摆满书的书架" decisive.
+_ZH_FILLER = (
+    "找到", "寻找", "搜索", "定位", "确认", "观察", "看到", "看见",
+    "一个", "这个", "那个", "地标", "摆满", "旁边", "左侧", "右侧",
+    "左边", "右边", "附近", "前面", "后面", "上方", "下方", "之间",
+    "对面", "教室里", "卧室里", "教室", "卧室", "的", "在", "里",
+    "和", "与", "及", "带",
+)
+_EN_FILLER = frozenset(
+    {
+        "the", "a", "an", "this", "that", "find", "locate", "search",
+        "look", "for", "of", "in", "on", "at", "to", "next", "near",
+        "beside", "by", "with", "and", "target", "object", "visible",
+        "please", "show", "me",
+    }
+)
+
+
+def _target_tokens(text: str) -> set[str]:
+    """Identity-bearing tokens: ASCII words plus CJK character bigrams."""
+    lowered = _PAREN_RE.sub(" ", str(text or "").lower())
+    tokens: set[str] = set()
+    for word in _WORD_RE.findall(lowered):
+        if len(word) >= 3 and word not in _EN_FILLER:
+            tokens.add(word)
+    for run in _CJK_RE.findall(lowered):
+        cleaned = run
+        for filler in _ZH_FILLER:
+            cleaned = cleaned.replace(filler, "")
+        if len(cleaned) == 2:
+            tokens.add(cleaned)
+        for index in range(len(cleaned) - 1):
+            tokens.add(cleaned[index:index + 2])
+    return tokens
+
+
+def _target_head(text: str) -> str:
+    """The head noun's final character of a CJK phrase ("" when not CJK).
+
+    Chinese compounds put the head noun last ("木椅旁边的灯" is a lamp, not a
+    chair), so a shared anchor noun alone must not merge two targets.
+    """
+    lowered = _PAREN_RE.sub(" ", str(text or "").lower())
+    runs = _CJK_RE.findall(lowered)
+    if not runs:
+        return ""
+    head = runs[-1].rstrip("的了")
+    return head[-1] if head else ""
+
+
+def _same_target_instruction(first: str, second: str) -> bool:
+    """Do two grounding instructions name the same object?
+
+    Exact string matching broke the v6 classroom merge: the same shelf was
+    grounded as ``带书的书架`` and as ``在教室里找到带书的书架（地标） - 一个
+    摆满书的书架``. Token overlap plus the CJK head noun keeps rephrasings of
+    one object together without merging an anchor noun with its relatum.
+    """
+    tokens_a, tokens_b = _target_tokens(first), _target_tokens(second)
+    if not tokens_a or not tokens_b or not (tokens_a & tokens_b):
+        return False
+    head_a, head_b = _target_head(first), _target_head(second)
+    if head_a and head_b and head_a != head_b:
+        return False
+    return True
+
+
+def _subtask_key(ctx: ToolContext) -> str:
+    """Stable identity of the current plan stage ("" without a plan)."""
+    try:
+        from .tool_impl_task import current_subtask
+
+        subtask = current_subtask(ctx)
+    except Exception:  # noqa: BLE001 - a context without the task module
+        subtask = None
+    if not isinstance(subtask, Mapping):
+        return ""
+    goal = str(subtask.get("goal") or "").strip()
+    return f"stage:{_instruction_signature(goal)}" if goal else ""
+
+
+def _triangulation_rejections(ctx: ToolContext) -> list[dict]:
+    extra = _extra(ctx)
+    items = extra.get(TRIANGULATION_REJECTIONS_KEY)
+    if not isinstance(items, list):
+        items = []
+        extra[TRIANGULATION_REJECTIONS_KEY] = items
+    return items
+
+
+def _remember_rejected_triangulation(
+    ctx: ToolContext, candidate: Mapping, reason: str
+) -> dict | None:
+    """Remember a candidate a confirmation rejected terminally.
+
+    v6 bedroom seed37 re-minted the same 5.15-deg intersection nine times (and
+    v7 did it five times with 21.3 deg) because only ``position_inconsistent``
+    was remembered. Every terminal rejection now records the point, the ray pair
+    and a candidate fingerprint (target identity + bearing/box), so a later
+    re-grounding can neither re-mint the intersection nor hand the same
+    appearance back as a fresh candidate.
+    """
+    if not isinstance(candidate, Mapping):
+        return None
+    triangulation = (
+        candidate.get("triangulation")
+        if isinstance(candidate.get("triangulation"), Mapping) else {}
+    )
+    raw_point = candidate.get("position_flu") or triangulation.get("point")
+    point: list[float] = []
+    if isinstance(raw_point, (list, tuple)) and len(raw_point) >= 3:
+        try:
+            point = [round(float(value), 3) for value in list(raw_point)[:3]]
+        except (TypeError, ValueError):
+            point = []
+    if len(point) == 3 and not all(math.isfinite(value) for value in point):
+        point = []
+    store = _candidate_store(ctx)
+    merged_id = str(triangulation.get("merged_candidate_id") or "")
+    merged = store.get(merged_id) if merged_id else None
+    own_ray = _ray_signature(candidate.get("ray"))
+    merged_ray = _ray_signature(merged.get("ray")) if isinstance(merged, Mapping) else None
+    box = candidate.get("box")
+    target_key = _candidate_target_key(candidate)
+    if not point and own_ray is None and merged_ray is None and not box and not target_key:
+        return None
+    entry = {
+        "candidate_id": str(candidate.get("id") or ""),
+        "merged_candidate_id": merged_id,
+        "observation_id": str(
+            triangulation.get("observation_id")
+            or candidate.get("observation_id") or ""
+        ),
+        "merged_observation_id": str(
+            triangulation.get("merged_observation_id")
+            or (merged.get("observation_id") if isinstance(merged, Mapping) else "")
+            or ""
+        ),
+        "point": point,
+        "angle_deg": triangulation.get("angle_deg"),
+        "baseline_m": triangulation.get("baseline_m"),
+        "reason": str(reason),
+        "instruction": str(candidate.get("instruction") or "")[:200],
+        "subtask_key": str(candidate.get("subtask_key") or ""),
+        "target_key": target_key,
+        "ray": own_ray,
+        "merged_ray": merged_ray,
+        "box": list(box) if isinstance(box, (list, tuple)) and len(box) >= 4 else None,
+        "fingerprint": _candidate_fingerprint(candidate, store),
+    }
+    items = _triangulation_rejections(ctx)
+    items.append(entry)
+    del items[:-TRIANGULATION_REJECTION_LIMIT]
+    return entry
+
+
+def _candidate_target_key(candidate: Mapping) -> str:
+    """Identity of the target a rejection belongs to (stage, else instruction)."""
+    return str(candidate.get("subtask_key") or "").strip() or _instruction_signature(
+        str(candidate.get("instruction") or "")
+    )
+
+
+def _ray_signature(ray: Any) -> dict | None:
+    """Quantized bearing/origin of a stored ray (the camera pose it came from)."""
+    if not isinstance(ray, Mapping):
+        return None
+    bearing = _as_float(ray.get("bearing_deg"), None)
+    elevation = _as_float(ray.get("elevation_deg"), 0.0)
+    origin = _ray_origin(ray)
+    if bearing is None or origin is None:
+        return None
+    return {
+        "origin_flu": [round(float(value), 2) for value in origin],
+        "bearing_deg": round(float(bearing), 1),
+        "elevation_deg": round(float(elevation or 0.0), 1),
+    }
+
+
+def _rays_compatible(first: Any, second: Any) -> bool:
+    """Two ray signatures from the same viewpoint and almost the same bearing."""
+    if not isinstance(first, Mapping) or not isinstance(second, Mapping):
+        return False
+    origin_a = first.get("origin_flu")
+    origin_b = second.get("origin_flu")
+    try:
+        origin_gap = float(
+            np.linalg.norm(
+                np.asarray(origin_a[:3], dtype=np.float64)
+                - np.asarray(origin_b[:3], dtype=np.float64)
+            )
+        )
+        bearing_gap = abs(
+            _norm_heading(
+                float(first.get("bearing_deg") or 0.0)
+                - float(second.get("bearing_deg") or 0.0)
+            ) or 0.0
+        )
+        elevation_gap = abs(
+            float(first.get("elevation_deg") or 0.0)
+            - float(second.get("elevation_deg") or 0.0)
+        )
+    except (TypeError, ValueError):
+        return False
+    return (
+        origin_gap <= TRIANGULATION_REJECTION_ORIGIN_M
+        and bearing_gap <= TRIANGULATION_REJECTION_RAY_DEG
+        and elevation_gap <= TRIANGULATION_REJECTION_RAY_DEG
+    )
+
+
+def _box_iou(first: Any, second: Any) -> float:
+    try:
+        ax1, ay1, ax2, ay2 = (float(value) for value in list(first)[:4])
+        bx1, by1, bx2, by2 = (float(value) for value in list(second)[:4])
+    except (TypeError, ValueError):
+        return 0.0
+    width = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+    height = max(0.0, min(ay2, by2) - max(ay1, by1))
+    intersection = width * height
+    union = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1) + max(
+        0.0, bx2 - bx1
+    ) * max(0.0, by2 - by1) - intersection
+    return 0.0 if union <= 0.0 else float(intersection / union)
+
+
+def _same_rejection_target(entry: Mapping, candidate: Mapping) -> bool:
+    stored_stage = str(entry.get("subtask_key") or "")
+    current_stage = str(candidate.get("subtask_key") or "")
+    if stored_stage and current_stage and stored_stage != current_stage:
+        return False
+    stored_key = str(entry.get("target_key") or "")
+    current_key = _candidate_target_key(candidate)
+    if stored_key and current_key:
+        if stored_key == current_key:
+            return True
+        return _same_target_instruction(
+            str(entry.get("instruction") or stored_key),
+            str(candidate.get("instruction") or current_key),
+        )
+    return False
+
+
+def _candidate_fingerprint(candidate: Mapping, store: Mapping | None = None) -> str:
+    """Stable fingerprint of a candidate's identity + bearing + box.
+
+    Re-grounding the same instance usually produces a new observation id and a
+    slightly moved box; the target identity together with the ray (same pose)
+    and a quantized box is what stays equal. The triangulated point is included
+    when one exists, so the same two-view intersection is recognizable even
+    when its observation ids changed.
+    """
+    triangulation = (
+        candidate.get("triangulation")
+        if isinstance(candidate.get("triangulation"), Mapping) else {}
+    )
+    merged_id = str(triangulation.get("merged_candidate_id") or "")
+    merged = store.get(merged_id) if isinstance(store, Mapping) and merged_id else None
+    box = candidate.get("box")
+    point = candidate.get("position_flu") or triangulation.get("point")
+    payload = {
+        "target": _candidate_target_key(candidate),
+        "point": (
+            [round(float(value), 2) for value in list(point)[:3]]
+            if isinstance(point, (list, tuple)) and len(point) >= 3
+            else None
+        ),
+        "ray": _ray_signature(candidate.get("ray")),
+        "merged_ray": (
+            _ray_signature(merged.get("ray")) if isinstance(merged, Mapping) else None
+        ),
+        "box": (
+            [round(float(value) / 10.0) * 10.0 for value in list(box)[:4]]
+            if isinstance(box, (list, tuple)) and len(box) >= 4
+            else None
+        ),
+    }
+    return hashlib.sha1(
+        json.dumps(payload, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:20]
+
+
+def _candidate_rejection_match(
+    ctx: ToolContext, candidate: Mapping
+) -> tuple[dict, str] | None:
+    """The recorded terminal rejection this candidate repeats, if any.
+
+    Returns ``(entry, kind)`` where kind is ``point`` (the rejected place),
+    ``ray`` (the same viewpoint) or ``box`` (the same appearance in the same
+    region). The caller may treat ``box`` as superseded when the candidate now
+    carries a fresh, trustworthy depth measurement - that is new evidence.
+    """
+    point = candidate.get("position_flu")
+    own_ray = _ray_signature(candidate.get("ray"))
+    box = candidate.get("box")
+    for entry in reversed(_triangulation_rejections(ctx)):
+        if not _same_rejection_target(entry, candidate):
+            continue
+        stored_point = entry.get("point")
+        if (
+            isinstance(point, (list, tuple)) and len(point) >= 3
+            and isinstance(stored_point, (list, tuple)) and len(stored_point) >= 3
+        ):
+            try:
+                gap = float(
+                    np.linalg.norm(
+                        np.asarray(point[:3], dtype=np.float64)
+                        - np.asarray(stored_point[:3], dtype=np.float64)
+                    )
+                )
+            except (TypeError, ValueError):
+                gap = float("inf")
+            if gap <= TRIANGULATION_REJECTION_RADIUS_M:
+                return entry, "point"
+        if _rays_compatible(own_ray, entry.get("ray")):
+            return entry, "ray"
+        if _rays_compatible(own_ray, entry.get("merged_ray")):
+            return entry, "ray"
+        if (
+            isinstance(box, (list, tuple)) and len(box) >= 4
+            and isinstance(entry.get("box"), (list, tuple))
+            and _box_iou(box, entry.get("box")) >= TRIANGULATION_REJECTION_BOX_IOU
+        ):
+            return entry, "box"
+    return None
+
+
+def _has_independent_depth_measurement(candidate: Mapping) -> bool:
+    """A fresh single-view depth range, i.e. new measurement evidence."""
+    return (
+        str(candidate.get("position_source") or "") == POSITION_DEPTH
+        and str(candidate.get("distance_source") or "") in TRUSTED_DEPTH_SOURCES
+        and candidate.get("distance_uncertain") is not True
+    )
+
+
+def _mark_inherited_rejection(candidate: dict, entry: Mapping) -> dict:
+    """Make a re-grounded repeat of a rejected candidate rejected in place."""
+    candidate["status"] = "rejected"
+    candidate["confirmation_status"] = "rejected"
+    candidate["rejection_inherited"] = True
+    candidate["rejection_reason"] = str(entry.get("reason") or "rejected")
+    candidate["rejection_fingerprint"] = entry.get("fingerprint")
+    candidate["rejected_point"] = entry.get("point")
+    candidate["rejection_source_candidate"] = entry.get("candidate_id")
+    return candidate
+
+
+def _triangulation_rejection(
+    ctx: ToolContext,
+    other: Mapping,
+    record: PerceptionObservation,
+    point: list[float],
+    candidate: Mapping | None = None,
+) -> dict | None:
+    """The rejection entry that forbids this ray pair, or None.
+
+    Point radius, the exact observation pair and the ray pair are checked; the
+    ray pair is order-independent because the two views may be re-grounded in
+    the opposite order.
+    """
+    try:
+        target = np.asarray(point, dtype=np.float64).reshape(3)
+    except (TypeError, ValueError):
+        target = None
+    current_ray = _ray_signature(candidate.get("ray")) if candidate else None
+    other_ray = _ray_signature(other.get("ray"))
+    for entry in reversed(_triangulation_rejections(ctx)):
+        stored = entry.get("point")
+        if target is not None and isinstance(stored, (list, tuple)) and len(stored) >= 3:
+            try:
+                gap = float(
+                    np.linalg.norm(target - np.asarray(stored[:3], dtype=np.float64))
+                )
+            except (TypeError, ValueError):
+                gap = float("inf")
+            if gap <= TRIANGULATION_REJECTION_RADIUS_M:
+                return entry
+        if (
+            str(entry.get("merged_candidate_id") or "") == str(other.get("id") or "")
+            and str(entry.get("observation_id") or "") == str(record.observation_id)
+        ):
+            return entry
+        if (
+            str(entry.get("merged_observation_id") or "")
+            == str(other.get("observation_id") or "")
+            and str(entry.get("observation_id") or "") == str(record.observation_id)
+        ):
+            return entry
+        if current_ray is not None and other_ray is not None:
+            if (
+                _rays_compatible(current_ray, entry.get("ray"))
+                and _rays_compatible(other_ray, entry.get("merged_ray"))
+            ) or (
+                _rays_compatible(current_ray, entry.get("merged_ray"))
+                and _rays_compatible(other_ray, entry.get("ray"))
+            ):
+                return entry
+    return None
+
+
+def _triangulation_rejected(
+    ctx: ToolContext,
+    other: Mapping,
+    record: PerceptionObservation,
+    point: list[float],
+) -> bool:
+    return _triangulation_rejection(ctx, other, record, point) is not None
+
+
+def _triangulate_candidate(
+    ctx: ToolContext,
+    candidate: dict,
+    record: PerceptionObservation,
+    diagnostics: dict | None = None,
+) -> dict | None:
+    """Second-view support for a fresh candidate: ray intersection with an
+    earlier grounding of the same target from a different capture pose.
+
+    The earlier candidate's stored ray is reused (it was computed from that
+    frame's own pose/intrinsics); no pixels are re-read. Same-pose views (a
+    lookaround sweep) have no baseline and are deliberately skipped - their
+    heading change supplies no parallax, only the later viewpoint does.
+    Target identity is matched by the plan stage (same sub-task) or by noun
+    overlap, never by the exact instruction string: the model rephrases the
+    same object between views.
+
+    ``diagnostics["rejection"]`` is filled when a geometrically valid pair was
+    refused by the rejection memory; the caller turns that into a rejected
+    candidate instead of silently dropping the bearing.
+    """
+    ray = candidate.get("ray")
+    if not isinstance(ray, Mapping):
+        return None
+    subtask_key = str(candidate.get("subtask_key") or "")
+    store = _candidate_store(ctx)
+    best: tuple[tuple[float, float], dict, dict, dict] | None = None
+    for other in store.values():
+        if not isinstance(other, dict) or other is candidate:
+            continue
+        if str(other.get("id")) == str(candidate.get("id")):
+            continue
+        if str(other.get("observation_id") or "") == str(record.observation_id):
+            continue
+        same_stage = bool(subtask_key) and str(other.get("subtask_key") or "") == subtask_key
+        if not same_stage and not _same_target_instruction(
+            str(other.get("instruction") or ""), str(candidate.get("instruction") or "")
+        ):
+            continue
+        other_ray = other.get("ray")
+        if not isinstance(other_ray, Mapping):
+            continue
+        geometry = _triangulate_rays(ray, other_ray)
+        if geometry is None:
+            continue
+        rejection = _triangulation_rejection(
+            ctx, other, record, geometry["point"], candidate
+        )
+        if rejection is not None:
+            if isinstance(diagnostics, dict):
+                diagnostics.setdefault("rejection", rejection)
+            continue
+        current_check = _range_check(candidate, geometry["range_a_m"])
+        other_check = _range_check(other, geometry["range_b_m"])
+        available = [check for check in (current_check, other_check) if check.get("available")]
+        consistent = [check for check in available if check.get("consistent")]
+        if available and not consistent:
+            continue
+        key = (geometry["residual_m"], -geometry["angle_deg"])
+        if best is None or key < best[0]:
+            best = (key, other, geometry, {"current": current_check, "other": other_check})
+    if best is None:
+        return None
+    _, other, geometry, checks = best
+    return {
+        "position_source": POSITION_TRIANGULATED,
+        "position_flu": list(geometry["point"]),
+        "range_m": geometry["range_a_m"],
+        "range_source": POSITION_TRIANGULATED,
+        "range_status": "known",
+        "distance_source": DISTANCE_TRIANGULATED,
+        "distance_uncertain": False,
+        "triangulation": {
+            "method": "ray_intersection",
+            "merged_candidate_id": str(other.get("id") or ""),
+            "merged_observation_id": str(other.get("observation_id") or ""),
+            "observation_id": str(record.observation_id),
+            "point": list(geometry["point"]),
+            "baseline_m": geometry["baseline_m"],
+            "angle_deg": geometry["angle_deg"],
+            "residual_m": geometry["residual_m"],
+            "range_checks": checks,
+            "range_check_consistent": all(
+                check.get("consistent", True) for check in checks.values()
+            ),
+        },
+    }
+
+
 def _frame_depth_reader(ctx: ToolContext, record: PerceptionObservation):
     """(depth reader, reason) of the frame a candidate was grounded in.
 
@@ -1801,6 +2615,139 @@ def _converged_sample(
     return name, sample, stats
 
 
+def _border_scan_sample(
+    ctx: ToolContext,
+    record: PerceptionObservation,
+    box: Box,
+    depth_fn,
+    model: float | None,
+) -> dict | None:
+    """A measurable support point on the bottom strip of a border-large box.
+
+    The ordinary centre/ground samples of a shelf-sized border box read the wall
+    behind it (the classroom 25/27 loop). The object's support contact can still
+    be visible along the box bottom: scan columns across the box width, read
+    several rows near the bottom, keep the nearest reading of each column and
+    accept only a contiguous run whose depths agree with the model's range.
+    Returns ``{sample, detail}`` (``None`` when no run is a surface).
+    """
+    if model is None or depth_fn is None:
+        return None
+    width = max(1.0, float(box.width))
+    height = max(1.0, float(box.height))
+    rows = sorted({
+        round(
+            min(1000.0, max(box.y1, box.y2 - fraction * height)),
+            1,
+        )
+        for fraction in BORDER_SCAN_ROW_INSETS
+    })
+    columns: list[dict] = []
+    for index in range(BORDER_SCAN_COLUMNS):
+        x = box.x1 + (index + 0.5) / BORDER_SCAN_COLUMNS * width
+        nearest = None
+        for y in rows:
+            sample = _depth_point(ctx, record, (x, y), depth_fn)
+            if sample is None:
+                continue
+            if nearest is None or sample["depth_m"] < nearest["depth_m"]:
+                nearest = sample
+        tolerance = max(BORDER_SCAN_MODEL_DIFF_M, 0.5 * float(model))
+        consistent = False
+        if nearest is not None:
+            gap = abs(float(nearest["depth_m"]) - float(model))
+            consistent = gap <= tolerance and (
+                max(float(nearest["depth_m"]), float(model))
+                / max(MIN_RANGE_M, min(float(nearest["depth_m"]), float(model)))
+                <= BORDER_SCAN_MODEL_RATIO
+            )
+        columns.append({"sample": nearest, "consistent": bool(consistent)})
+    runs: list[tuple[int, int]] = []
+    start = None
+    for index, column in enumerate(columns + [{"consistent": False}]):
+        if column["consistent"] and start is None:
+            start = index
+        elif not column["consistent"] and start is not None:
+            runs.append((start, index - 1))
+            start = None
+    best: tuple[tuple[float, int], int, int, dict, dict] | None = None
+    for first, last in runs:
+        length = last - first + 1
+        if length < BORDER_SCAN_MIN_RUN:
+            continue
+        samples = [columns[index]["sample"] for index in range(first, last + 1)]
+        depths = sorted(float(sample["depth_m"]) for sample in samples)
+        median = depths[len(depths) // 2]
+        spread = depths[-1] - depths[0]
+        if spread > BORDER_SCAN_SPREAD_M:
+            continue
+        if median > MIN_RANGE_M and spread / median > DISTANCE_CONSENSUS_SPREAD_RATIO:
+            continue
+        middle = (first + last) // 2
+        sample = columns[middle]["sample"]
+        score = (abs(float(median) - float(model)), -length)
+        if best is None or score < best[0]:
+            best = (score, first, last, sample, {
+                "columns": BORDER_SCAN_COLUMNS,
+                "rows": rows,
+                "run_columns": length,
+                "run_start": first,
+                "run_end": last,
+                "median_m": round(median, 3),
+                "spread_m": round(spread, 3),
+            })
+    if best is None:
+        return None
+    _, _first, _last, sample, detail = best
+    detail.update({
+        "sample_pixel": sample["pixel"],
+        "sample_depth_m": sample["depth_m"],
+    })
+    return {"sample": sample, "detail": detail}
+
+
+def _border_second_view(box: Box) -> dict:
+    """The dedicated second view for a border-large box.
+
+    The next bearing must look *toward the frame edge the box occupies*, not at
+    the same shelf/wall; the small sideways step supplies the baseline the
+    in-place sweep cannot. Yaw follows ``observe``'s convention (positive =
+    left), so a box on the right edge is a negative offset.
+    """
+    left = box.x1 <= BOX_BORDER_MARGIN
+    right = box.x2 >= 1000.0 - BOX_BORDER_MARGIN
+    top = box.y1 <= BOX_BORDER_MARGIN
+    bottom = box.y2 >= 1000.0 - BOX_BORDER_MARGIN
+    centre_x = box.x1 + 0.5 * box.width
+    offset = centre_x - 500.0
+    if right and not left:
+        side = "right"
+    elif left and not right:
+        side = "left"
+    elif top and not bottom:
+        side = "top"
+    elif bottom and not top:
+        side = "bottom"
+    else:
+        side = "right" if offset >= 0.0 else "left"
+    magnitude = BORDER_SECOND_VIEW_MIN_DEG + (
+        BORDER_SECOND_VIEW_MAX_DEG - BORDER_SECOND_VIEW_MIN_DEG
+    ) * min(1.0, abs(offset) / 500.0)
+    yaw = -magnitude if offset >= 0.0 else magnitude
+    return {
+        "side": side,
+        "yaw_deg": round(yaw, 1),
+        "step_m": BORDER_SECOND_VIEW_STEP_M,
+        "step_side_m": round(BORDER_SECOND_VIEW_STEP_M, 1),
+        "why": (
+            f"the box runs into the {side} edge: turn {abs(yaw):.0f} deg toward "
+            f"that edge and take a {BORDER_SECOND_VIEW_STEP_M:g} m sideways step "
+            "before grounding again; two bearings with real parallax replace the "
+            "unmeasurable single-view range"
+        ),
+    }
+
+
 def _candidate_location(
     ctx: ToolContext,
     record: PerceptionObservation,
@@ -1819,12 +2766,19 @@ def _candidate_location(
     - a converged support-contact cluster on a normal (not border/large) box
       (``depth_consistent``) when the model range is a short estimate: the
       cluster is a measurement, the model range is recorded as an underestimate;
+    - a contiguous bottom-strip cluster on a border-touching large box
+      (``depth_border_scan``): the centre and the support contact read the wall,
+      but a run of columns whose depth agrees with the model is the near
+      support surface;
     - the model's own ``distance_m`` estimate (``model``).
 
     When the centre depth and the model estimate contradict each other (ratio
     > 2 or difference > 3 m) the centre is not trusted: the surface samples are
-    tried first, then the model. A large or border-touching box always gets the
-    surface samples because its centre is usually background. If no independent
+    tried first, then the model. A large box gets the surface samples because
+    its centre is usually background; a box that both touches the frame border
+    and covers more than 15% of it is first scanned along its bottom strip, then
+    (when no near surface exists) kept as a model range with a dedicated
+    second-view request toward the box's frame edge. If no independent
     measurement agrees, the model range is used but the candidate is marked
     ``distance_source=conflict`` / ``distance_uncertain=True`` - confirmation
     may not accept it and navigation may not approach it until it is re-grounded
@@ -1868,24 +2822,76 @@ def _candidate_location(
         return location
 
     geometry = _box_geometry(box)
+    # a border-touching, large box is the shelf/wall ambiguity: its centre and
+    # its support contact both read the surface behind the object, so no pixel
+    # of this frame can measure it (classroom v5: [480,0,999,400], 0.208 of the
+    # frame). It stays a direction with the model's estimate and needs a second
+    # view with a real baseline before it can become a position.
+    border_large = bool(
+        geometry["border_touching"] and geometry["area_fraction"] > BORDER_LARGE_FRACTION
+    )
     centre = None
     ground: list[tuple[str, dict]] = []
     usable_depth = depth_fn is not None and not pixel_problem
-    if usable_depth:
-        centre = _depth_point(ctx, record, pixel, depth_fn)
-        for name, point in _ground_points(box):
-            sample = _depth_point(ctx, record, point, depth_fn)
-            if sample is not None:
-                ground.append((name, sample))
-
-    selected: tuple[str, str, dict] | None = None  # (source, sample_name, sample)
-    conflict: dict | None = None
-    consensus_detail: dict | None = None
     model = (
         float(distance_m)
         if distance_m is not None and MIN_RANGE_M < distance_m <= MAX_RANGE_M
         else None
     )
+    border_scan: dict | None = None
+    if usable_depth and not border_large:
+        centre = _depth_point(ctx, record, pixel, depth_fn)
+        for name, point in _ground_points(box):
+            sample = _depth_point(ctx, record, point, depth_fn)
+            if sample is not None:
+                ground.append((name, sample))
+    elif usable_depth and border_large:
+        # the ordinary samples are known to read the wall for this box shape;
+        # the bottom strip is the one place a near support surface can still be
+        # visible (v7: 25/27 classroom candidates were border-large conflicts)
+        border_scan = _border_scan_sample(ctx, record, box, depth_fn, model)
+
+    selected: tuple[str, str, dict] | None = None  # (source, sample_name, sample)
+    conflict: dict | None = None
+    consensus_detail: dict | None = None
+    if border_scan is not None:
+        selected = (
+            DISTANCE_DEPTH_BORDER, "border_scan", border_scan["sample"]
+        )
+        consensus_detail = {
+            "model_m": None if model is None else round(model, 3),
+            "depth_center_m": None,
+            "depth_ground_m": border_scan["sample"]["depth_m"],
+            "ratio": (
+                None if model is None else round(
+                    max(
+                        float(border_scan["sample"]["depth_m"]) / float(model),
+                        float(model) / float(border_scan["sample"]["depth_m"]),
+                    ),
+                    3,
+                )
+            ),
+            "difference_m": (
+                None if model is None else round(
+                    abs(float(border_scan["sample"]["depth_m"]) - float(model)), 3
+                )
+            ),
+            "samples": [
+                {
+                    "source": DISTANCE_DEPTH_BORDER,
+                    "depth_m": border_scan["sample"]["depth_m"],
+                    "pixel": border_scan["sample"]["pixel"],
+                }
+            ],
+            "border_scan": border_scan["detail"],
+            "resolved": True,
+            "resolution": "border_bottom_scan",
+            "note": (
+                "the box touches the frame border, but its bottom strip holds a "
+                "contiguous near surface consistent with the model's range; that "
+                "cluster is the support point (not the wall behind the object)"
+            ),
+        }
     if centre is not None or ground:
         candidates: list[tuple[str, str, dict]] = []
         if centre is not None:
@@ -1988,6 +2994,75 @@ def _candidate_location(
     elif model is None and not usable_depth:
         conflict = None
 
+    border_second_view = (
+        _border_second_view(box) if border_large and selected is None else None
+    )
+    if border_large and selected is None:
+        # no bottom-strip support: the model's own estimate is the only range;
+        # only a dedicated, offset second view can settle it
+        conflict = {
+            "model_m": None if model is None else round(model, 3),
+            "depth_center_m": None,
+            "depth_ground_m": None,
+            "ratio": None,
+            "difference_m": None,
+            "samples": [],
+            "resolved": False,
+            "resolution": "border_large",
+            "border_touching": True,
+            "area_fraction": geometry["area_fraction"],
+            "border_scan": (
+                None if border_scan is None else border_scan["detail"]
+            ),
+            "why": (
+                "the box touches the frame border and covers more than 15% of it: "
+                "its centre and its support contact read the surface behind the "
+                "object, and the bottom-strip scan found no near surface "
+                "consistent with the model's range"
+            ),
+        }
+    advice = None
+    if conflict is not None:
+        observe_yaw = (
+            border_second_view["yaw_deg"] if border_second_view is not None else 45.0
+        )
+        advice = {
+            "reason": (
+                "border_large_box"
+                if border_large
+                else "dispersed_depth_samples"
+            ),
+            "recommended": "change_viewpoint",
+            "tool": "ground_target",
+            "args": {"instruction": None},
+            "observe_first": {"tool": "observe", "args": {"mode": "forward", "yaw_deg": observe_yaw}},
+            "dedicated_second_view": border_second_view,
+            "alternative_tool": "propose_viewpoints",
+            "why": (
+                "a single view cannot resolve this box's range: fly to an offset "
+                "viewpoint and ground the same instruction again; the two bearings "
+                "triangulate the object, and the triangulated position replaces "
+                "the single-view estimate"
+            ),
+        }
+        if border_second_view is not None:
+            advice["sequence"] = [
+                {
+                    "tool": "observe",
+                    "args": {"mode": "forward", "yaw_deg": observe_yaw},
+                },
+                {"tool": "ground_target", "args": {"instruction": None}},
+            ]
+            advice["step_hint"] = (
+                f"before grounding again, move about {border_second_view['step_side_m']:g} m "
+                f"to the {border_second_view['side']} side of the current heading "
+                "(a go_to_viewpoint / approach leg is fine): the second bearing needs "
+                "real parallax, not only a rotation"
+            )
+
+    # the bearing of the box centre is needed by triangulation even when the
+    # range came from depth (an early return must still carry it)
+    ray = _pixel_ray(ctx, record, pixel)
     if selected is not None:
         source, sample_name, sample = selected
         detail = consensus_detail if consensus_detail is not None else conflict
@@ -2026,6 +3101,11 @@ def _candidate_location(
             "distance_conflict": detail,
             "distance_uncertain": False,
             "box_area_fraction": geometry["area_fraction"],
+            "view_change_advice": advice,
+            "border_large_box": border_large,
+            "border_second_view": border_second_view,
+            "border_scan": None if border_scan is None else border_scan["detail"],
+            "ray": ray,
         }
 
     if model is not None:
@@ -2043,6 +3123,11 @@ def _candidate_location(
                 "distance_conflict": conflict,
                 "distance_uncertain": bool(conflict is not None),
                 "box_area_fraction": geometry["area_fraction"],
+                "view_change_advice": advice,
+                "border_large_box": border_large,
+                "border_second_view": border_second_view,
+                "border_scan": None if border_scan is None else border_scan["detail"],
+                "ray": ray,
             }
         if location["position_source"] == POSITION_NO_RANGE:
             location["position_source"] = problem or POSITION_NO_RANGE
@@ -2066,7 +3151,6 @@ def _candidate_location(
         location["distance_source"] = DISTANCE_DEPTH_CENTER
         location["box_area_fraction"] = geometry["area_fraction"]
 
-    ray = _pixel_ray(ctx, record, pixel)
     if ray is not None:
         location["ray"] = ray
         if location["position_source"] == POSITION_NO_RANGE:
@@ -2074,6 +3158,14 @@ def _candidate_location(
             # distance is the ray, not a point at an invented range
             location["position_source"] = POSITION_RAY
     location["box_area_fraction"] = geometry["area_fraction"]
+    location["view_change_advice"] = advice
+    location["border_large_box"] = border_large
+    location["border_second_view"] = border_second_view
+    location["border_scan"] = None if border_scan is None else border_scan["detail"]
+    if conflict is not None:
+        location["distance_source"] = DISTANCE_CONFLICT
+        location["distance_conflict"] = conflict
+        location["distance_uncertain"] = True
     return location
 
 
@@ -3074,11 +4166,11 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
         # the same pixels already produced two unresolved depth-vs-model
         # conflicts: a third call would only mint another unusable candidate
         return _conflict_stagnant_result(ctx, instruction, record, attempt)
-    try:
-        reply = backend.decide(
-            [record.frame],
-            GROUND_SYSTEM_PROMPT,
-            _ground_user_prompt(instruction),
+    def ask(system_prompt: str, user_prompt: str, frames=None):
+        return backend.decide(
+            [record.frame] if frames is None else frames,
+            system_prompt,
+            user_prompt,
             context={
                 "observation_id": record.observation_id,
                 "instruction": instruction,
@@ -3088,6 +4180,11 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
                 "tool": "ground_target",
             },
         )
+
+    vlm_calls = 0
+    try:
+        reply = ask(GROUND_SYSTEM_PROMPT, _ground_user_prompt(instruction))
+        vlm_calls += 1
     except Exception as exc:  # noqa: BLE001 - backend failures are reported
         return ToolResult(
             STATUS_FAILED,
@@ -3099,25 +4196,99 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
             evidence,
         )
 
-    items = _candidate_items(_extract_json(reply if isinstance(reply, str) else str(reply)))
-    if items is None:
-        return ToolResult(
-            STATUS_EMPTY,
-            {
-                "reason": "unparsable_reply",
-                "instruction": instruction,
-                "observation_id": record.observation_id,
-                "backend": backend_name,
-            },
-            evidence,
-        )
     store = _candidate_store(ctx)
-    candidates = _normalize_candidates(
-        items,
-        store,
-        width=int(record.frame.shape[-1]),
-        height=int(record.frame.shape[-2]),
+    subtask_key = _subtask_key(ctx)
+    frame_width = int(record.frame.shape[-1])
+    frame_height = int(record.frame.shape[-2])
+    raw_items = _candidate_items(
+        _extract_json(reply if isinstance(reply, str) else str(reply))
     )
+    candidates = (
+        _normalize_candidates(raw_items, store, width=frame_width, height=frame_height)
+        if raw_items is not None
+        else []
+    )
+    retry: dict | None = None
+    # a scripted backend that locks one answer per case/step opts out: its
+    # call log is the experiment's record, and a second call would be a new
+    # answer rather than a retry of the same question
+    if not candidates and getattr(backend, "allow_box_retry", True):
+        # the first answer named no usable box (empty list, prose, or boxes the
+        # parser dropped): one cheap box-only retry on the same frame. The first
+        # prompt asks for attributes/distance too, and the v5 bedroom run had 15
+        # confirms with no box from the view; a second, narrower question is
+        # cheaper than sending the drone to a new viewpoint for a box.
+        retry_trigger = "unparsable_reply" if raw_items is None else "no_candidate"
+        retry_calls = 0
+        retry_items = None
+        retry_region: list[float] | None = None
+        retry_mode = "box_only"
+        retry_frame = record.frame
+        retry_anchor_box: list[float] | None = None
+        hint_box, hint_mode = _retry_hint_box(ctx, record, instruction, subtask_key)
+        retry_prompt = BOX_ONLY_USER_PROMPT.format(instruction=instruction)
+        if hint_box is not None:
+            # draw the previous candidate's box on a copy: the model gets a
+            # visual anchor to correct instead of the v6 blind second look
+            retry_frame = _draw_hint_box(record.frame, hint_box)
+            retry_anchor_box = list(hint_box)
+            retry_mode = hint_mode
+            retry_prompt += (
+                "\nThe attached frame is the same view with a red rectangle around "
+                "the previous candidate. Return the exact box of the instructed "
+                "target, correcting the rectangle when it is misplaced."
+            )
+        else:
+            # no previous candidate: enlarge the centre of the frame, where a
+            # forward-looking grounding miss usually is, and map the box back
+            retry_region = [200.0, 200.0, 600.0, 600.0]
+            retry_frame, _size, _upscale, _origin = _crop_frame(record.frame, retry_region)
+            retry_mode = "centre_crop"
+            retry_prompt += (
+                "\nThe attached image is an enlarged central crop of the same view. "
+                "Return the target's box in this crop's normalized 0-1000 coordinates."
+            )
+        try:
+            retry_reply = ask(BOX_ONLY_SYSTEM_PROMPT, retry_prompt, [retry_frame])
+            retry_calls = 1
+            retry_items = _candidate_items(
+                _extract_json(retry_reply if isinstance(retry_reply, str) else str(retry_reply))
+            )
+        except Exception:  # noqa: BLE001 - a failed retry is just no candidate
+            retry_items = None
+        retry_candidates = (
+            _normalize_candidates(
+                retry_items, store, width=frame_width, height=frame_height
+            )
+            if retry_items is not None
+            else []
+        )
+        if retry_region is not None:
+            for retry_candidate in retry_candidates:
+                mapped = _map_box_from_region(retry_candidate.get("box"), retry_region)
+                if mapped is None:
+                    continue
+                retry_candidate["box"] = mapped
+                retry_candidate["box_uvwh"] = [
+                    mapped[0], mapped[1], mapped[2] - mapped[0], mapped[3] - mapped[1]
+                ]
+                retry_candidate["retry_region"] = list(retry_region)
+        vlm_calls += retry_calls
+        retry = {
+            "attempted": True,
+            "trigger": retry_trigger,
+            "vlm_calls": retry_calls,
+            "recovered": bool(retry_candidates),
+            "system_prompt": "box_only",
+            "mode": retry_mode,
+            "capture": "same_frame",
+        }
+        if retry_region is not None:
+            retry["region"] = list(retry_region)
+        if retry_anchor_box is not None:
+            retry["anchor_box"] = list(retry_anchor_box)
+        if retry_candidates:
+            candidates = retry_candidates
     if not candidates:
         # one more empty answer on this evidence: the 2nd consecutive one carries
         # the "look somewhere else" alternatives, and a 3rd call is refused above
@@ -3146,7 +4317,7 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
             step=record.metadata.get("step"),
         )
         data = {
-            "reason": "no_candidate",
+            "reason": "unparsable_reply" if raw_items is None else "no_candidate",
             "instruction": instruction,
             "observation_id": record.observation_id,
             "backend": backend_name,
@@ -3154,7 +4325,14 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
             "visibility": visibility,
             "scope_note": _scope_text(visibility),
             "memory_negative": negative_write,
+            "vlm_calls": vlm_calls,
         }
+        if retry is not None:
+            data["grounding_retry"] = retry
+            data["hint"] = (
+                "no box even after one box-only retry on the same frame: a new "
+                "viewpoint, not another re-grounding of this evidence"
+            )
         if failures >= STALL_FLAG_AT:
             change = _strategy_change(
                 ctx, record, "inspect_region" if not record.region else "change_view"
@@ -3187,11 +4365,69 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
         candidate["observation_id"] = record.observation_id
         candidate["source"] = "ground_target"
         candidate["instruction"] = instruction[:120]
+        candidate["subtask_key"] = subtask_key
         box = parse_box(candidate["box"], box_format=BOX_FORMAT_XYXY)[0]
         if box is not None:
             candidate.update(
                 _candidate_location(ctx, record, box, candidate["distance_m"], depth_fn, depth_reason)
             )
+            advice = candidate.get("view_change_advice")
+            if isinstance(advice, dict) and isinstance(advice.get("args"), dict):
+                if advice["args"].get("instruction") is None:
+                    advice["args"]["instruction"] = instruction
+            # a re-grounding of a candidate whose instance/place a confirmation
+            # already rejected inherits that verdict (v7 bedroom seed37 minted
+            # the same 21.3-deg point five times after different_instance)
+            rejection = _candidate_rejection_match(ctx, candidate)
+            if rejection is not None:
+                entry, match_kind = rejection
+                # a fresh depth measurement is new evidence against a same-box
+                # match, but not against the rejected place or bearing
+                superseded = (
+                    match_kind == "box"
+                    and _has_independent_depth_measurement(candidate)
+                )
+                if not superseded:
+                    _mark_inherited_rejection(candidate, entry)
+                    rejection = entry
+                else:
+                    rejection = None
+            if rejection is None:
+                # a second view of the same target is a stereo pair: the ray
+                # intersection replaces the single-view range and makes the
+                # candidate measurable even when neither frame's depth was
+                diagnostics: dict = {}
+                triangulated = _triangulate_candidate(
+                    ctx, candidate, record, diagnostics
+                )
+                if triangulated is not None:
+                    single_view_conflict = candidate.get("distance_conflict")
+                    candidate.update(triangulated)
+                    if single_view_conflict is not None:
+                        candidate["single_view_distance_conflict"] = single_view_conflict
+                    candidate["distance_conflict"] = {
+                        "resolved": True,
+                        "resolution": "triangulation",
+                        "single_view_conflict": single_view_conflict,
+                        **candidate["triangulation"],
+                    }
+                    candidate["view_change_advice"] = None
+                    rejection = _candidate_rejection_match(ctx, candidate)
+                    if rejection is not None:
+                        _mark_inherited_rejection(candidate, rejection[0])
+                    else:
+                        merged = store.get(
+                            str(candidate["triangulation"]["merged_candidate_id"])
+                        )
+                        if isinstance(merged, dict):
+                            merged["superseded_by"] = candidate["id"]
+                            merged["status"] = "merged"
+                            merged["merged_into"] = candidate["id"]
+                elif isinstance(diagnostics.get("rejection"), Mapping):
+                    # the geometric pair is valid but its intersection is on the
+                    # rejection list: report the candidate as rejected instead
+                    # of silently dropping the second bearing
+                    _mark_inherited_rejection(candidate, diagnostics["rejection"])
         else:  # pragma: no cover - the record's box came from this parser
             candidate["position_source"] = POSITION_NO_RANGE
             candidate["range_status"] = "unknown"
@@ -3224,7 +4460,10 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
         "box_format": BOX_FORMAT_DOC,
         "intrinsics": _observation_intrinsics(ctx, record),
         "memory_sighting": sighting_write,
+        "vlm_calls": vlm_calls,
     }
+    if retry is not None:
+        data["grounding_retry"] = retry
     if conflict_ids:
         data["distance_conflict_candidates"] = conflict_ids
         data["hint"] = (

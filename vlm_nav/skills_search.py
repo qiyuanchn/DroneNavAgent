@@ -987,10 +987,15 @@ def _scan_summary(result: ToolResult) -> dict:
 
 def _ground_summary(result: ToolResult) -> dict:
     data = result.data or {}
-    summary = _kept(data, ("reason", "n_candidates", "error", "observation_id", "note", "hint"))
+    summary = _kept(
+        data,
+        ("reason", "n_candidates", "error", "observation_id", "note", "hint", "vlm_calls"),
+    )
     summary["status"] = result.status
     if data.get("repeated_grounding"):
         summary["repeated_grounding"] = True
+    if isinstance(data.get("grounding_retry"), Mapping):
+        summary["grounding_retry"] = dict(data["grounding_retry"])
     if isinstance(data.get("strategy_change"), Mapping):
         summary["strategy_change"] = dict(data["strategy_change"])
     candidates = data.get("candidates") or []
@@ -1149,14 +1154,54 @@ def _candidate_summary(candidate: Mapping) -> dict:
             "distance_source",
             "distance_uncertain",
             "distance_conflict",
+            "triangulation",
+            "view_change_advice",
+            "border_large_box",
+            "border_second_view",
+            "border_scan",
+            "status",
+            "confirmation_status",
+            "rejection_inherited",
+            "rejection_reason",
         ),
     )
+
+
+def _candidate_trustworthy(candidate: Mapping) -> bool:
+    """A candidate confirmation may accept: a real range, or two-view geometry.
+
+    A single border/large or dispersed-depth candidate stays uncertain; the
+    routine keeps looking instead of stopping on it. A triangulated candidate is
+    the point two bearings agree on, which is exactly the second-view support
+    the single frame could not give. A candidate whose instance a confirmation
+    already rejected (or a re-grounding that inherited that rejection) is not a
+    candidate at all.
+    """
+    if str(candidate.get("status") or "") == "rejected":
+        return False
+    if str(candidate.get("position_source") or "") == "triangulated":
+        return True
+    return not bool(candidate.get("distance_uncertain")) and str(
+        candidate.get("distance_source") or ""
+    ) != "conflict"
+
+
+def _live_candidates(candidates: list) -> list:
+    """Candidates not already rejected by an earlier confirmation."""
+    return [
+        dict(item) for item in candidates
+        if isinstance(item, Mapping)
+        and str(item.get("status") or "") != "rejected"
+    ]
 
 
 def _best_candidate(candidates: list) -> dict:
     return max(
         (dict(item) for item in candidates if isinstance(item, Mapping)),
-        key=lambda item: (_as_float(item.get("confidence"), -1.0) or -1.0),
+        key=lambda item: (
+            1 if str(item.get("position_source") or "") == "triangulated" else 0,
+            _as_float(item.get("confidence"), -1.0) or -1.0,
+        ),
     )
 
 
@@ -1222,6 +1267,7 @@ def search_target(
     model_steps = 0
     candidate_id: str | None = None
     found: list[dict] = []
+    uncertain_found: list[dict] = []
     confirmed = False
     confirmation: dict | None = None
     last_coverage: dict = {}
@@ -1352,8 +1398,10 @@ def search_target(
                 if faced:
                     ground_id = faced
             grounded = caller("ground_target", {"instruction": instruction, "observation_id": ground_id})
-            if grounded.data.get("backend") and not grounded.data.get("model_call_skipped"):
-                vlm_calls += 1
+            ground_calls = int(grounded.data.get("vlm_calls") or 0)
+            if not ground_calls and grounded.data.get("backend") and not grounded.data.get("model_call_skipped"):
+                ground_calls = 1
+            vlm_calls += ground_calls
             _record(
                 steps,
                 "ground_target",
@@ -1362,8 +1410,19 @@ def search_target(
                 _ground_summary(grounded),
             )
             if grounded.status == STATUS_OK and grounded.data.get("candidates"):
-                found = list(grounded.data["candidates"])
-                candidate_id = str(found[0].get("id") or "")
+                found = _live_candidates(grounded.data["candidates"])
+                if not found:
+                    # every box repeats a terminal rejection: do not stop on a
+                    # candidate the confirmation already condemned
+                    continue
+                if any(_candidate_trustworthy(item) for item in found):
+                    candidate_id = str(_best_candidate(found).get("id") or "")
+                    break
+                # every candidate from this view is distance-uncertain: another
+                # heading at the same pose has no baseline to triangulate it, so
+                # do not stop here - fly to an offset viewpoint and ground again
+                uncertain_found = found
+                found = []
                 break
             if grounded.status == STATUS_EMPTY and grounded.data.get("reason") == "no_vlm_backend":
                 # no grounding model: sweeping further cannot change that
@@ -1408,8 +1467,10 @@ def search_target(
                     zoomed = caller(
                         "ground_target", {"instruction": instruction, "observation_id": crop_id}
                     )
-                    if zoomed.data.get("backend") and not zoomed.data.get("model_call_skipped"):
-                        vlm_calls += 1
+                    zoom_calls = int(zoomed.data.get("vlm_calls") or 0)
+                    if not zoom_calls and zoomed.data.get("backend") and not zoomed.data.get("model_call_skipped"):
+                        zoom_calls = 1
+                    vlm_calls += zoom_calls
                     _record(
                         steps,
                         "ground_target",
@@ -1418,7 +1479,14 @@ def search_target(
                         _ground_summary(zoomed),
                     )
                     if zoomed.status == STATUS_OK and zoomed.data.get("candidates"):
-                        found = list(zoomed.data["candidates"])
+                        zoomed_found = _live_candidates(zoomed.data["candidates"])
+                        if not zoomed_found:
+                            continue
+                        if any(_candidate_trustworthy(item) for item in zoomed_found):
+                            found = zoomed_found
+                            candidate_id = str(_best_candidate(found).get("id") or "")
+                            break
+                        uncertain_found = zoomed_found
                         break
         if reason == "no_vlm_backend":
             break
@@ -1507,6 +1575,26 @@ def search_target(
             break
         moved_to.append(viewpoint_id)
 
+    if candidate_id is None and uncertain_found:
+        # the routine never got a trustworthy candidate, but it did see the
+        # target: report the single-view candidate instead of pretending the
+        # search found nothing. It stays unconfirmed and the next action asks
+        # for the second viewpoint triangulation needs.
+        found = list(uncertain_found)
+        best = _best_candidate(found)
+        candidate_id = str(best.get("id") or "") or None
+        confirmed = False
+        if not reason:
+            reason = "candidate_distance_uncertain"
+        next_action = {
+            "tool": "search_target",
+            "args": {"instruction": instruction},
+            "reason": (
+                "the target was seen but its range is uncertain (large/border box "
+                "or dispersed depth): continue from an offset viewpoint so a second "
+                "bearing triangulates it"
+            ),
+        }
     if candidate_id is None and not reason:
         reason = "no_candidate_in_budget"
     if candidate_id is None and next_action is None and (moved_to or reason == "inner_steps_exhausted"):
@@ -1527,6 +1615,11 @@ def search_target(
         "instruction": instruction,
         "candidate_id": candidate_id,
         "candidates": [_candidate_summary(item) for item in found[:MAX_REPORTED_CANDIDATES]],
+        "distance_uncertain_candidates": [
+            str(item.get("id"))
+            for item in found
+            if isinstance(item, Mapping) and not _candidate_trustworthy(item)
+        ],
         "confirmed": bool(confirmed),
         "steps": steps,
         "vlm_calls": vlm_calls,

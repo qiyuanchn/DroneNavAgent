@@ -19,6 +19,8 @@ import torch
 from vlm_nav.tool_impl_perception import (
     CANDIDATE_STORE_KEY,
     IMAGE_STORE_KEY,
+    TRIANGULATION_REJECTIONS_KEY,
+    _remember_rejected_triangulation,
     latest_observation,
     compare_candidates,
     ground_target,
@@ -772,6 +774,69 @@ class GroundTargetTest(unittest.TestCase):
         self.assertEqual(result.status, "empty")
         self.assertEqual(result.data["reason"], "no_candidate")
 
+    def test_an_empty_box_answer_is_retried_once_with_a_box_only_prompt(self):
+        """A model that judged the target but omitted its box gets one retry.
+
+        The v5 bedroom confirms had 15 views with no box, so no independent
+        position measurement was possible. The retry asks for the box only on
+        the same frame (one model call, no new render) and recovers the box.
+        """
+        class TwoReplyVLM(FakeVLM):
+            def __init__(self):
+                super().__init__(None)
+                self.replies = [
+                    '{"candidates": []}',
+                    '{"candidates": [{"box": [450, 450, 100, 100], "confidence": 0.8}]}',
+                ]
+
+            def decide(self, frames, system_prompt, user_prompt, context=None):
+                self.calls.append(
+                    {"frames": frames, "system_prompt": system_prompt,
+                     "user_prompt": user_prompt, "context": context}
+                )
+                return self.replies.pop(0)
+
+        world = FakeWorld(position=(0.0, 0.0, 0.0), yaw_deg=0.0, depth=4.0)
+        ctx = make_ctx(world)
+        observed = observe(ctx, {"mode": "forward"})
+        vlm = TwoReplyVLM()
+        result = ground_target(
+            ctx,
+            {"instruction": "find the chair", "observation_id": observed.data["observation_id"]},
+            vlm=vlm,
+        )
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.data["n_candidates"], 1)
+        self.assertEqual(result.data["vlm_calls"], 2)
+        self.assertEqual(len(vlm.calls), 2)
+        self.assertIn("only the box", vlm.calls[1]["user_prompt"])
+        self.assertEqual(result.data["grounding_retry"]["trigger"], "no_candidate")
+        self.assertIs(result.data["grounding_retry"]["recovered"], True)
+        # no previous candidate to draw: the centre is enlarged and the box is
+        # mapped back into the source frame
+        self.assertEqual(result.data["grounding_retry"]["mode"], "centre_crop")
+        self.assertIn("region", result.data["grounding_retry"])
+        candidate = result.data["candidates"][0]
+        self.assertEqual(candidate["position_source"], "depth")
+        self.assertEqual(candidate["position_flu"], [4.0, 0.0, 0.0])
+
+    def test_an_empty_retry_stays_empty_and_reports_both_calls(self):
+        ctx = make_ctx(FakeWorld())
+        observed = observe(ctx, {"mode": "forward"})
+        vlm = FakeVLM('{"candidates": []}')
+        result = ground_target(
+            ctx,
+            {"instruction": "find the chair", "observation_id": observed.data["observation_id"]},
+            vlm=vlm,
+        )
+
+        self.assertEqual(result.status, "empty")
+        self.assertEqual(result.data["reason"], "no_candidate")
+        self.assertEqual(result.data["vlm_calls"], 2)
+        self.assertEqual(len(vlm.calls), 2)
+        self.assertIs(result.data["grounding_retry"]["recovered"], False)
+
     def test_candidates_without_a_valid_box_are_dropped(self):
         ctx = make_ctx(FakeWorld())
         observed = observe(ctx, {"mode": "forward"})
@@ -880,20 +945,102 @@ class CandidatePositionTest(unittest.TestCase):
         self.assertEqual(candidate["distance_source"], "conflict")
         self.assertAlmostEqual(candidate["range_m"], 3.0)
         self.assertIs(candidate["distance_conflict"]["resolved"], False)
+        self.assertEqual(candidate["distance_conflict"]["resolution"], "border_large")
         self.assertIs(candidate["distance_uncertain"], True)
-        self.assertGreater(candidate["distance_conflict"]["ratio"], 2.0)
-        self.assertGreater(candidate["distance_conflict"]["difference_m"], 3.0)
+        self.assertIs(candidate["border_large_box"], True)
+        # no pixel of this frame is measurable; the advice is a new view with
+        # a baseline, not another depth read of the same shelf/wall
+        advice = candidate["view_change_advice"]
+        self.assertEqual(advice["recommended"], "change_viewpoint")
+        self.assertEqual(advice["alternative_tool"], "propose_viewpoints")
         # the model's range (not the 16 m wall) is what navigation can use
         position = np.asarray(candidate["position_flu"], dtype=np.float64)
         self.assertGreater(position[0], 0.0)
         self.assertLess(float(np.linalg.norm(position)), 6.0)
+
+    def test_border_large_bottom_strip_finds_a_near_support_surface(self):
+        """The classroom shelf: the centre and the wall behind it are 15 m, but
+        the bottom strip holds a contiguous near surface at the model's range.
+
+        The v7 run left 25/27 classroom candidates unmeasurable because a
+        border-large box was rejected before any pixel was read. The bottom-strip
+        scan is the measurable alternative: a run of columns that agree with the
+        model's 3.5 m is the support point, not the 15 m wall.
+        """
+
+        def depth(pixel):
+            x, y = float(pixel[0]), float(pixel[1])
+            if y >= 430.0 and 600.0 <= x <= 820.0:
+                return 3.4
+            return 15.0
+
+        world = FakeWorld(
+            position=(0.0, 0.0, 0.0), yaw_deg=0.0, depth=depth, hfov_deg=90.0,
+        )
+        ctx = make_ctx(world)
+        observed = observe(ctx, {"mode": "forward"})
+        result = ground_target(
+            ctx,
+            {"instruction": "bookshelf", "observation_id": observed.data["observation_id"]},
+            vlm=FakeVLM(
+                '{"candidates": [{"box": [480, 0, 999, 500], "distance_m": 3.5}]}'
+            ),
+        )
+
+        candidate = result.data["candidates"][0]
+        self.assertIs(candidate["border_large_box"], True)
+        self.assertEqual(candidate["position_source"], "depth")
+        self.assertEqual(candidate["distance_source"], "depth_border_scan")
+        self.assertIs(candidate["distance_uncertain"], False)
+        self.assertAlmostEqual(candidate["range_m"], 3.4, places=3)
+        self.assertIsNone(candidate["border_second_view"])
+        conflict = candidate["distance_conflict"]
+        self.assertIs(conflict["resolved"], True)
+        self.assertEqual(conflict["resolution"], "border_bottom_scan")
+        self.assertGreaterEqual(conflict["border_scan"]["run_columns"], 3)
+        # the selected point is the support cluster, not the 15 m background
+        self.assertAlmostEqual(conflict["border_scan"]["sample_depth_m"], 3.4)
+
+    def test_border_large_without_a_near_surface_requests_a_dedicated_view(self):
+        """Only the 15 m wall is readable: the candidate must ask for a view
+        toward the edge the box occupies (right edge -> negative yaw), with a
+        sideways step for the baseline - not another 45-deg look at the wall."""
+        world = FakeWorld(
+            position=(0.0, 0.0, 0.0), yaw_deg=0.0,
+            depth=lambda pixel: 15.0, hfov_deg=90.0,
+        )
+        ctx = make_ctx(world)
+        observed = observe(ctx, {"mode": "forward"})
+        result = ground_target(
+            ctx,
+            {"instruction": "bookshelf", "observation_id": observed.data["observation_id"]},
+            vlm=FakeVLM(
+                '{"candidates": [{"box": [480, 0, 999, 500], "distance_m": 3.5}]}'
+            ),
+        )
+
+        candidate = result.data["candidates"][0]
+        self.assertEqual(candidate["position_source"], "model_distance")
+        self.assertEqual(candidate["distance_source"], "conflict")
+        self.assertEqual(candidate["distance_conflict"]["resolution"], "border_large")
+        self.assertIs(candidate["distance_uncertain"], True)
+        second = candidate["border_second_view"]
+        self.assertEqual(second["side"], "right")
+        self.assertGreaterEqual(abs(second["yaw_deg"]), 30.0)
+        self.assertLessEqual(abs(second["yaw_deg"]), 45.0)
+        self.assertLess(second["yaw_deg"], 0.0)
+        self.assertEqual(second["step_m"], 1.5)
+        advice = candidate["view_change_advice"]
+        self.assertEqual(advice["observe_first"]["args"]["yaw_deg"], second["yaw_deg"])
+        self.assertEqual(advice["dedicated_second_view"], second)
+        self.assertTrue(advice.get("step_hint"))
 
     def test_a_big_box_prefers_the_ground_contact_depth(self):
         """A large box whose centre is background but whose bottom edge lands
         on the object's support: the ground sample resolves the disagreement."""
         world = FakeWorld(
             position=(0.0, 0.0, 0.0), yaw_deg=0.0,
-            depth=lambda pixel: 16.0 if pixel[1] < 300.0 else 3.2,
+            depth=lambda pixel: 16.0 if pixel[1] <= 300.0 else 3.2,
             hfov_deg=90.0,
         )
         ctx = make_ctx(world)
@@ -902,7 +1049,7 @@ class CandidatePositionTest(unittest.TestCase):
             ctx,
             {"instruction": "bookshelf", "observation_id": observed.data["observation_id"]},
             vlm=FakeVLM(
-                '{"candidates": [{"box": [480, 0, 999, 400], "distance_m": 3.0}]}'
+                '{"candidates": [{"box": [480, 100, 950, 500], "distance_m": 3.0}]}'
             ),
         )
 
@@ -929,7 +1076,7 @@ class CandidatePositionTest(unittest.TestCase):
             ctx,
             {"instruction": "bookshelf", "observation_id": observed.data["observation_id"]},
             vlm=FakeVLM(
-                '{"candidates": [{"box": [480, 100, 999, 500], "distance_m": 3.0}]}'
+                '{"candidates": [{"box": [470, 100, 950, 500], "distance_m": 3.0}]}'
             ),
         )
 
@@ -1009,6 +1156,253 @@ class CandidatePositionTest(unittest.TestCase):
         self.assertIs(candidate["distance_uncertain"], True)
         self.assertIs(candidate["distance_conflict"]["resolved"], False)
         self.assertAlmostEqual(candidate["range_m"], 1.2, places=3)
+
+    def test_two_views_triangulate_the_candidate_position(self):
+        """Two bearings from different poses replace the single-view range.
+
+        Camera A at (0,0,1) looks along +x; camera B at (5,5,1) looks along -y.
+        Both see the same target at (5,0,1). Each single view is only a bearing
+        plus a range estimate; their intersection is the position.
+        """
+        world = FakeWorld(position=(0.0, 0.0, 1.0), yaw_deg=0.0, depth=5.0, hfov_deg=90.0)
+        ctx = make_ctx(world)
+        first_obs = observe(ctx, {"mode": "forward"})
+        first = ground_target(
+            ctx,
+            {"instruction": "the red chair", "observation_id": first_obs.data["observation_id"]},
+            vlm=FakeVLM('{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 5.0}]}'),
+        )
+        self.assertEqual(first.status, "ok")
+        first_candidate = first.data["candidates"][0]
+        self.assertEqual(first_candidate["position_source"], "depth")
+
+        world.state.position_flu = np.asarray([5.0, 5.0, 1.0])
+        world.state.yaw_rad = math.radians(-90.0)
+        second_obs = observe(ctx, {"mode": "forward"})
+        second = ground_target(
+            ctx,
+            {"instruction": "the red chair", "observation_id": second_obs.data["observation_id"]},
+            vlm=FakeVLM('{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 5.0}]}'),
+        )
+
+        candidate = second.data["candidates"][0]
+        self.assertEqual(candidate["position_source"], "triangulated")
+        self.assertEqual(candidate["distance_source"], "triangulated")
+        self.assertIs(candidate["distance_uncertain"], False)
+        position = np.asarray(candidate["position_flu"], dtype=np.float64)
+        error = float(np.linalg.norm(position - np.asarray([5.0, 0.0, 1.0])))
+        self.assertLess(error, 0.5)
+        triangulation = candidate["triangulation"]
+        self.assertAlmostEqual(triangulation["angle_deg"], 90.0, places=1)
+        self.assertLess(triangulation["residual_m"], 0.5)
+        self.assertEqual(
+            triangulation["merged_candidate_id"], first_candidate["id"]
+        )
+        self.assertEqual(
+            ctx.extra[CANDIDATE_STORE_KEY][first_candidate["id"]]["status"], "merged"
+        )
+
+    def test_same_pose_views_do_not_triangulate(self):
+        """A lookaround changes heading, not position: no baseline, no stereo."""
+        world = FakeWorld(position=(0.0, 0.0, 1.0), yaw_deg=0.0, depth=5.0, hfov_deg=90.0)
+        ctx = make_ctx(world)
+        first_obs = observe(ctx, {"mode": "forward"})
+        ground_target(
+            ctx,
+            {"instruction": "chair", "observation_id": first_obs.data["observation_id"]},
+            vlm=FakeVLM('{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 5.0}]}'),
+        )
+        turned = observe(ctx, {"mode": "forward", "yaw_deg": 45.0})
+        result = ground_target(
+            ctx,
+            {"instruction": "chair", "observation_id": turned.data["observation_id"]},
+            vlm=FakeVLM('{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 5.0}]}'),
+        )
+
+        candidate = result.data["candidates"][0]
+        self.assertNotEqual(candidate["position_source"], "triangulated")
+        self.assertNotIn("triangulation", candidate)
+
+    def test_a_rephrased_instruction_still_reuses_the_first_bearing(self):
+        """The model renames the same target between views (v6 classroom).
+
+        ``带书的书架`` and ``在教室里找到带书的书架（地标） - 一个摆满书的书架``
+        are one object; an exact instruction signature dropped the second
+        bearing and the shelf produced 28 unresolved conflicts but 3 merges.
+        """
+        world = FakeWorld(position=(0.0, 0.0, 1.0), yaw_deg=0.0, depth=5.0, hfov_deg=90.0)
+        ctx = make_ctx(world)
+        first_obs = observe(ctx, {"mode": "forward"})
+        first = ground_target(
+            ctx,
+            {"instruction": "带书的书架", "observation_id": first_obs.data["observation_id"]},
+            vlm=FakeVLM('{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 5.0}]}'),
+        )
+        first_candidate = first.data["candidates"][0]
+
+        world.state.position_flu = np.asarray([5.0, 5.0, 1.0])
+        world.state.yaw_rad = math.radians(-90.0)
+        second_obs = observe(ctx, {"mode": "forward"})
+        second = ground_target(
+            ctx,
+            {
+                "instruction": "在教室里找到带书的书架（地标） - 一个摆满书的书架",
+                "observation_id": second_obs.data["observation_id"],
+            },
+            vlm=FakeVLM('{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 5.0}]}'),
+        )
+
+        candidate = second.data["candidates"][0]
+        self.assertEqual(candidate["position_source"], "triangulated", candidate)
+        self.assertEqual(
+            candidate["triangulation"]["merged_candidate_id"], first_candidate["id"]
+        )
+        self.assertGreaterEqual(candidate["triangulation"]["angle_deg"], 10.0)
+
+    def test_low_parallax_views_do_not_triangulate(self):
+        """5.7 deg / 1.0 m pair: the v6 bedroom pair was biased by 1.6 m."""
+        world = FakeWorld(position=(0.0, 0.0, 1.0), yaw_deg=0.0, depth=10.0, hfov_deg=90.0)
+        ctx = make_ctx(world)
+        first_obs = observe(ctx, {"mode": "forward"})
+        ground_target(
+            ctx,
+            {"instruction": "chair", "observation_id": first_obs.data["observation_id"]},
+            vlm=FakeVLM('{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 10.0}]}'),
+        )
+
+        # 1.0 m baseline at 10 m range: atan(0.1) = 5.71 deg, below the floor
+        world.state.position_flu = np.asarray([0.0, 1.0, 1.0])
+        world.state.yaw_rad = math.radians(math.degrees(math.atan2(-1.0, 10.0)))
+        second_obs = observe(ctx, {"mode": "forward"})
+        result = ground_target(
+            ctx,
+            {"instruction": "chair", "observation_id": second_obs.data["observation_id"]},
+            vlm=FakeVLM('{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 10.0}]}'),
+        )
+
+        candidate = result.data["candidates"][0]
+        self.assertNotEqual(candidate["position_source"], "triangulated")
+        self.assertNotIn("triangulation", candidate)
+
+    def test_a_rejected_triangulation_is_not_minted_again(self):
+        """v6/v7 bedroom seed37: one intersection was minted five to nine times
+        because only ``position_inconsistent`` used to be remembered."""
+        world = FakeWorld(position=(0.0, 0.0, 1.0), yaw_deg=0.0, depth=5.0, hfov_deg=90.0)
+        ctx = make_ctx(world)
+        first_obs = observe(ctx, {"mode": "forward"})
+        ground_target(
+            ctx,
+            {"instruction": "chair", "observation_id": first_obs.data["observation_id"]},
+            vlm=FakeVLM('{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 5.0}]}'),
+        )
+
+        world.state.position_flu = np.asarray([5.0, 5.0, 1.0])
+        world.state.yaw_rad = math.radians(-90.0)
+        second_obs = observe(ctx, {"mode": "forward"})
+        second = ground_target(
+            ctx,
+            {"instruction": "chair", "observation_id": second_obs.data["observation_id"]},
+            vlm=FakeVLM('{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 5.0}]}'),
+        )
+        rejected = second.data["candidates"][0]
+        self.assertEqual(rejected["position_source"], "triangulated")
+        # a terminal identity rejection is remembered too (not only a position
+        # mismatch); v7 seed37's 21.3-deg point was rejected as different_instance
+        entry = _remember_rejected_triangulation(ctx, rejected, "different_instance")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["reason"], "different_instance")
+        self.assertEqual(len(ctx.extra[TRIANGULATION_REJECTIONS_KEY]), 1)
+        self.assertTrue(entry["fingerprint"])
+        self.assertTrue(entry["ray"])
+
+        # a third view of the same pair: the same intersection must not return,
+        # and the re-grounded candidate inherits the rejected status
+        third_obs = observe(ctx, {"mode": "forward"})
+        third = ground_target(
+            ctx,
+            {"instruction": "chair", "observation_id": third_obs.data["observation_id"]},
+            vlm=FakeVLM('{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 5.0}]}'),
+        )
+
+        candidate = third.data["candidates"][0]
+        self.assertNotEqual(candidate["position_source"], "triangulated", candidate)
+        self.assertNotIn("triangulation", candidate)
+        self.assertEqual(candidate["status"], "rejected")
+        self.assertEqual(candidate["confirmation_status"], "rejected")
+        self.assertIs(candidate["rejection_inherited"], True)
+        self.assertEqual(candidate["rejection_reason"], "different_instance")
+        self.assertEqual(
+            ctx.extra[CANDIDATE_STORE_KEY][candidate["id"]]["status"], "rejected"
+        )
+
+    def test_a_same_view_regrounding_inherits_the_rejection(self):
+        """The same bearing/box after a terminal rejection is the same
+        candidate; it must not be offered as a fresh one even when no second
+        bearing exists yet."""
+        world = FakeWorld(position=(0.0, 0.0, 1.0), yaw_deg=0.0, depth=5.0, hfov_deg=90.0)
+        ctx = make_ctx(world)
+        first_obs = observe(ctx, {"mode": "forward"})
+        first = ground_target(
+            ctx,
+            {"instruction": "chair", "observation_id": first_obs.data["observation_id"]},
+            vlm=FakeVLM('{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 5.0}]}'),
+        )
+        rejected = first.data["candidates"][0]
+        _remember_rejected_triangulation(ctx, rejected, "relation_not_supported")
+
+        # a new frame at the same pose: same ray, same box, new observation id
+        again = observe(ctx, {"mode": "forward"})
+        result = ground_target(
+            ctx,
+            {"instruction": "chair", "observation_id": again.data["observation_id"]},
+            vlm=FakeVLM('{"candidates": [{"box": [452, 448, 100, 100], "distance_m": 5.0}]}'),
+        )
+
+        candidate = result.data["candidates"][0]
+        self.assertEqual(candidate["status"], "rejected")
+        self.assertIs(candidate["rejection_inherited"], True)
+        self.assertEqual(candidate["rejection_reason"], "relation_not_supported")
+
+    def test_ground_retry_draws_the_previous_candidate_box(self):
+        """A visual anchor is what the v6 same-frame text retry lacked."""
+
+        class TwoReplyVLM(FakeVLM):
+            def __init__(self):
+                super().__init__(None)
+                self.replies = [
+                    '{"candidates": []}',
+                    '{"candidates": [{"box": [450, 450, 100, 100], "confidence": 0.8}]}',
+                ]
+
+            def decide(self, frames, system_prompt, user_prompt, context=None):
+                self.calls.append(
+                    {"frames": frames, "system_prompt": system_prompt,
+                     "user_prompt": user_prompt, "context": context}
+                )
+                return self.replies.pop(0)
+
+        world = FakeWorld(position=(0.0, 0.0, 0.0), yaw_deg=0.0, depth=4.0)
+        ctx = make_ctx(world)
+        observed = observe(ctx, {"mode": "forward"})
+        original = resolve_observation(ctx, observed.data["observation_id"]).frame.clone()
+        ground_target(
+            ctx,
+            {"instruction": "chair", "observation_id": observed.data["observation_id"]},
+            vlm=FakeVLM('{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 4.0}]}'),
+        )
+        vlm = TwoReplyVLM()
+        result = ground_target(
+            ctx,
+            {"instruction": "chair", "observation_id": observed.data["observation_id"]},
+            vlm=vlm,
+        )
+
+        self.assertEqual(result.status, "ok")
+        retry = result.data["grounding_retry"]
+        self.assertEqual(retry["mode"], "previous_box")
+        self.assertTrue(retry["recovered"])
+        self.assertIn("red rectangle", vlm.calls[1]["user_prompt"])
+        self.assertFalse(torch.equal(vlm.calls[1]["frames"][0], original))
 
     def test_repeated_conflicting_groundings_on_one_view_are_stopped(self):
         """Two unresolved conflicts on the same pixels stop the candidate loop.
@@ -2496,14 +2890,15 @@ class GroundingStallTest(unittest.TestCase):
     def test_the_third_attempt_is_blocked_without_another_model_call(self):
         self.ground()
         self.ground()
-        self.assertEqual(len(self.vlm.calls), 2)
+        # each empty grounding is one box-only retry: 2 views x 2 calls
+        self.assertEqual(len(self.vlm.calls), 4)
 
         third = self.ground()
 
         self.assertEqual(third.status, "blocked")
         self.assertEqual(third.data["reason"], "stagnant_grounding")
         self.assertTrue(third.data["repeated_grounding"])
-        self.assertEqual(len(self.vlm.calls), 2)  # the model was not asked again
+        self.assertEqual(len(self.vlm.calls), 4)  # the model was not asked again
         self.assertEqual(third.data["strategy_change"]["kind"], "change_viewpoint")
         self.assertEqual(third.data["strategy_change"]["tool"], "propose_viewpoints")
         self.assertTrue(third.data["strategy_change"]["why"])

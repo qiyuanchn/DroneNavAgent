@@ -64,7 +64,12 @@ import numpy as np
 from . import skills_approach
 from .observations import CANDIDATE_STORE_KEY
 from .tool_impl_perception import (
+    _as_frame,
+    _crop_frame,
     _depth_point,
+    _draw_hint_box,
+    _map_box_from_region,
+    _remember_rejected_triangulation,
     _vlm_from_ctx,
     parse_box,
     resolve_observation,
@@ -105,6 +110,9 @@ MAX_TURN_DEG = 80.0
 CONFIRM_POSITION_TOL_M = 1.0
 #: A deviation this large is a different surface, not measurement noise.
 CONFIRM_POSITION_REJECT_M = 2.0
+#: Slack on the relation between a candidate and the anchor stage's own
+#: recorded place when the sub-task does not declare ``within_m``.
+CONFIRM_ANCHOR_RELATION_M = 3.5
 #: How close the drone must be to inspect the candidate.
 CONFIRM_STANDOFF_M = skills_approach.APPROACH_STANDOFF_M
 CONFIRM_ARRIVE_RADIUS_M = skills_approach.ARRIVE_RADIUS_M + 0.15
@@ -126,6 +134,26 @@ SAME_HEADING_DEG = 8.0
 CONFIRMATION_LEDGER_KEY = "confirmation_ledger"
 CONFIRMATION_LEDGER_LIMIT = 32
 MAX_EVIDENCE_KEYS = 16
+
+#: One cheap retry when a confirmation view names the target but gives no box:
+#: the independent position half of confirmation is otherwise unavailable (the
+#: v5 bedroom run had 15 such views). The retry asks for the box only on the
+#: same fresh frame, so it costs one model call and no new capture.
+CONFIRM_BOX_SYSTEM_PROMPT = (
+    "You are the target-grounding step of a drone navigation agent. Return ONE "
+    'JSON object and nothing else: {"box": [x1, y1, x2, y2], "target": true}. '
+    "box is the visible extent of the instructed target in normalized 0-1000 "
+    "image coordinates (x1, y1 = top-left, x2, y2 = bottom-right), not the wall "
+    'or the whole scene. Use {"target": false, "box": null} when the target is '
+    "not visible."
+)
+
+CONFIRM_BOX_USER_PROMPT = (
+    "Instruction: {instruction}\n"
+    "Your previous answer named the target but gave no usable box. Look at the "
+    "attached fresh view again and return only the target's box (normalized "
+    "0-1000, corner form)."
+)
 
 CONFIRM_SYSTEM_PROMPT = (
     "You are the identity-confirmation step of a drone navigation agent. You are "
@@ -451,6 +479,88 @@ def _relation_anchor(
     return "", ""
 
 
+def _subtask_anchor_check(ctx: ToolContext, record: Mapping) -> dict:
+    """Is the candidate's claimed place consistent with this sub-task's anchor?
+
+    Two v6 acceptances happened 2.21 m / 2.95 m from their stage while the
+    stage declared ``locate_m=1.5``. Confirmation has no ground truth, so the
+    check uses what the sub-task itself records: a declared ``goal_position``
+    (tolerance ``locate_m``) or the anchor stage's own located evidence (a
+    relation sanity bound). With neither, the check is unavailable and the old
+    verdict stands - it never invents a place.
+    """
+    try:
+        point = np.asarray(record.get("position_flu"), dtype=np.float64).reshape(-1)[:3]
+    except (TypeError, ValueError):
+        return {"available": False, "reason": "no_candidate_position"}
+    if point.size != 3 or not np.isfinite(point).all():
+        return {"available": False, "reason": "no_candidate_position"}
+    try:
+        from .tool_impl_task import (
+            _locate_limit,
+            _position_of,
+            current_subtask,
+            plan_subtasks,
+        )
+
+        subtask = current_subtask(ctx)
+    except Exception:  # noqa: BLE001 - a context without the task module
+        subtask = None
+    if not isinstance(subtask, Mapping):
+        return {"available": False, "reason": "no_subtask"}
+    anchors: list[dict] = []
+    goal = _position_of(subtask.get("goal_position"))
+    if goal:
+        anchors.append(
+            {
+                "source": "subtask.goal_position",
+                "point": goal,
+                "tolerance_m": float(_locate_limit(subtask)),
+            }
+        )
+    subtasks = {
+        str(item.get("id")): item
+        for item in plan_subtasks(ctx) or []
+        if isinstance(item, Mapping)
+    }
+    for dependency in subtask.get("depends_on") or ():
+        anchor = subtasks.get(str(dependency))
+        if not isinstance(anchor, Mapping):
+            continue
+        tolerance = max(float(_locate_limit(subtask)), CONFIRM_ANCHOR_RELATION_M)
+        for place in anchor.get("_evidence_places") or []:
+            try:
+                anchor_point = np.asarray(place, dtype=np.float64).reshape(-1)[:3]
+            except (TypeError, ValueError):
+                continue
+            if anchor_point.size != 3 or not np.isfinite(anchor_point).all():
+                continue
+            anchors.append(
+                {
+                    "source": f"anchor.{dependency}",
+                    "point": [float(value) for value in anchor_point],
+                    "tolerance_m": tolerance,
+                }
+            )
+    if not anchors:
+        return {"available": False, "reason": "no_subtask_anchor"}
+    for anchor in anchors:
+        anchor["distance_m"] = float(
+            np.linalg.norm(point - np.asarray(anchor["point"], dtype=np.float64))
+        )
+    nearest = min(anchors, key=lambda anchor: anchor["distance_m"])
+    return {
+        "available": True,
+        "consistent": any(
+            anchor["distance_m"] <= anchor["tolerance_m"] for anchor in anchors
+        ),
+        "source": nearest["source"],
+        "distance_m": round(nearest["distance_m"], 3),
+        "tolerance_m": round(float(nearest["tolerance_m"]), 3),
+        "anchors_checked": len(anchors),
+    }
+
+
 def _confidence_state(confidence: Any) -> str:
     """How one view's confidence reads: ``ok`` / ``low`` / ``undecided``.
 
@@ -614,6 +724,80 @@ def _ask_view(
         return {"error": "unparsable_reply", "raw": str(reply)[:200], "source_frame": source_frame is not None}
     parsed["backend"] = getattr(backend, "name", None) or type(backend).__name__
     parsed["source_frame"] = source_frame is not None
+    parsed["vlm_calls"] = 1
+    if (
+        parsed.get("target") is not False
+        and not parsed.get("box")
+        and getattr(backend, "allow_box_retry", True)
+    ):
+        # the view judged the target but supplied no outline: one box-only
+        # retry on the same fresh frame (no new capture, one model call). The
+        # retry carries a visual anchor - a red rectangle on the candidate's
+        # projected place, else an enlarged centre crop - because the v6 plain
+        # second look recovered no box in 22 ground attempts.
+        retry_context = {
+            "step": "confirm_candidate_box",
+            "tool": "confirm_candidate",
+            "candidate_id": candidate_id,
+            "observation_id": view.get("obs_id"),
+            "instruction": instruction,
+            "pose": view.get("pose_flu"),
+            "yaw_deg": view.get("heading_deg"),
+        }
+        retry_prompt = CONFIRM_BOX_USER_PROMPT.format(instruction=instruction)
+        retry_source = _as_frame(view["frame"])
+        if retry_source is None:
+            retry_source = view["frame"]
+        retry_frame = retry_source
+        retry_region: list[float] | None = None
+        if candidate_pixel is not None:
+            retry_mode = "annotated_candidate_pixel"
+            hint = [
+                float(candidate_pixel[0]) - 80.0,
+                float(candidate_pixel[1]) - 80.0,
+                float(candidate_pixel[0]) + 80.0,
+                float(candidate_pixel[1]) + 80.0,
+            ]
+            retry_frame = _draw_hint_box(retry_source, hint)
+            retry_prompt += (
+                "\nThe attached frame is the same fresh view with a red rectangle "
+                "around where the candidate is expected. Return the target's exact "
+                "box, correcting the rectangle when it is misplaced."
+            )
+        else:
+            retry_mode = "centre_crop"
+            retry_region = [200.0, 200.0, 600.0, 600.0]
+            retry_frame, _size, _upscale, _origin = _crop_frame(
+                retry_source, retry_region
+            )
+            retry_prompt += (
+                "\nThe attached image is an enlarged central crop of the fresh "
+                "view. Return the target's box in this crop's normalized 0-1000 "
+                "coordinates."
+            )
+        try:
+            retry_reply = backend.decide(
+                [retry_frame],
+                CONFIRM_BOX_SYSTEM_PROMPT,
+                retry_prompt,
+                context=retry_context,
+            )
+            parsed["vlm_calls"] = 2
+            retry_parsed = _parse_reply(retry_reply)
+            if retry_parsed is not None and retry_parsed.get("box"):
+                box = retry_parsed["box"]
+                if retry_region is not None:
+                    mapped = _map_box_from_region(box, retry_region)
+                    if mapped is not None:
+                        box = mapped
+                parsed["box"] = box
+                parsed["box_problem"] = ""
+                parsed["box_retry"] = True
+                parsed["box_retry_mode"] = retry_mode
+                if retry_region is not None:
+                    parsed["box_retry_region"] = list(retry_region)
+        except Exception:  # noqa: BLE001 - a failed retry is just no box
+            pass
     return parsed
 
 
@@ -786,13 +970,31 @@ def _reground_view_action(
     source = resolve_observation(ctx, source_id) if source_id else None
     if source is not None and getattr(source, "yaw_deg", None) is not None:
         current = float(source.yaw_deg)
+    second = record.get("border_second_view")
+    second = second if isinstance(second, Mapping) else None
+    second_yaw = _as_float(second.get("yaw_deg"), None) if second else None
     offsets = [step, -step]
+    if second_yaw is not None:
+        # a border-large box needs the view toward the edge it runs into, not a
+        # generic 45-deg turn away from it
+        offsets = [float(second_yaw), -float(second_yaw), step, -step]
+    unique_offsets: list[float] = []
+    for offset in offsets:
+        if all(abs(_norm_deg(offset - kept)) > 1.0 for kept in unique_offsets):
+            unique_offsets.append(offset)
+    offsets = unique_offsets
     viewpoints = [
         {
             "yaw_deg": round(offset, 1),
             "why": (
-                "turn from the current heading before grounding: a view that "
-                "returns the same pixels returns the same depth/model conflict"
+                "turn toward the frame edge the candidate occupies before "
+                "grounding again: a view that returns the same pixels returns "
+                "the same depth/model conflict"
+                if second_yaw is not None and abs(offset - second_yaw) <= 1.0
+                else (
+                    "turn from the current heading before grounding: a view that "
+                    "returns the same pixels returns the same depth/model conflict"
+                )
             ),
         }
         for offset in offsets
@@ -831,6 +1033,13 @@ def _reground_view_action(
         "tool": "observe",
         "args": {"mode": "forward", "yaw_deg": round(offsets[0], 1)},
     }
+    if second is not None:
+        action["dedicated_second_view"] = dict(second)
+        action["step_hint"] = (
+            f"step about {second.get('step_side_m') or second.get('step_m')} m to "
+            f"the {second.get('side') or 'edge'} side before grounding again: "
+            "rotation alone gives no baseline, the triangulation needs parallax"
+        )
     return action
 
 
@@ -1656,7 +1865,7 @@ def _run_confirmation(
             distance,
             relation_source=relation_source,
         )
-        vlm_calls += 1
+        vlm_calls += int(verdict.get("vlm_calls") or 1)
 
         # location consistency: the model names the object's box on *this*
         # fresh frame, and that box - not the candidate's own projected pixel -
@@ -1705,6 +1914,9 @@ def _run_confirmation(
             "source_frame_attached": bool(verdict.get("source_frame")),
             "box": verdict.get("box"),
             "box_problem": verdict.get("box_problem") or "",
+            "box_retry": bool(verdict.get("box_retry")),
+            "box_retry_mode": verdict.get("box_retry_mode") or "",
+            "box_retry_region": verdict.get("box_retry_region"),
             "independent": True,
         }
         if verdict.get("error"):
@@ -1744,6 +1956,12 @@ def _run_confirmation(
             }
             for attempt in position_attempts
         ]
+    anchor_check = _subtask_anchor_check(ctx, record)
+    position_check = dict(position_check)
+    position_check["subtask_anchor"] = anchor_check
+    anchor_ok = not anchor_check.get("available") or bool(
+        anchor_check.get("consistent")
+    )
     strong_bad = [
         view for view in views
         if view.get("same_instance") is False or view.get("attributes_match") is False
@@ -1765,6 +1983,9 @@ def _run_confirmation(
         entry["attempts"] = int(entry.get("attempts", 0)) + 1
         entry["last_verdict"] = CONFIRMATION_REJECTED
         _set_candidate_status(ctx, candidate_id, CONFIRMATION_REJECTED, reason)
+        # a triangulated point the independent measurement refused is not
+        # re-minted from the same ray pair (v6 bedroom seed37 repeated it 9x)
+        _remember_rejected_triangulation(ctx, record, reason)
         record_confirmation(
             ctx, candidate_id=candidate_id, verdict=CONFIRMATION_REJECTED,
             observation_ids=[str(view.get("obs_id")) for view in views],
@@ -1848,8 +2069,23 @@ def _run_confirmation(
             ),
             views=views, position_check=checks,
         )
-    if appearance_ok and position_ok:
+    if appearance_ok and position_ok and anchor_ok:
         return accept()
+    if appearance_ok and position_ok and not anchor_ok:
+        # the instance and the fresh measurement agree, but the candidate sits
+        # outside the place the sub-task's own anchor records: at most open,
+        # never accepted (v6 accepted two such placements)
+        return uncertain(
+            ["location"], "outside_subtask_anchor",
+            _next_action(
+                "ground_target",
+                {"instruction": instruction},
+                "the candidate is outside the current sub-task's anchor/goal "
+                "tolerance: re-ground the stage's object from a view that also "
+                "shows the anchor, instead of accepting this place",
+            ),
+            views=views, position_check=position_check,
+        )
     if appearance_ok:
         # appearance is agreed but the location could not be measured: without
         # the second, independent measurement the verdict stays open

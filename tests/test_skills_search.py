@@ -287,6 +287,54 @@ class SearchTargetTest(unittest.TestCase):
         self.assertEqual(len(coverage["checked_deg"]), 8)
         json.dumps(result.to_dict())
 
+    def test_a_single_view_conflict_continues_to_a_second_viewpoint_without_low_parallax_triangulation(self):
+        """The sweep must not stop on a distance-uncertain candidate.
+
+        Round 1 sees the target but neither its depth nor its model range can
+        localise it (dispersed samples, 3 m model). The routine changes place
+        and grounds again. This pair's parallax is only ~8 deg, below the
+        10-deg stereo floor: the second depth consensus is reported, but the
+        bearings are not triangulated (v6 bedroom's biased 5.15-deg pair).
+        """
+        class DispersedDepthWorld(FakeWorld):
+            def depth_at_pixel(self, pixel):
+                return 7.0 if pixel[0] < 775.0 else (12.0 if pixel[0] < 825.0 else 22.0)
+
+        world = DispersedDepthWorld(position=(0.0, 0.0, 1.0), yaw_deg=0.0)
+        world.hfov_deg = 130.0
+        # the same world object at (3.7, -4.7, 1) is at u=800 from the first
+        # pose and u=896 after the viewpoint move: two different bearings
+        view_one = (
+            '{"candidates": [{"box": [750, 450, 100, 100], '
+            '"distance_m": 6.0, "confidence": 0.8}]}'
+        )
+        view_two = (
+            '{"candidates": [{"box": [846, 450, 100, 100], '
+            '"distance_m": 6.0, "confidence": 0.8}]}'
+        )
+        vlm = ScriptedGroundingVLM(replies={"obs_1": view_one, "obs_9": view_two})
+        moved: list[str] = []
+        registry = make_search_registry(world, vlm, moved=moved)
+        ctx = make_ctx(world)
+
+        result = registry.call(
+            "search_target",
+            {"instruction": "the bookshelf", "budget_turns": 2, "max_steps": 20},
+            ctx,
+        )
+
+        self.assertEqual(result.status, "ok", result.data)
+        self.assertTrue(result.data["confirmed"])
+        candidate = result.data["candidates"][0]
+        self.assertNotEqual(candidate["position_source"], "triangulated")
+        self.assertNotIn("triangulation", candidate)
+        self.assertIs(candidate["distance_uncertain"], False)
+        tools = [step["step"] for step in result.data["steps"]]
+        self.assertIn("go_to_viewpoint", tools)
+        self.assertGreaterEqual(tools.count("ground_target"), 2)
+        self.assertEqual(len(world.scan_positions), 2)
+        self.assertNotEqual(world.scan_positions[0], world.scan_positions[1])
+
     def test_the_grounding_calls_stop_at_the_first_view_with_candidates(self):
         world = FakeWorld()
         vlm = ScriptedGroundingVLM(
@@ -370,7 +418,9 @@ class SearchTargetTest(unittest.TestCase):
         )
 
         self.assertEqual(result.status, "empty")
-        self.assertLessEqual(len(vlm.calls), 4)  # 2 views x (view + one zoom)
+        # 2 views x (view + one zoom) x (first ask + box-only retry)
+        self.assertLessEqual(len(vlm.calls), 8)
+        self.assertEqual(result.data["vlm_calls"], len(vlm.calls))
         self.assertEqual(result.data["cost"]["budget_turns"], 1)
         self.assertIsNone(result.data["candidate_id"])
 

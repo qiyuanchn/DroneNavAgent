@@ -1983,6 +1983,31 @@ class RecoveryTest(unittest.TestCase):
         self.assertIn("propose_viewpoints", text)
         self.assertIn("go_to_viewpoint", text)
 
+    def test_advice_for_a_distance_uncertain_candidate_does_not_reconfirm(self):
+        """The v4 confirm loop: an uncertain range cannot be fixed by confirming.
+
+        ``confirm_candidate`` used to feed its uncertain verdict into the
+        generic identity rule, which told the model to confirm the same
+        candidate from another heading. The advice now changes the view and
+        re-grounds, and never offers another confirmation of that candidate.
+        """
+        advice = recovery_advice(
+            "confirm_candidate",
+            {
+                "verdict": "uncertain",
+                "reason": "candidate_distance_uncertain",
+                "candidate_id": "cand_1",
+                "distance_source": "conflict",
+            },
+            STATUS_BLOCKED,
+            available=self.ADVICE_TOOLS,
+        )
+        text = " ".join(advice)
+        self.assertIn("ground_target", text)
+        self.assertIn("observe", text)
+        self.assertIn("do not call confirm_candidate again", text)
+        self.assertNotIn('confirm_candidate(candidate_id="cand_1")', text)
+
     def test_advice_for_a_searched_out_area(self):
         advice = recovery_advice(
             "search",

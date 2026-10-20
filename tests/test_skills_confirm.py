@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import unittest
 
 import numpy as np
+import torch
 
 from vlm_nav.actions import NavAction, action_to_body_delta, body_delta_to_world
 from vlm_nav.mcp_server import ENV_TOOL_NAMES, TOOL_CONTRACTS
@@ -231,7 +232,12 @@ class ScriptedVLM:
 
     def decide(self, frames, system_prompt, user_prompt, context=None):
         self.calls.append(
-            {"frames": len(frames), "context": dict(context or {}), "prompt": user_prompt}
+            {
+                "frames": len(frames),
+                "frames_raw": list(frames),
+                "context": dict(context or {}),
+                "prompt": user_prompt,
+            }
         )
         reply = self.replies.pop(0) if len(self.replies) > 1 else self.replies[0]
         return reply if isinstance(reply, str) else json.dumps(reply)
@@ -322,6 +328,46 @@ class ConfirmCandidateTest(unittest.TestCase):
         self.assertLessEqual(
             result.data["position_check"]["delta_m"], 1.0, result.data["position_check"]
         )
+
+    def test_a_candidate_outside_the_subtask_anchor_is_not_accepted(self):
+        """v6 accepted two confirmations 2.2-3.0 m from a stage with locate 1.5."""
+        vlm = ScriptedVLM([ACCEPTED, ACCEPTED])
+        ctx = make_context(ConfirmWorld(), vlm)
+        registry = make_registry(vlm)
+        source = registry.call("observe", {"mode": "forward"}, ctx)
+        store_candidate(ctx, observation_id=source.data["observation_id"])
+
+        from vlm_nav.tool_impl_task import update_plan
+
+        plan = update_plan(
+            ctx,
+            {
+                "steps": [
+                    {
+                        "id": "st_1",
+                        "goal": "the wooden cabinet",
+                        "position_flu": [8.0, 0.0, 0.0],
+                        "locate_m": 1.5,
+                    }
+                ]
+            },
+        )
+        self.assertEqual(plan.status, STATUS_OK, plan.data)
+
+        result = registry.call(
+            "confirm_candidate",
+            {"candidate_id": "cand_1", "instruction": "the wooden cabinet"},
+            ctx,
+        )
+
+        self.assertEqual(result.data["verdict"], "uncertain", result.data)
+        self.assertEqual(result.data["reason"], "outside_subtask_anchor")
+        self.assertEqual(result.data["missing"], ["location"])
+        anchor = result.data["position_check"]["subtask_anchor"]
+        self.assertIs(anchor["available"], True, anchor)
+        self.assertIs(anchor["consistent"], False, anchor)
+        self.assertGreater(anchor["distance_m"], anchor["tolerance_m"])
+        self.assertEqual(result.data["confirmation_count"], 0)
 
     def test_a_wrong_candidate_is_rejected_and_finish_cannot_count_it(self):
         vlm = ScriptedVLM([WRONG_INSTANCE])
@@ -477,6 +523,41 @@ class ConfirmCandidateTest(unittest.TestCase):
         self.assertIs(check["available"], False, check)
         self.assertEqual(check["reason"], "no_box_from_view")
         self.assertEqual(result.data["confirmation_count"], 0)
+
+    def test_a_view_without_a_box_is_retried_once_for_the_box(self):
+        """The independent position half needs a box; a box-only retry supplies
+        it without another view or capture (v5 bedroom: 15 such views)."""
+        no_box = {key: value for key, value in ACCEPTED.items() if key != "box"}
+        retry = {
+            "target": True,
+            "box": [450, 450, 550, 550],
+            "confidence": 0.8,
+            "reason": "box only",
+        }
+        vlm = ScriptedVLM([no_box, retry, ACCEPTED])
+        world = ConfirmWorld(position=(1.8, 0.0, 0.0), target=(3.0, 0.0, 0.0))
+        ctx = make_context(world, vlm)
+        registry = make_registry(vlm)
+        store_candidate(ctx)
+
+        result = registry.call(
+            "confirm_candidate",
+            {"candidate_id": "cand_1", "instruction": "the wooden cabinet"},
+            ctx,
+        )
+
+        self.assertEqual(result.data["verdict"], "accepted", result.data)
+        # view 1: no box -> retry, view 2: normal answer
+        self.assertEqual(result.data["vlm_calls"], 3)
+        check = result.data["position_check"]
+        self.assertIs(check["available"], True, check)
+        self.assertEqual(check["method"], "observed_box")
+        self.assertIsNotNone(check.get("box"))
+        # the retry carried a visual anchor (the candidate's projected box);
+        # the plain same-frame text retry recovered 0/22 in v6
+        retry_frame = torch.as_tensor(vlm.calls[1]["frames_raw"][0])
+        red = (retry_frame[0] > 0.9) & (retry_frame[1] < 0.1) & (retry_frame[2] < 0.1)
+        self.assertTrue(bool(red.any()))
 
     def test_a_whole_frame_box_is_not_an_object_measurement(self):
         """The v3 seed41 failure: Qwen boxed [0,0,1000,1000] and the nearest
@@ -980,6 +1061,11 @@ class ConfirmCandidateTest(unittest.TestCase):
         self.assertEqual(
             ctx.extra["perception.candidates"]["cand_1"].get("status"), "rejected"
         )
+        # every terminal rejection is remembered, including different_instance
+        rejections = ctx.extra.get("perception.triangulation_rejections") or []
+        self.assertTrue(rejections)
+        self.assertEqual(rejections[-1]["reason"], "different_instance")
+        self.assertEqual(rejections[-1]["candidate_id"], "cand_1")
 
     def test_the_relation_prompt_carries_the_full_anchor(self):
         """The view check names the sub-task's whole anchor (object + relation)."""
