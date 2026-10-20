@@ -64,9 +64,10 @@ MCP stdio server（同一 registry、同一 session）或脚本直接调用
 DroneNavAgent/
 ├── README.md
 ├── pyproject.toml              # 包名 vlm_nav；extras: hf / openai / mcp / test
-├── vlm_nav/                    # 核心 agent 包（27 个模块 + plugins 子包）
+├── vlm_nav/                    # 核心 agent 包（29 个模块 + plugins 子包）
 │   ├── runtime.py  tools.py  actions.py  candidates.py
-│   ├── motion.py  mixed_mission.py  task_planner.py  semantic.py  hardware.py
+│   ├── motion.py  mixed_mission.py  task_planner.py  semantic.py
+│   ├── vision.py  offline_batch.py  hardware.py
 │   ├── observations.py  memory.py  world.py  cpu_renderer.py
 │   ├── tool_impl_perception.py  tool_impl_navigation.py  tool_impl_task.py
 │   ├── skills_approach.py  skills_search.py  skills_confirm.py
@@ -86,7 +87,7 @@ DroneNavAgent/
 │   └── vlm_nav_make_scene.py  vlm_nav_eval.py
 ├── docs/                       # 资源画像 / 4090 检查清单 / 混合任务契约
 ├── serving/                    # Qwen-VL vLLM 启服脚本与说明
-├── tests/                      # agent 侧测试（41 个文件）
+├── tests/                      # agent 侧测试（43 个文件）
 ├── data/phase1/                # book/synth 场景的任务 JSON 与小型冒烟 PLY
 ├── data/mixed_missions/        # M4 的 2/4/8 阶段动作/语义/混合任务
 └── third_party/diffaero        # git submodule：3DGS/HiGS/SUPER 验证环境
@@ -243,6 +244,31 @@ python scripts/check_hardware_profile.py --profile 4090-local --device cuda
 （工具/服务/worker 进程/residual）。语义组和混合组的 mock 服务只用于
 CPU 矩阵与编排回归；真实语义能力由 `--semantic real` 或
 `run_mixed_mission.py --semantic real` 验证。
+
+## VLM 成本与吞吐
+
+- **输入尺寸**：`OpenAIVLM` / `HFLocalVLM` 默认 `image_size=(320, 180)`，与
+  传感器原生渲染一致；`--image-size 320 180` 是各驱动脚本的新默认值。此前的
+  640×360 是把原图放大 4 倍再送入模型，视觉 token 翻倍但信息不增加。
+- **scan contact sheet**：扫描/视角比较把 8/10 个视角拼成一张带编号的 contact
+  sheet（`vlm_nav/vision.py`），prompt 直接要求返回格子编号；确认对象和最终
+  identity 判断仍使用单张原图/裁剪图，不使用拼图。
+- **客户端**：`OpenAIVLM` 使用 `requests.Session` keep-alive（无 requests 时
+  回退 urllib）、JPEG quality 90、重复图片编码 bytes 的 LRU 缓存；历史图预算
+  `max_history_images` 默认 1。`decide` 在 `json_mode` 下发送
+  `response_format={"type":"json_object"}`，也接受 `guided_json`；单工具调用
+  默认 `max_new_tokens=96`，plan turn 由 runtime 提高到
+  `plan_max_new_tokens`。
+- **连续批处理/共享端点**：批量评测复用同一个 `--base-url`，不要每个 episode
+  起一个 server；vLLM 自己做连续批处理。离线 replay 可用
+  `vlm_nav/offline_batch.py::VLLMBatchRunner`，它把整批 conversations 一次交给
+  vLLM `LLM.chat`（需要本机 vLLM；无 vLLM 时给出明确错误）。
+- **模型级联**：纯动作任务直接走 `motion_mission`/`mission_run`，不调用 VLM；
+  候选定位优先使用 `--detector sam3_dino`，8B VLM 负责 plan、关系确认和最终
+  identity。
+- **可观测性**：vLLM `/metrics` 看 TTFT / inter-token latency / prompt 与
+  generation tokens；客户端日志的 `usage_metrics` 记录
+  `cached_tokens`，用于验证 prefix caching 和 contact sheet 的实际收益。
 
 ## 快速开始
 

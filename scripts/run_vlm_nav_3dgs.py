@@ -83,8 +83,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", type=str, default=None)
     parser.add_argument("--device", type=str, default="cpu",
                         help="device for the local hf backend")
-    parser.add_argument("--max-new-tokens", type=int, default=192)
-    parser.add_argument("--image-size", type=int, nargs=2, default=(640, 360),
+    parser.add_argument("--max-new-tokens", type=int, default=96)
+    parser.add_argument("--image-size", type=int, nargs=2, default=(320, 180),
                         metavar=("W", "H"), help="VLM input resize")
     parser.add_argument("--num-threads", type=int, default=None)
     parser.add_argument("--no-think", action="store_true",

@@ -637,7 +637,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--quantization", default="none")
     parser.add_argument("--max-new-tokens", type=int, default=192)
-    parser.add_argument("--image-size", type=_image_size, default=(640, 360))
+    parser.add_argument("--image-size", type=_image_size, default=(320, 180))
     parser.add_argument("--num-threads", type=int, default=0)
     return parser
 

@@ -7316,6 +7316,7 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
                 "yaw_deg": record.yaw_deg,
                 "intrinsics": _observation_intrinsics(ctx, record),
                 "tool": "ground_target",
+                "json_mode": True,
             },
         )
 

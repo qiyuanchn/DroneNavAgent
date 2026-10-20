@@ -450,7 +450,7 @@ def build(
             scene=scene_info,
             generator=generator,
             benchmark={
-                "vlm_image_size": [640, 360],
+                "vlm_image_size": [320, 180],
                 "sensor_size": [int(camera["width"]), int(camera["height"])],
                 "note": "the VLM input resize the harness uses; keep it identical across hosts",
             },

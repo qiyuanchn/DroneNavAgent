@@ -769,6 +769,7 @@ def _ask_view(
                 "relation_chain": relation_chain_enabled(ctx),
                 "source_observation_id": source,
                 "source_frame_attached": source_frame is not None,
+                "json_mode": True,
                 "pose": view.get("pose_flu"),
                 "yaw_deg": view.get("heading_deg"),
                 "candidate_pixel": (
@@ -803,6 +804,7 @@ def _ask_view(
             "instruction": instruction,
             "pose": view.get("pose_flu"),
             "yaw_deg": view.get("heading_deg"),
+            "json_mode": True,
         }
         retry_prompt = CONFIRM_BOX_USER_PROMPT.format(instruction=instruction)
         retry_source = _as_frame(view["frame"])

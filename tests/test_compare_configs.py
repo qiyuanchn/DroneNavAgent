@@ -291,7 +291,7 @@ class CommandBuildTest(unittest.TestCase):
         self.assertEqual(DRIVER.action_backend(args), "mock:forward")
         model_args = DRIVER.model_args(args)
         self.assertEqual(model_args[:2], ["--model-path", "/weights/qwen"])
-        self.assertEqual(model_args[2:4], ["--image-size", "640"])
+        self.assertEqual(model_args[2:4], ["--image-size", "320"])
 
     def test_hf_backend_requires_a_model_path(self):
         args = _args("--backend", "hf")
@@ -357,7 +357,10 @@ class ActionMetricsTest(unittest.TestCase):
         self.assertEqual(row["images_total"], 3 * 3 + 3 * 10)
         text_chars = sum(len(entry["raw_response"]) for entry in trace) + 6 * 1200
         self.assertEqual(row["text_chars"], text_chars)
-        self.assertEqual(row["tokens_estimate"], 39 * 294 + text_chars // 4)
+        self.assertEqual(
+            row["tokens_estimate"],
+            39 * row["image_tokens"] + text_chars // int(row["chars_per_token"]),
+        )
 
     def test_action_metrics_survive_a_trace_without_scan_flags(self):
         summary = {"success": False, "finish_reason": "max_steps", "steps": 2,

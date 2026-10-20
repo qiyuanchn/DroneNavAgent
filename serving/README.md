@@ -61,6 +61,31 @@ CONTAINER=vlm-nav \
 这样 `OpenAIVLM` 的原生 tool calling 路径可用；`--reasoning-parser qwen3`
 与 thinking 关闭的 chat-template 参数也由脚本统一处理。
 
+### 渲染/token 相关的默认值
+
+- `--max-model-len` 默认从 32768 降到 **8192**：导航 episode 的实际上下文远小于
+  此值，降低它可以减少 KV cache 配置压力。
+- `--enable-prefix-caching` 默认开启（`--no-prefix-caching` 关闭）。system
+  prompt、工具目录和重复图片的 prefill 可以复用。
+- `--enable-chunked-prefill` 默认开启（`--no-chunked-prefill` 关闭），多图
+  prompt 的首 token 等待更低。
+- `--async-scheduling` 默认关闭；确认 vLLM 版本支持后显式打开。
+- `--mm-processor-cache-gb N` 只在传入时添加；版本不支持时不要加。
+- `--limit-mm-image` 默认 4；改成 contact sheet 后 scan/compare 只发 1 张图，
+  可再按需降到 2。
+- 新版本 vLLM 可能没有 `--enable-prefix-caching`（默认即开启）；此时用
+  `--no-prefix-caching` 之外的 `--extra` 组合或直接去掉该 flag。
+
+客户端侧同时做了这些收敛：默认 VLM 输入 **320×180**（传感器原生）、
+JPEG quality 90、重复图片 bytes LRU 缓存、`requests.Session` keep-alive、
+`max_history_images=1`、scan/compare 使用编号 contact sheet、decide 调用
+可用 `response_format={"type":"json_object"}` 约束 JSON。
+
+验证时建议同时看 vLLM 的 `/metrics`（`time_to_first_token`、
+`inter_token_latency`、prompt/generation tokens）和客户端日志里的
+`usage_metrics`（包含 `cached_tokens`）：contact sheet 与 prefix caching 的
+收益应体现在 prompt token 和 TTFT 上，而不是解码速度。
+
 检查端点：
 
 ```bash
@@ -89,8 +114,14 @@ python scripts/run_vlm_nav_tools.py \
   --backend openai \
   --model qwen3-vl-8b \
   --base-url http://127.0.0.1:8000/v1 \
+  --image-size 320 180 \
+  --max-new-tokens 96 \
+  --tool-choice required \
   --out outputs/vlm_nav/book_openai
 ```
+
+`--tool-choice required` 强制原生 tool call；若服务端/模型不支持，退回默认
+`auto`。`--image-size`/`--max-new-tokens` 的默认值已经是上面的 320×180/96。
 
 其他驱动脚本（`run_vlm_nav_3dgs.py`、`run_vlm_nav_m2_memory.py`、
 `compare_*.py`、`verify_*.py`）使用同一组 `--backend openai --model ...

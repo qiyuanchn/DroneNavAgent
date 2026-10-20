@@ -3903,7 +3903,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default="cpu", help="hf backend device (cuda)")
     parser.add_argument("--model", type=str, default=None, help="openai backend model name")
     parser.add_argument("--base-url", type=str, default=None, help="openai backend base url")
-    parser.add_argument("--image-size", type=_parse_size, default=(640, 360),
+    parser.add_argument("--image-size", type=_parse_size, default=(320, 180),
                         help="resolution the model receives (WxH)")
     parser.add_argument("--max-new-tokens", type=int, default=192)
     parser.add_argument("--mock-replies", type=str, default=None,

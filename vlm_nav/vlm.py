@@ -28,12 +28,16 @@ Two interchangeable paths, sharing the same tools, log hook and history:
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
+import hashlib
 import io
 import json
 import math
 import os
+import threading
 import time
 from typing import Any, Callable
+import urllib.parse
 import urllib.request
 
 import numpy as np
@@ -52,6 +56,31 @@ def _frame_count(frames) -> int:
     if isinstance(frames, (list, tuple)):
         return len(frames)
     return 1
+
+
+def usage_metrics(usage: Any) -> dict:
+    """Normalize an OpenAI/vLLM usage block for logs and summaries.
+
+    vLLM reports prefix-cache reuse in ``prompt_tokens_details.cached_tokens``;
+    keeping that field next to prompt/completion counts is what makes a
+    prefix-caching or contact-sheet change measurable after the fact.
+    """
+    if not isinstance(usage, dict):
+        return {}
+    details = usage.get("prompt_tokens_details")
+    cached = None
+    if isinstance(details, dict):
+        cached = details.get("cached_tokens")
+    if cached is None:
+        cached = usage.get("cached_tokens")
+    metrics = {
+        "prompt_tokens": usage.get("prompt_tokens"),
+        "completion_tokens": usage.get("completion_tokens"),
+        "total_tokens": usage.get("total_tokens"),
+    }
+    if cached is not None:
+        metrics["cached_tokens"] = cached
+    return {key: value for key, value in metrics.items() if value is not None}
 
 
 def render_tool_reply(calls: list[dict]) -> str:
@@ -631,8 +660,8 @@ class HFLocalVLM(VLMBackend):
         model_path: str,
         device: str = "cpu",
         dtype: str = "bfloat16",
-        max_new_tokens: int = 192,
-        image_size: tuple[int, int] = (640, 360),
+        max_new_tokens: int = 96,
+        image_size: tuple[int, int] = (320, 180),
         num_threads: int | None = None,
         template_kwargs: dict | None = None,
         native_tools: bool | None = None,
@@ -648,6 +677,7 @@ class HFLocalVLM(VLMBackend):
         self.template_kwargs = dict(template_kwargs or {})
         self.native_tools = native_tools
         self.on_log = on_log
+        self.last_usage: dict = {}
         torch_dtype = getattr(torch, dtype)
         config = AutoConfig.from_pretrained(model_path)
         self.is_qwen3vl = getattr(config, "model_type", "") == "qwen3_vl"
@@ -669,7 +699,7 @@ class HFLocalVLM(VLMBackend):
         """Per-call generation cap: ``context["max_new_tokens"]`` may raise it.
 
         A self-plan turn needs room for the whole multi-stage JSON object; the
-        backend default (192) cuts a four-stage plan mid-object. The runtime
+        backend default (96) cuts a four-stage plan mid-object. The runtime
         asks for the larger cap only on that turn, and a caller can never
         lower the configured default through the context.
         """
@@ -694,7 +724,12 @@ class HFLocalVLM(VLMBackend):
                 ),
                 do_sample=False,
             )
-        new_tokens = output[0, inputs["input_ids"].shape[1]:]
+        prompt_tokens = int(inputs["input_ids"].shape[1])
+        new_tokens = output[0, prompt_tokens:]
+        self.last_usage = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": int(new_tokens.shape[0]),
+        }
         return self.processor.decode(
             new_tokens, skip_special_tokens=True
         ).strip()
@@ -740,18 +775,36 @@ class HFLocalVLM(VLMBackend):
         return self.native_tools
 
     def decide(self, frames, system_prompt, user_prompt, context=None):
-        images = self._as_image_list(frames, self.image_size)
+        started = time.time()
+        image_size = (
+            context.get("image_size", self.image_size)
+            if isinstance(context, dict) else self.image_size
+        )
+        images = self._as_image_list(frames, image_size)
         try:
             text = self._render(self._messages(system_prompt, user_prompt, images))
         except Exception:
             text = self._render(self._messages_without_system(system_prompt, user_prompt, images))
-        return self._generate(text, images, self._token_budget(context))
+        raw = self._generate(text, images, self._token_budget(context))
+        if not (isinstance(context, dict) and context.get("suppress_decide_log")):
+            self._log_tool_call(
+                "decide", raw, [], started, context, _frame_count(frames),
+                extra={
+                    "usage_metrics": dict(self.last_usage),
+                    "json_mode": bool(
+                        isinstance(context, dict) and context.get("json_mode")
+                    ),
+                },
+            )
+        return raw
 
     def decide_with_tools(self, frames, system_prompt, user_prompt, tools_text="", context=None):
         specs = resolve_tool_specs(tools_text, context)
         if not specs or not self._supports_tools_param():
+            fallback = dict(context or {})
+            fallback["suppress_decide_log"] = True
             return super().decide_with_tools(
-                frames, system_prompt, user_prompt, tools_text, context
+                frames, system_prompt, user_prompt, tools_text, fallback
             )
         images = self._as_image_list(frames, self.image_size)
         messages = [
@@ -762,12 +815,17 @@ class HFLocalVLM(VLMBackend):
         try:
             text = self._render(messages, tools=to_openai_tools(specs))
         except Exception:
+            fallback = dict(context or {})
+            fallback["suppress_decide_log"] = True
             return super().decide_with_tools(
-                frames, system_prompt, user_prompt, tools_text, context
+                frames, system_prompt, user_prompt, tools_text, fallback
             )
         raw = self._generate(text, images, self._token_budget(context))
         calls = extract_native_tool_calls(raw)
-        self._log_tool_call("native", raw, calls, started, context, _frame_count(frames))
+        self._log_tool_call(
+            "native", raw, calls, started, context, _frame_count(frames),
+            extra={"usage_metrics": dict(self.last_usage)},
+        )
         return render_tool_reply(calls) if calls else raw
 
 
@@ -787,10 +845,16 @@ class OpenAIVLM(VLMBackend):
         model: str,
         base_url: str | None = None,
         api_key: str | None = None,
-        max_new_tokens: int = 192,
-        image_size: tuple[int, int] = (640, 360),
+        max_new_tokens: int = 96,
+        image_size: tuple[int, int] = (320, 180),
         timeout_s: float = 120.0,
         tool_choice: str = "auto",
+        response_format: dict | str | None = None,
+        image_format: str = "jpeg",
+        jpeg_quality: int = 90,
+        image_cache_size: int = 64,
+        session: Any = None,
+        transport: Callable[[str, dict, dict], dict] | None = None,
         on_log: Callable[[dict], None] | None = None,
     ):
         self.model = model
@@ -806,16 +870,95 @@ class OpenAIVLM(VLMBackend):
         self.image_size = image_size
         self.timeout_s = timeout_s
         self.tool_choice = tool_choice or "auto"
+        self.response_format = (
+            {"type": "json_object"} if response_format == "json" else response_format
+        )
+        fmt = str(image_format or "jpeg").strip().lower()
+        self.image_format = fmt if fmt in ("jpeg", "jpg", "png") else "jpeg"
+        self.jpeg_quality = max(1, min(100, int(jpeg_quality)))
+        self.image_cache_size = max(0, int(image_cache_size))
         self.on_log = on_log
+        self._transport = transport
+        self._session = (
+            None if transport is not None
+            else (session if session is not None else self._make_session())
+        )
+        self._lock = threading.Lock()
+        self._image_cache: OrderedDict[str, str] = OrderedDict()
+        self._image_cache_hits = 0
+        self._image_cache_misses = 0
 
-    def _messages(self, frames, system_prompt, user_prompt) -> list[dict]:
-        images = self._as_image_list(frames, self.image_size)
+    @staticmethod
+    def _make_session() -> Any:
+        """A keep-alive client when requests is installed, else None.
+
+        ``requests`` lives in the ``openai`` extra; the stdlib fallback keeps
+        the backend usable without it. A caller may inject ``session`` (or a
+        ``transport`` callable in tests).
+        """
+        try:
+            import requests  # noqa: PLC0415 - optional dependency
+
+            return requests.Session()
+        except Exception:  # noqa: BLE001 - optional dependency
+            return None
+
+    @property
+    def _endpoint(self) -> str:
+        return f"{self.base_url}/v1/chat/completions"
+
+    def _image_data_url(self, image) -> str:
+        """Encode one resized image, reusing the bytes for repeated frames."""
+        key = (
+            f"{image.size[0]}x{image.size[1]}:{self.image_format}:"
+            f"{self.jpeg_quality}:{hashlib.sha1(image.tobytes()).hexdigest()}"
+        )
+        with self._lock:
+            cached = self._image_cache.get(key)
+            if cached is not None:
+                self._image_cache.move_to_end(key)
+                self._image_cache_hits += 1
+                return cached
+        buffer = io.BytesIO()
+        if self.image_format == "png":
+            image.save(buffer, format="PNG")
+            mime = "image/png"
+        else:
+            image.convert("RGB").save(
+                buffer, format="JPEG", quality=self.jpeg_quality, optimize=False
+            )
+            mime = "image/jpeg"
+        data_url = f"data:{mime};base64," + base64.b64encode(
+            buffer.getvalue()
+        ).decode()
+        if self.image_cache_size:
+            with self._lock:
+                self._image_cache[key] = data_url
+                self._image_cache_misses += 1
+                while len(self._image_cache) > self.image_cache_size:
+                    self._image_cache.popitem(last=False)
+        return data_url
+
+    def image_cache_stats(self) -> dict:
+        with self._lock:
+            return {
+                "size": len(self._image_cache),
+                "limit": self.image_cache_size,
+                "hits": self._image_cache_hits,
+                "misses": self._image_cache_misses,
+            }
+
+    def _messages(
+        self, frames, system_prompt, user_prompt, image_size: Any = "__default__"
+    ) -> list[dict]:
+        size = self.image_size if image_size == "__default__" else image_size
+        images = self._as_image_list(frames, size)
         content: list[dict] = []
         for image in images:
-            buffer = io.BytesIO()
-            image.save(buffer, format="PNG")
-            data_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
-            content.append({"type": "image_url", "image_url": {"url": data_url}})
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": self._image_data_url(image)},
+            })
         content.append({"type": "text", "text": user_prompt})
         return [
             {"role": "system", "content": system_prompt},
@@ -823,13 +966,44 @@ class OpenAIVLM(VLMBackend):
         ]
 
     def _post(self, payload: dict) -> dict:
+        url = self._endpoint
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        if (
+            self.response_format
+            and "response_format" not in payload
+            and "tools" not in payload
+        ):
+            payload = {**payload, "response_format": self.response_format}
+        if self._transport is not None:
+            return self._transport(url, headers, payload)
+        if self._session is not None:
+            with self._lock:
+                try:
+                    response = self._session.post(
+                        url, json=payload, headers=headers, timeout=self.timeout_s
+                    )
+                except Exception:
+                    # A pooled connection can go stale between calls; rebuild
+                    # the session once and retry the request.
+                    try:
+                        self._session.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._session = self._make_session()
+                    if self._session is None:
+                        raise
+                    response = self._session.post(
+                        url, json=payload, headers=headers, timeout=self.timeout_s
+                    )
+            raise_for_status = getattr(response, "raise_for_status", None)
+            if callable(raise_for_status):
+                raise_for_status()
+            return response.json()
         request = urllib.request.Request(
-            f"{self.base_url}/v1/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
+            url, data=json.dumps(payload).encode(), headers=headers
         )
         with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
             return json.loads(response.read().decode())
@@ -846,20 +1020,54 @@ class OpenAIVLM(VLMBackend):
         return max(configured, requested)
 
     def decide(self, frames, system_prompt, user_prompt, context=None):
+        started = time.time()
+        image_size = (
+            context.get("image_size", "__default__")
+            if isinstance(context, dict) else "__default__"
+        )
         payload = {
             "model": self.model,
             "max_tokens": self._token_budget(context),
             "temperature": 0.0,
-            "messages": self._messages(frames, system_prompt, user_prompt),
+            "messages": self._messages(
+                frames, system_prompt, user_prompt, image_size=image_size
+            ),
         }
+        guided = (
+            context.get("guided_json") if isinstance(context, dict) else None
+        )
+        if isinstance(guided, dict):
+            # vLLM's guided-decoding spelling; harmless on servers that ignore
+            # unknown fields, and stricter than json_object where supported.
+            payload["guided_json"] = guided
+        elif isinstance(context, dict) and context.get("json_mode"):
+            payload["response_format"] = {"type": "json_object"}
         body = self._post(payload)
+        usage = body.get("usage")
+        if not (isinstance(context, dict) and context.get("suppress_decide_log")):
+            self._log_tool_call(
+                "decide",
+                str((body["choices"][0]["message"].get("content") or "").strip()),
+                [],
+                started,
+                context,
+                _frame_count(frames),
+                extra={
+                    "usage": usage,
+                    "usage_metrics": usage_metrics(usage),
+                    "response_format": payload.get("response_format"),
+                    "image_cache": self.image_cache_stats(),
+                },
+            )
         return (body["choices"][0]["message"].get("content") or "").strip()
 
     def decide_with_tools(self, frames, system_prompt, user_prompt, tools_text="", context=None):
         specs = resolve_tool_specs(tools_text, context)
         if not specs:
+            fallback = dict(context or {})
+            fallback["suppress_decide_log"] = True
             return super().decide_with_tools(
-                frames, system_prompt, user_prompt, tools_text, context
+                frames, system_prompt, user_prompt, tools_text, fallback
             )
         messages = [
             *self._messages(frames, system_prompt, user_prompt),
@@ -878,11 +1086,23 @@ class OpenAIVLM(VLMBackend):
         message = body["choices"][0]["message"]
         calls = openai_tool_calls_to_canonical(message.get("tool_calls"))
         raw = render_tool_reply(calls) if calls else (message.get("content") or "").strip()
+        usage = body.get("usage")
         self._log_tool_call(
             "native", raw, calls, started, context, _frame_count(frames),
-            extra={"usage": body.get("usage")},
+            extra={
+                "usage": usage,
+                "usage_metrics": usage_metrics(usage),
+                "tool_choice": self.tool_choice,
+                "image_cache": self.image_cache_stats(),
+            },
         )
         return raw
+
+    def close(self) -> None:
+        session, self._session = self._session, None
+        close = getattr(session, "close", None)
+        if callable(close):
+            close()
 
 
 def make_backend(spec: str, **kwargs) -> VLMBackend:
@@ -899,8 +1119,8 @@ def make_backend(spec: str, **kwargs) -> VLMBackend:
         return HFLocalVLM(
             model_path=kwargs["model_path"],
             device=kwargs.get("device", "cpu"),
-            max_new_tokens=kwargs.get("max_new_tokens", 192),
-            image_size=tuple(kwargs.get("image_size", (640, 360))),
+            max_new_tokens=kwargs.get("max_new_tokens", 96),
+            image_size=tuple(kwargs.get("image_size", (320, 180))),
             num_threads=kwargs.get("num_threads"),
             template_kwargs=kwargs.get("template_kwargs"),
             native_tools=kwargs.get("native_tools"),
@@ -910,9 +1130,17 @@ def make_backend(spec: str, **kwargs) -> VLMBackend:
         return OpenAIVLM(
             model=kwargs["model"],
             base_url=kwargs.get("base_url"),
-            max_new_tokens=kwargs.get("max_new_tokens", 192),
-            image_size=tuple(kwargs.get("image_size", (640, 360))),
+            api_key=kwargs.get("api_key"),
+            timeout_s=kwargs.get("timeout_s", 120.0),
+            max_new_tokens=kwargs.get("max_new_tokens", 96),
+            image_size=tuple(kwargs.get("image_size", (320, 180))),
             tool_choice=kwargs.get("tool_choice") or "auto",
+            response_format=kwargs.get("response_format"),
+            image_format=kwargs.get("image_format", "jpeg"),
+            jpeg_quality=kwargs.get("jpeg_quality", 90),
+            image_cache_size=kwargs.get("image_cache_size", 64),
+            session=kwargs.get("session"),
+            transport=kwargs.get("transport"),
             on_log=kwargs.get("on_log"),
         )
     raise ValueError(f"unknown VLM backend {spec!r}")

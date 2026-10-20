@@ -522,6 +522,37 @@ def switch_report(args: argparse.Namespace) -> dict:
     }
 
 
+def vlm_usage_summary(events: Any) -> dict:
+    """Aggregate backend ``usage_metrics`` (including vLLM cached tokens).
+
+    The per-call logs live in the episode's ``vlm_log``; this compact block is
+    what a batch report can sum without reading every backend event.
+    """
+    totals = {
+        "calls": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "cached_tokens": 0,
+    }
+    seen = False
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        metrics = event.get("usage_metrics")
+        if not isinstance(metrics, dict) or not metrics:
+            continue
+        seen = True
+        totals["calls"] += 1
+        for key in ("prompt_tokens", "completion_tokens", "cached_tokens"):
+            try:
+                totals[key] += int(metrics.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+    if not seen:
+        return {}
+    return totals
+
+
 def memory_layer_report(memory: Any) -> dict:
     """The two memory layers as the *built memory* reports them.
 
@@ -948,9 +979,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="optional grounding detector: off (VLM-only) | "
                              "sam3 (SAM3 masks + DINOv2 crop features) | "
                              "module:factory")
-    parser.add_argument("--max-new-tokens", type=int, default=192)
-    parser.add_argument("--image-size", type=int, nargs=2, default=(640, 360),
-                        metavar=("W", "H"), help="VLM input resize")
+    parser.add_argument("--max-new-tokens", type=int, default=96,
+                        help="per-call generation cap; plan turns raise it")
+    parser.add_argument("--image-size", type=int, nargs=2, default=(320, 180),
+                        metavar=("W", "H"),
+                        help="VLM input resize (default: sensor-native 320x180)")
+    parser.add_argument("--tool-choice", type=str, default="auto",
+                        choices=("auto", "required", "none"),
+                        help="native tool_choice sent by the OpenAI backend")
     parser.add_argument("--num-threads", type=int, default=None)
     parser.add_argument("--no-think", action="store_true",
                         help="disable chain-of-thought in the chat template")
@@ -1226,9 +1262,12 @@ def build_vlm(args: argparse.Namespace):
     if args.backend == "openai":
         if not args.model:
             raise SystemExit("--backend openai requires --model")
-        return make_backend("openai", model=args.model, base_url=args.base_url,
-                            max_new_tokens=args.max_new_tokens,
-                            image_size=tuple(args.image_size))
+        return make_backend(
+            "openai", model=args.model, base_url=args.base_url,
+            max_new_tokens=args.max_new_tokens,
+            image_size=tuple(args.image_size),
+            tool_choice=getattr(args, "tool_choice", "auto"),
+        )
     raise SystemExit(f"unknown backend {args.backend!r}")
 
 
@@ -3118,6 +3157,9 @@ def run_episode(world: Any, vlm: Any, args: argparse.Namespace, out_dir: Path,
         "tool_calls": stats["total_calls"],
         "parse_failures": int(result.get("parse_failures") or stats["parse_failures"]),
         "vlm_calls": result.get("vlm_calls"),
+        "vlm_usage": vlm_usage_summary(
+            getattr(getattr(runtime, "log", None), "vlm_log", [])
+        ),
         "tool_budget": {
             "initial": int(args.tool_budget),
             "left": budget_left,

@@ -1295,7 +1295,7 @@ class AgentRuntime:
         *,
         episode_id: str | None = None,
         max_images: int = 4,
-        max_history_images: int = 2,
+        max_history_images: int = 1,
         max_cache_images: int = 24,
         max_system_chars: int = DEFAULT_SYSTEM_CHARS,
         max_text_chars: int = 6000,

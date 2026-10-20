@@ -13,7 +13,9 @@ Covers the four requirements of ``VLMBackend.decide_with_tools``:
 Everything runs on CPU with fake processors/models - no weights, no network.
 """
 
+import base64
 import http.server
+import io
 import json
 import threading
 import unittest
@@ -46,6 +48,7 @@ from vlm_nav.vlm import (
     resolve_tool_specs,
     to_openai_tools,
     tools_from_specs_text,
+    usage_metrics,
 )
 
 FRAME = torch.zeros(3, 8, 8)
@@ -449,6 +452,14 @@ class _UrlopenRecorder:
         body = self.bodies.pop(0) if self.bodies else {"choices": [{"message": {"content": "{}"}}]}
         return _FakeResponse(body)
 
+    def transport(self, url: str, headers: dict, payload: dict) -> dict:
+        self.urls.append(url)
+        self.headers.append(dict(headers))
+        self.payloads.append(payload)
+        return self.bodies.pop(0) if self.bodies else {
+            "choices": [{"message": {"content": "{}"}}]
+        }
+
     @staticmethod
     def tool_call_body(call_id: str, name: str, args: dict) -> dict:
         return {
@@ -476,6 +487,7 @@ class OpenAINativeTest(unittest.TestCase):
         kwargs.setdefault("model", "test-model")
         kwargs.setdefault("base_url", "http://localhost:9999")
         kwargs.setdefault("image_size", (8, 8))
+        kwargs.setdefault("transport", recorder.transport)
         return OpenAIVLM(**kwargs)
 
     def test_decide_payload_unchanged(self):
@@ -490,7 +502,7 @@ class OpenAINativeTest(unittest.TestCase):
         self.assertEqual(payload["messages"][0], {"role": "system", "content": "POLICY"})
         content = payload["messages"][1]["content"]
         self.assertEqual(content[0]["type"], "image_url")
-        self.assertTrue(content[0]["image_url"]["url"].startswith("data:image/png;base64,"))
+        self.assertTrue(content[0]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
         self.assertEqual(content[-1], {"type": "text", "text": "USER"})
 
     def test_native_tool_call_payload_and_reply(self):
@@ -609,6 +621,111 @@ class OpenAINativeTest(unittest.TestCase):
             "openai", model="m", base_url="http://x", image_size=(8, 8), tool_choice="required"
         )
         self.assertEqual(backend.tool_choice, "required")
+
+    def test_json_mode_sets_response_format_and_logs_usage(self):
+        events: list[dict] = []
+        recorder = _UrlopenRecorder([{
+            "choices": [{"message": {"content": '{"view": 0}'}}],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 8,
+                "total_tokens": 108,
+                "prompt_tokens_details": {"cached_tokens": 64},
+            },
+        }])
+        backend = self._backend(recorder, on_log=events.append)
+        raw = backend.decide(
+            FRAME, "POLICY", "USER", {"json_mode": True, "step": "scan"}
+        )
+        self.assertEqual(raw, '{"view": 0}')
+        self.assertEqual(
+            recorder.payloads[0]["response_format"], {"type": "json_object"}
+        )
+        self.assertEqual(events[0]["path"], "decide")
+        self.assertEqual(
+            events[0]["usage_metrics"],
+            {
+                "prompt_tokens": 100,
+                "completion_tokens": 8,
+                "total_tokens": 108,
+                "cached_tokens": 64,
+            },
+        )
+
+    def test_image_cache_reuses_encoded_bytes(self):
+        recorder = _UrlopenRecorder([
+            {"choices": [{"message": {"content": "a"}}]},
+            {"choices": [{"message": {"content": "b"}}]},
+        ])
+        backend = self._backend(recorder)
+        backend.decide(FRAME, "POLICY", "USER")
+        backend.decide(FRAME, "POLICY", "USER")
+        first = recorder.payloads[0]["messages"][1]["content"][0]["image_url"]["url"]
+        second = recorder.payloads[1]["messages"][1]["content"][0]["image_url"]["url"]
+        self.assertEqual(first, second)
+        self.assertEqual(backend.image_cache_stats()["misses"], 1)
+        self.assertEqual(backend.image_cache_stats()["hits"], 1)
+
+    def test_context_image_size_override_keeps_sheet_pixels(self):
+        from PIL import Image
+
+        recorder = _UrlopenRecorder([
+            {"choices": [{"message": {"content": "ok"}}]},
+        ])
+        backend = self._backend(recorder, image_size=(4, 4))
+        backend.decide(
+            FRAME, "POLICY", "USER", {"contact_sheet": True, "image_size": None}
+        )
+        url = recorder.payloads[0]["messages"][1]["content"][0]["image_url"]["url"]
+        payload = base64.b64decode(url.split(",", 1)[1])
+        with Image.open(io.BytesIO(payload)) as decoded:
+            self.assertEqual(decoded.size, (8, 8))
+
+    def test_keep_alive_session_is_reused_and_closed(self):
+        class _Session:
+            def __init__(self):
+                self.calls = 0
+                self.closed = False
+
+            def post(self, url, json=None, headers=None, timeout=None):
+                self.calls += 1
+
+                class _Response:
+                    def raise_for_status(self):
+                        return None
+
+                    def json(self):
+                        return {"choices": [{"message": {"content": "hover"}}]}
+
+                return _Response()
+
+            def close(self):
+                self.closed = True
+
+        session = _Session()
+        backend = OpenAIVLM(
+            model="m", base_url="http://x", image_size=(8, 8), session=session
+        )
+        self.assertEqual(backend.decide(FRAME, "POLICY", "USER"), "hover")
+        self.assertEqual(backend.decide(FRAME, "POLICY", "USER"), "hover")
+        self.assertEqual(session.calls, 2)
+        backend.close()
+        self.assertTrue(session.closed)
+
+    def test_usage_metrics_extracts_prompt_cache_tokens(self):
+        self.assertEqual(
+            usage_metrics({
+                "prompt_tokens": 12,
+                "completion_tokens": 3,
+                "prompt_tokens_details": {"cached_tokens": 7},
+            }),
+            {
+                "prompt_tokens": 12,
+                "completion_tokens": 3,
+                "cached_tokens": 7,
+            },
+        )
+        self.assertEqual(usage_metrics(None), {})
 
 
 class _ChatHandler(http.server.BaseHTTPRequestHandler):

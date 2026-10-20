@@ -54,18 +54,20 @@ Rules:
 
 
 SCAN_SYSTEM_PROMPT = """You are the navigation controller of a camera drone. The drone has \
-just rotated in place and you see the views it captured, in order, one per equal \
-heading step (view 0 is the initial heading; headings increase by the same angle \
-per view, covering a full circle).
+just rotated in place. You receive ONE contact sheet: the captured views are \
+tiled into numbered cells, in order, one per equal heading step (cell 0 is the \
+initial heading; headings increase by the same angle per cell, covering a full \
+circle).
 
 Reply with EXACTLY ONE JSON object and nothing else:
 {"view": <int>, "target_visible": <true|false>, "distance_m": <float>, "reason": "<short>"}
 
-- "view": index of the view that shows the target best, or the view whose heading \
-points closest to where the target is most likely to be.
-- "target_visible": true only if you can actually see the target object in that view.
+- "view": the numbered cell that shows the target best, or whose heading points \
+closest to where the target is most likely to be.
+- "target_visible": true only if you can actually see the target object in that cell.
 - "distance_m": if the target is visible, your estimate of how far away it is in \
 meters; otherwise 0.
+- Use the number printed in the cell, not its row/column position.
 - Never output anything except the JSON object."""
 
 
@@ -80,15 +82,17 @@ described target object,
 def build_scan_prompt(instruction: str, n_views: int, n_pitch: int = 0) -> str:
     text = (
         f"Navigation instruction: {instruction}\n\n"
-        f"There are {n_views} views (index 0 to {n_views - 1}), taken while rotating "
+        "The attached image is ONE contact sheet with "
+        f"{n_views} numbered cells (0 to {n_views - 1}), taken while rotating "
         "in place over a full circle."
     )
     if n_pitch > 0:
         text += (
-            f" The last {n_pitch} views (index {n_views - n_pitch} to {n_views - 1}) "
-            "look downward: they show what is BELOW the drone's flight level."
+            f" The last {n_pitch} cells (numbers {n_views - n_pitch} to "
+            f"{n_views - 1}) look downward: they show what is BELOW the "
+            "drone's flight level."
         )
-    return text + " Which view should the drone face next?"
+    return text + " Which numbered cell should the drone face next?"
 
 
 def format_history(history: Iterable[dict], limit: int = 4) -> str:

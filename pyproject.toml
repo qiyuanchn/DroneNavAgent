@@ -19,8 +19,9 @@ dependencies = [
 [project.optional-dependencies]
 # Local Hugging Face inference (HFLocalVLM).
 hf = ["transformers>=4.45", "accelerate>=0.30"]
-# The OpenAI-compatible backend uses urllib from the standard library.
-openai = []
+# The OpenAI-compatible backend falls back to urllib; requests adds a
+# keep-alive Session (connection reuse) for high-call-count evaluation.
+openai = ["requests>=2.28"]
 # stdio MCP server.
 mcp = ["mcp>=1.0", "anyio>=4.0"]
 test = ["pytest>=7.0"]

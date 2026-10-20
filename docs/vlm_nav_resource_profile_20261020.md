@@ -6,6 +6,13 @@ inventory. No `vlm_nav/` core logic changed; the new code is
 `scripts/profile_resources.py`, `scripts/replay_frames.py`,
 `scripts/build_replay_window_chair.py` plus tests.
 
+> **2026-10-20 follow-up:** the VLM input default is now the sensor-native
+> 320x180 (was 640x360), and scan/view-comparison calls send one numbered
+> contact sheet instead of 8-10 full frames. The numbers below were measured
+> with the old per-image 640x360 path; re-run the profile with the new defaults
+> before comparing TTFT/token counts. Confirmation and final identity calls
+> still use single full/cropped frames.
+
 Generated artifacts (not tracked by Git, `.gitignore` excludes `outputs/`):
 
 - `outputs/vlm_nav/resource_profile/report.md` and `report.json` - the measured
@@ -144,8 +151,8 @@ for a 24 GB Ada card; none of it changes vlm_nav core behaviour.
 | Rasterizer arch list | `script/build_batch_rasterizer.sh:8,40` | default `8.0;8.6;8.9;9.0;12.0+PTX` already includes Ada 8.9 | Keep it, or narrow to `8.9` on a 4090-only host to cut build time |
 | Renderer precision | `utils/gaussian_splatting/higs/native/backend.py:42-80,111-115` | means FP32, quaternion/scale/opacity/color and the render buffer FP16; output FP16 `[V,H,W,4]` | No change needed; the FP16 path is Ada-native |
 | `cuda_raycast` extension | `sensor/cuda_raycast.py:22` | fixed extension name `diffaero_cuda_raycast` (no arch digest) | A cache built on A100 can be stale on 4090; clear/rebuild or set a per-arch `TORCH_EXTENSIONS_DIR` |
-| Frame size | `vlm_nav/vlm.py:637`, `cfg/sensor/3dgs_rgb.yaml:3-5` | VLM input 640x360; sensor renders 320x180 | Lowering `image_size` is the cheapest 4090 lever but changes the benchmark; freeze it in the replay metadata |
-| Generation cap | `vlm_nav/vlm.py:634`, `scripts/run_vlm_nav_3dgs.py:87` | 192 new tokens default | Record it; decode time/KV growth are not comparable otherwise |
+| Frame size | `vlm_nav/vlm.py:635,791`, `cfg/sensor/3dgs_rgb.yaml:3-5` | VLM input now defaults to the sensor-native 320x180 (was 640x360); replay metadata records the size | Freeze `--image-size` and scan contact-sheet mode in the replay metadata when comparing runs |
+| Generation cap | `vlm_nav/vlm.py:634,790`, `scripts/run_vlm_nav_3dgs.py:86` | 96 new tokens default; plan turns raise it via `plan_max_new_tokens` | Record it; decode time/KV growth are not comparable otherwise |
 | Scene assets | `vlm_nav/world.py:619-625`, replay builder | HiGS loads PLY; the replay source is a 1.2M-Gaussian SPZ converted once | Ship/pre-convert the PLY; report Gaussian count and scene scale |
 | Environment | container / `scripts/verify_long_horizon.py:158` | `TORCH_CUDA_ARCH_LIST`, `TORCH_EXTENSIONS_DIR`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `HF_HOME` are shell/env, not code | Record them in the run summary; a stale extension cache is the most likely 4090 "silent" failure |
 

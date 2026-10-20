@@ -92,6 +92,7 @@ from .tools import (
 )
 # the 45 deg sector binning of the coverage contract is defined once, in the
 # module that produces it - the expected-information report must not re-derive it
+from .vision import contact_sheet
 from .tool_impl_perception import (
     _vlm_from_ctx,
     resolve_observation,
@@ -194,24 +195,24 @@ COMPARE_MODES = ("auto", "on", "off")
 #: hundred tokens), so the per-view form is compact: the verdict for every frame,
 #: the details only for the frames that are candidates.
 COMPARE_VIEWS_SYSTEM_PROMPT = (
-    "You are the view-comparison step of a drone navigation agent. You are given "
-    "several frames of the same scene, each shot facing a different direction; the "
-    "direction of every frame is listed in the user message in the same order as the "
-    "attached images. Decide, for every frame, whether it shows the object the "
-    "instruction names - including the relation the instruction states (for example "
-    '"next to the lamp": the frame must show the object *and* the lamp) - and answer '
-    "with ONE short JSON object and nothing else: "
+    "You are the view-comparison step of a drone navigation agent. You receive ONE "
+    "contact sheet: several views of the same scene, each shot facing a different "
+    "direction, tiled into numbered cells; the direction of every cell is listed in "
+    "the user message in the same order. Decide, for every cell, whether it shows "
+    "the object the instruction names - including the relation the instruction states "
+    '(for example "next to the lamp": the cell must show the object *and* the lamp) - '
+    "and answer with ONE short JSON object and nothing else: "
     '{"views": [{"view": 1, "target": false}, {"view": 2, "target": true, '
     '"confidence": 0.8, "reason": "red object with the lamp beside it", '
     '"box": [x1, y1, x2, y2]}], "best_view": 2, "relation_visible": true}. '
-    "List every frame in order, in the short form {\"view\": n, \"target\": false} - "
-    "add \"confidence\", a few words of \"reason\" and "
-    "\"box\": [x1, y1, x2, y2] (normalized 0-1000 image coordinates of the instance) "
-    "only to the frames whose target is true. Keep the whole answer short: "
-    "\"best_view\" is the single frame to trust, \"relation_visible\" is false when no "
-    "frame shows the relation the instruction names. Judge only what the frames show: "
-    "an object whose named relation is not visible in that frame is not resolved by "
-    "that frame."
+    "Use the number printed in each cell as \"view\". List every cell in order, in "
+    "the short form {\"view\": n, \"target\": false} - add \"confidence\", a few "
+    "words of \"reason\" and \"box\": [x1, y1, x2, y2] (normalized 0-1000 "
+    "coordinates INSIDE that cell) only to the cells whose target is "
+    "true. Keep the whole answer short: \"best_view\" is the single cell to trust, "
+    "\"relation_visible\" is false when no cell shows the relation the instruction "
+    "names. Judge only what the cells show: an object whose named relation is not "
+    "visible in that cell is not resolved by that cell."
 )
 
 
@@ -356,15 +357,17 @@ def _comparison_frames(ctx: ToolContext, view_index: list, *, limit: int) -> lis
 def _compare_views_user_prompt(instruction: str, entries: list[dict]) -> str:
     """The comparison call's user message: the frames, their bearings, the task."""
     lines = [
-        f"view {index}: {entry.get('where')} ({entry.get('obs_id')})"
+        f"cell {index}: {entry.get('where')} ({entry.get('obs_id')})"
         for index, entry in enumerate(entries, start=1)
     ]
     return (
         f"Instruction: {instruction}\n"
-        "Frames, in the order they are attached:\n"
+        "The attached image is ONE contact sheet; its cells are numbered in "
+        "this order:\n"
         + "\n".join(lines)
-        + "\n\nWhich frames show the object the instruction names, and which is the one "
-        "to trust? Add the box of the instance that makes a frame a candidate."
+        + "\n\nWhich numbered cells show the object the instruction names, and which "
+        "is the one to trust? Box coordinates are normalized 0-1000 coordinates "
+        "inside that numbered cell."
     )
 
 
@@ -562,16 +565,20 @@ def _compare_views_call(
     if backend is None:
         return {"error": "no_vlm_backend"}
     frames = [entry["frame"] for entry in entries]
+    sheet = contact_sheet(frames, columns=4, start_index=1, scale=0.5)
     user_prompt = _compare_views_user_prompt(instruction, entries)
     try:
         reply = backend.decide(
-            frames,
+            [sheet.tensor()],
             COMPARE_VIEWS_SYSTEM_PROMPT,
             user_prompt,
             context={
                 "step": "compare_views",
                 "tool": "search_target",
                 "instruction": instruction,
+                "json_mode": True,
+                "contact_sheet": True,
+                "image_size": None,
                 "observation_ids": [str(entry.get("obs_id")) for entry in entries],
                 "view_index": [
                     {

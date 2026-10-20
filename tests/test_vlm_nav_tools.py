@@ -825,6 +825,38 @@ class CliTest(unittest.TestCase):
         self.assertNotIn("navigate", on_disk["tools"])
 
 
+class CostDefaultTest(unittest.TestCase):
+    def test_sensor_native_image_and_short_generation_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = _runner_args(Path(tmp))
+        self.assertEqual(tuple(args.image_size), (320, 180))
+        self.assertEqual(args.max_new_tokens, 96)
+        self.assertEqual(args.tool_choice, "auto")
+        self.assertEqual(args.mission_plugin, "off")
+
+    def test_vlm_usage_summary_tracks_cached_tokens(self):
+        summary = RUNNER.vlm_usage_summary([
+            {"usage_metrics": {"prompt_tokens": 10, "completion_tokens": 2,
+                               "cached_tokens": 6}},
+            {"usage_metrics": {"prompt_tokens": 4, "completion_tokens": 1}},
+            {"usage_metrics": {}},
+            None,
+        ])
+        self.assertEqual(summary["calls"], 2)
+        self.assertEqual(summary["prompt_tokens"], 14)
+        self.assertEqual(summary["completion_tokens"], 3)
+        self.assertEqual(summary["cached_tokens"], 6)
+        self.assertEqual(RUNNER.vlm_usage_summary([]), {})
+
+    def test_tool_choice_and_mission_plugin_switches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = _runner_args(
+                Path(tmp), tool_choice="required", mission_plugin="on"
+            )
+        self.assertEqual(args.tool_choice, "required")
+        self.assertEqual(args.mission_plugin, "on")
+
+
 class ToolsetFilterTest(unittest.TestCase):
     """``--toolset basic|memory|full`` restricts the catalogue the model sees."""
 

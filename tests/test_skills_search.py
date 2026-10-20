@@ -736,9 +736,13 @@ class SearchCompareViewsTest(unittest.TestCase):
         self.assertEqual(steps[:2], ["observe", "compare_views"])
         self.assertEqual(len(vlm.compare_calls), 1)  # one call, every view at once
         call = vlm.compare_calls[0]
-        self.assertEqual(call["n_frames"], len(call["observation_ids"]))
-        self.assertGreaterEqual(call["n_frames"], 2)
+        # one contact sheet replaces the per-view frame list
+        self.assertEqual(call["n_frames"], 1)
+        self.assertGreaterEqual(len(call["observation_ids"]), 2)
+        self.assertTrue(call["context"].get("contact_sheet"))
+        self.assertTrue(call["context"].get("json_mode"))
         self.assertIn(RELATION_INSTRUCTION, call["user_prompt"])
+        self.assertIn("contact sheet", call["user_prompt"].lower())
         # the grounding came after the comparison and used the view it picked
         picked_id = call["observation_ids"][1]
         grounded = [step for step in result.data["steps"] if step["step"] == "ground_target"]
@@ -921,7 +925,7 @@ class SearchCompareViewsTest(unittest.TestCase):
 
         self.assertEqual(len(proxy.model_calls), 1 + len(inner.calls))
         self.assertEqual(proxy.model_calls[0]["context"].get("step"), "compare_views")
-        self.assertEqual(proxy.model_calls[0]["frames"], len(inner.compare_calls[0]["observation_ids"]))
+        self.assertEqual(proxy.model_calls[0]["frames"], 1)
         self.assertEqual(result.data["vlm_calls"], len(proxy.model_calls))
 
     def test_the_comparison_is_bounded_by_the_requested_view_count(self):
@@ -936,7 +940,8 @@ class SearchCompareViewsTest(unittest.TestCase):
             ctx,
         )
 
-        self.assertEqual(vlm.compare_calls[0]["n_frames"], 3)
+        self.assertEqual(vlm.compare_calls[0]["n_frames"], 1)
+        self.assertEqual(len(vlm.compare_calls[0]["observation_ids"]), 3)
 
     def test_recalled_frames_are_compared_without_a_new_sweep(self):
         world = FakeWorld()

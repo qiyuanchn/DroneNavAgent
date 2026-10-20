@@ -645,7 +645,7 @@ def _is_scan_summary(summary: str) -> bool:
 
 def image_tokens(args: argparse.Namespace) -> int:
     """Image token estimate for one VLM input image (28x28 patch by default)."""
-    width, height = (args.image_size or (640, 360))
+    width, height = (args.image_size or (320, 180))
     divisor = float(args.image_token_divisor)
     if divisor <= 0:
         return 0
@@ -1112,7 +1112,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--base-url", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--max-new-tokens", type=int, default=None)
-    parser.add_argument("--image-size", type=int, nargs=2, default=(640, 360),
+    parser.add_argument("--image-size", type=int, nargs=2, default=(320, 180),
                         metavar=("W", "H"), help="VLM input resize (both runners)")
     parser.add_argument("--num-threads", type=int, default=None)
     parser.add_argument("--no-think", action="store_true")

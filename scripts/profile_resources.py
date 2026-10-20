@@ -1930,7 +1930,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quantization", type=str, default="none",
                         choices=["none", "8bit", "4bit"])
     parser.add_argument("--quantization-overhead-gib", type=float, default=1.0)
-    parser.add_argument("--image-size", type=int, nargs=2, default=(640, 360),
+    parser.add_argument("--image-size", type=int, nargs=2, default=(320, 180),
                         metavar=("W", "H"))
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--repeat", type=int, default=5)

@@ -3013,8 +3013,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="model name for the openai backend")
     parser.add_argument("--base-url", type=str, default=None)
     parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--max-new-tokens", type=int, default=192)
-    parser.add_argument("--image-size", type=int, nargs=2, default=(640, 360),
+    parser.add_argument("--max-new-tokens", type=int, default=96)
+    parser.add_argument("--image-size", type=int, nargs=2, default=(320, 180),
                         metavar=("W", "H"))
     parser.add_argument("--num-threads", type=int, default=None)
     parser.add_argument("--no-think", action="store_true")

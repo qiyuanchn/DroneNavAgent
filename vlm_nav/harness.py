@@ -29,6 +29,7 @@ from .prompts import (
     build_user_prompt,
     summarize_action,
 )
+from .vision import contact_sheet
 from .vlm import VLMBackend, frame_to_pil
 from .world import estimate_point_world
 
@@ -204,9 +205,25 @@ class SemanticNavHarness:
             self.frames_dir.mkdir(parents=True, exist_ok=True)
             for k, view in enumerate(views):
                 frame_to_pil(view).save(self.frames_dir / f"scan_{tag}_{k:02d}.png")
+        # One numbered contact sheet instead of N full-resolution frames: the
+        # scan only needs a heading choice, and the individual frames remain in
+        # memory for the trust/crop checks below.
+        sheet = contact_sheet(views, scale=0.5)
+        if self.save_frames:
+            sheet.image.save(self.frames_dir / f"scan_{tag}_contact_sheet.png")
         prompt = build_scan_prompt(self.instruction, len(views), n_pitch=n_pitch)
+        context = self._vlm_context()
+        # The sheet is already tiled/scaled; resizing it to the single-frame
+        # envelope would collapse its labels, so this call keeps its pixels.
+        context.update({
+            "json_mode": True,
+            "contact_sheet": True,
+            "image_size": None,
+        })
         self._vlm_calls += 1
-        raw = self.vlm.decide(views, SCAN_SYSTEM_PROMPT, prompt, self._vlm_context())
+        raw = self.vlm.decide(
+            [sheet.tensor()], SCAN_SYSTEM_PROMPT, prompt, context
+        )
         view_idx, visible, scan_dist = parse_scan_choice(raw, len(views))
         print(f"[scan] chosen view={view_idx} visible={visible} dist={scan_dist:.1f} | {raw[:200]}", flush=True)
         if view_idx is None:

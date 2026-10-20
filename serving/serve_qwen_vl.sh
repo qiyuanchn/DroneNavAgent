@@ -28,10 +28,14 @@ GPU="${CUDA_VISIBLE_DEVICES:-0}"
 HOST="${QWEN_VL_HOST:-0.0.0.0}"
 PORT="${QWEN_VL_PORT:-8000}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 LIMIT_MM_IMAGE="${LIMIT_MM_IMAGE:-4}"
 TENSOR_PARALLEL="${TENSOR_PARALLEL:-1}"
+PREFIX_CACHING="${PREFIX_CACHING:-1}"
+CHUNKED_PREFILL="${CHUNKED_PREFILL:-1}"
+ASYNC_SCHEDULING="${ASYNC_SCHEDULING:-0}"
+MM_PROCESSOR_CACHE_GB="${MM_PROCESSOR_CACHE_GB:-}"
 HF_HOME="${HF_HOME:-}"
 VLLM_PYTHON="${VLLM_PYTHON:-python}"
 WORKDIR=""
@@ -57,10 +61,17 @@ Options:
   -p, --port PORT             HTTP port (default 8000)
       --host ADDR             bind address (default 0.0.0.0)
       --gpu-mem-util FLOAT    vLLM GPU memory fraction (default 0.90)
-      --max-model-len N       context length (default 32768)
+      --max-model-len N       context length (default 8192)
       --max-num-seqs N        concurrent sequences (default 8)
       --tensor-parallel N     tensor parallel size (default 1)
       --limit-mm-image N      images per prompt (default 4, vision only)
+      --prefix-caching on|off enable vLLM prefix caching (default on)
+      --chunked-prefill on|off enable chunked prefill (default on)
+      --async-scheduling      opt in to vLLM async scheduling (newer builds)
+      --mm-processor-cache-gb N
+                              cache preprocessed images (vLLM build permitting)
+      --no-prefix-caching     alias for --prefix-caching off
+      --no-chunked-prefill    alias for --chunked-prefill off
       --hf-home PATH          Hugging Face cache
       --vllm-python PATH      interpreter that has vLLM (default python)
       --workdir PATH          cd before launch
@@ -91,6 +102,12 @@ while [[ $# -gt 0 ]]; do
         --max-num-seqs) MAX_NUM_SEQS="$2"; shift 2 ;;
         --tensor-parallel) TENSOR_PARALLEL="$2"; shift 2 ;;
         --limit-mm-image) LIMIT_MM_IMAGE="$2"; shift 2 ;;
+        --prefix-caching) PREFIX_CACHING="$2"; shift 2 ;;
+        --no-prefix-caching) PREFIX_CACHING=0; shift ;;
+        --chunked-prefill) CHUNKED_PREFILL="$2"; shift 2 ;;
+        --no-chunked-prefill) CHUNKED_PREFILL=0; shift ;;
+        --async-scheduling) ASYNC_SCHEDULING=1; shift ;;
+        --mm-processor-cache-gb) MM_PROCESSOR_CACHE_GB="$2"; shift 2 ;;
         --hf-home) HF_HOME="$2"; shift 2 ;;
         --vllm-python) VLLM_PYTHON="$2"; shift 2 ;;
         --workdir) WORKDIR="$2"; shift 2 ;;
@@ -145,6 +162,18 @@ CMD=(
     --enable-auto-tool-choice
     --tool-call-parser "$TOOL_CALL_PARSER"
 )
+if [[ "$PREFIX_CACHING" == "1" ]]; then
+    CMD+=(--enable-prefix-caching)
+fi
+if [[ "$CHUNKED_PREFILL" == "1" ]]; then
+    CMD+=(--enable-chunked-prefill)
+fi
+if [[ "$ASYNC_SCHEDULING" == "1" ]]; then
+    CMD+=(--async-scheduling)
+fi
+if [[ -n "$MM_PROCESSOR_CACHE_GB" && "$MM_PROCESSOR_CACHE_GB" != "0" ]]; then
+    CMD+=(--mm-processor-cache-gb "$MM_PROCESSOR_CACHE_GB")
+fi
 if [[ "$LANGUAGE_MODEL_ONLY" == "1" ]]; then
     CMD+=(--language-model-only)
 else
@@ -211,6 +240,10 @@ echo "endpoint:     http://127.0.0.1:${PORT}/v1"
 echo "gpu:          $GPU"
 echo "vision:       $([[ "$LANGUAGE_MODEL_ONLY" == "1" ]] && echo off || echo on)"
 echo "thinking:     $([[ "$THINKING" == "1" ]] && echo on || echo off)"
+echo "prefix cache: $([[ "$PREFIX_CACHING" == "1" ]] && echo on || echo off)"
+echo "chunked pref: $([[ "$CHUNKED_PREFILL" == "1" ]] && echo on || echo off)"
+echo "async sched:  $([[ "$ASYNC_SCHEDULING" == "1" ]] && echo on || echo off)"
+echo "mm cache:     ${MM_PROCESSOR_CACHE_GB:-off} GiB"
 echo "log:          $LOG"
 echo
 echo "navagent:"
