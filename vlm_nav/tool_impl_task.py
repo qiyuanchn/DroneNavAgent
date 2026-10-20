@@ -947,6 +947,35 @@ def current_subtask(ctx: ToolContext) -> dict | None:
     return subtasks[index - 1] if index else None
 
 
+def subtask_ground_instruction(ctx: ToolContext) -> str:
+    """The current sub-task as a re-grounding instruction ("" without a plan).
+
+    A recovery call must re-locate *this* stage's object, not restate the whole
+    task: the sub-task's goal leads, its relation anchor
+    (``expected_observation``) and its declared preconditions follow. The
+    global instruction is never mixed in - an automatic ``ground_target`` that
+    repeats the three-stage sentence dilutes the identity the stage is about
+    (goal.md v1, seed23).
+    """
+    subtask = current_subtask(ctx)
+    if not isinstance(subtask, Mapping):
+        return ""
+    parts: list[str] = []
+    goal = str(subtask.get("goal") or "").strip()
+    if goal:
+        parts.append(goal)
+    anchor = str(subtask.get("expected_observation") or "").strip()
+    if anchor and anchor.casefold() not in goal.casefold():
+        parts.append(anchor)
+    for value in subtask.get("preconditions") or ():
+        text = str(value or "").strip()
+        if text and text.casefold() not in " ".join(parts).casefold():
+            parts.append(text)
+        if len(parts) >= 3:
+            break
+    return " - ".join(parts)[:MAX_STEP_CHARS]
+
+
 def mark_next_step_spent(
     ctx: ToolContext, origin: str = "subtask_next_step", subtask: dict | None = None
 ) -> bool:
@@ -2269,6 +2298,52 @@ def plan_complete(record: dict | None) -> bool:
     return bool(steps) and all(index in done for index in range(1, len(steps) + 1))
 
 
+def plan_completion(ctx: ToolContext) -> dict | None:
+    """The plan's completion verdict for the ``finish`` contract (None: no plan).
+
+    Every sub-task has to be ``done``; a ``claimed_done``/``blocked``/``failed``
+    or still pending stage is reported by id, status and goal, so a refused
+    ``finish`` can answer *which stages are still missing* instead of only
+    "verified=false". The evidence a claimed stage still owes travels along in
+    ``evidence_missing``.
+    """
+    record = plan_state(ctx)
+    if record is None:
+        return None
+    subtasks = plan_subtasks(ctx) or []
+    open_subtasks: list[dict] = []
+    missing: list[str] = []
+    for position, subtask in enumerate(subtasks, 1):
+        status = str(subtask.get("status") or SUBTASK_PENDING)
+        if status == SUBTASK_DONE:
+            continue
+        subtask_id = str(subtask.get("id") or f"st_{position}")
+        goal = str(subtask.get("goal") or "")
+        item = {
+            "index": position,
+            "subtask_id": subtask_id,
+            "status": status,
+            "goal": goal,
+        }
+        verdict = evidence_verdict(subtask)
+        if verdict["missing"]:
+            item["evidence_missing"] = list(verdict["missing"])
+        open_subtasks.append(item)
+        missing.append(f"subtask {subtask_id} ({status}): {goal}")
+    return {
+        "task_id": str(record.get("plan_id") or ""),
+        "revision": int(record.get("revision", 0)),
+        "complete": not open_subtasks,
+        "missing": missing,
+        "open_subtasks": open_subtasks,
+        "done_subtasks": [
+            str(subtask.get("id"))
+            for subtask in subtasks
+            if subtask.get("status") == SUBTASK_DONE
+        ],
+    }
+
+
 def plan_progress(ctx: ToolContext) -> str:
     """One-line progress of the episode's plan (the runtime's STATE block).
 
@@ -2931,6 +3006,8 @@ __all__ = [
     "normalize_subtasks",
     "explicit_progress",
     "plan_complete",
+    "plan_completion",
+    "subtask_ground_instruction",
     "plan_state",
     "plan_subtasks",
     "plan_text",

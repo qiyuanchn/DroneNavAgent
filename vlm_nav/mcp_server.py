@@ -179,6 +179,19 @@ TRAJECTORY_SEGMENT_STEPS = 32
 MAX_RESULT_IMAGES = 8
 STUB_MARKER = "[stub: implementation pending]"
 
+#: The task scope every scoped tool advertises (goal.md v1): the plan/sub-task
+#: the call belongs to, the candidate instance and the evidence revision a
+#: confirmation was taken against. Results carry the same four fields.
+SCOPE_PROPERTIES: dict[str, dict[str, Any]] = {
+    "task_id": {"type": "string", "description": "task/plan id (plan_N)"},
+    "subtask_id": {"type": "string", "description": "executing sub-task id (st_N)"},
+    "candidate_id": {"type": "string", "description": "candidate instance (cand_N)"},
+    "evidence_revision": {
+        "type": "integer",
+        "description": "candidate evidence revision the call/result belongs to",
+    },
+}
+
 #: First-version tool contracts (goal.md section 3). These schemas are what the
 #: MCP services advertise when the toolset module is not importable yet; when it
 #: is, the module's own ``ToolSpec.input_schema`` is used verbatim instead.
@@ -344,6 +357,11 @@ TOOL_CONTRACTS: dict[str, dict[str, Any]] = {
                 },
                 "max_legs": {"type": "integer", "minimum": 1, "maximum": 64},
                 "task_id": {"type": "string", "description": "continue an existing approach task (nav_N)"},
+                "subtask_id": {"type": "string", "description": "the plan sub-task this approach serves (st_N)"},
+                "evidence_revision": {
+                    "type": "integer",
+                    "description": "the candidate evidence revision being approached",
+                },
                 "timeout_s": {"type": "number"},
             },
             "required": ["candidate_id"],
@@ -408,6 +426,7 @@ TOOL_CONTRACTS: dict[str, dict[str, Any]] = {
                 "conditions": {"type": "array", "items": {"type": "string"}},
                 "candidate_id": {"type": "string"},
                 "observation_id": {"type": "string"},
+                **SCOPE_PROPERTIES,
             },
             "required": [],
         },
@@ -416,9 +435,12 @@ TOOL_CONTRACTS: dict[str, dict[str, Any]] = {
         "description": (
             "End the episode with an explicit outcome and the evidence behind it: "
             "success=true only when this episode left the trail (a verify_goal that "
-            "returned verified=true, or a grounded candidate plus an arrival). The "
-            "answer reports verified, claim, evidence_trail and what is missing; an "
-            "unbacked success claim is downgraded and never counted as success."
+            "returned verified=true, or a grounded candidate plus an arrival) and, "
+            "when a plan exists, every sub-task is done and the terminal "
+            "confirmation belongs to the current candidate/sub-task revision. The "
+            "answer reports verified, claim, evidence_trail, missing and "
+            "missing_subtasks (the stages still open); an unbacked success claim is "
+            "downgraded and never counted as success."
         ),
         "side_effects": False,
         "input_schema": FINISH_SCHEMA,

@@ -2467,5 +2467,43 @@ class PlanResumeTest(unittest.TestCase):
         self.assertEqual(record["resumed_from"], "")
 
 
+class SubtaskGroundInstructionTest(unittest.TestCase):
+    """A recovery re-grounding speaks the *current* sub-task, not the plan's
+    whole instruction (goal.md version 1, seed23)."""
+
+    def test_the_current_subtask_goal_and_its_relation_anchor_are_used(self):
+        from vlm_nav.tool_impl_task import subtask_ground_instruction
+
+        registry, ctx = plan_registry(), make_context()
+        registry.call(
+            "update_plan",
+            {
+                "steps": [
+                    {"id": "st_1", "goal": "fly to the wooden door"},
+                    {
+                        "id": "st_2",
+                        "goal": "confirm the cabinet",
+                        "expected_observation": "the cabinet beside the wooden door",
+                        "preconditions": ["the wooden door was confirmed at obs_7"],
+                    },
+                ]
+            },
+            ctx,
+        )
+        registry.call("update_plan", {"patch": [{"id": "st_1", "status": "done"}]}, ctx)
+
+        text = subtask_ground_instruction(ctx)
+
+        self.assertIn("cabinet", text)
+        self.assertIn("wooden door", text)
+        self.assertIn("obs_7", text)
+        self.assertNotIn("fly to the wooden door", text)
+
+    def test_without_a_plan_there_is_no_subtask_instruction(self):
+        from vlm_nav.tool_impl_task import subtask_ground_instruction
+
+        self.assertEqual(subtask_ground_instruction(make_context()), "")
+
+
 if __name__ == "__main__":
     unittest.main()

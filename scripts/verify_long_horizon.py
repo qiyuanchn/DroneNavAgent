@@ -173,6 +173,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -1087,6 +1088,7 @@ def read_trace(out_dir: Path) -> list[dict]:
 M1_MODULES = {
     "task": "vlm_nav.tool_impl_task",
     "tools": "vlm_nav.tools",
+    "navigation": "vlm_nav.tool_impl_navigation",
     "runtime": "vlm_nav.runtime",
 }
 
@@ -1343,33 +1345,777 @@ def build_carry_plan(
     }
 
 
-def completion_chain(entries: Sequence[Mapping]) -> dict:
-    """The runtime's own completion-chain verdict over a leg's turns.
+# ---------------------------------------------------------------------------
+# task scope: offline verdicts under the same contract as ``finish`` (goal.md v1)
+# ---------------------------------------------------------------------------
+
+#: The four scope fields of the v1 contract (``vlm_nav.tools.SCOPE_FIELDS``).
+SCOPE_FIELDS = ("task_id", "subtask_id", "candidate_id", "evidence_revision")
+#: Tools whose answer grounds a candidate identity (``vlm_nav.tools.IDENTITY_TOOLS``).
+IDENTITY_TOOLS = ("ground_target", "search_target")
+#: Tools whose answer flies to a place; ``outcome == arrived`` is the arrival.
+ARRIVAL_TOOLS = ("approach_candidate", "go_to_viewpoint", "return_to_observation")
+ARRIVAL_OUTCOMES = ("arrived",)
+
+
+def entry_scope(entry: Mapping) -> dict | None:
+    """The task scope a ledger entry's result carries, or None (pre-v1 trace).
+
+    ``ToolRegistry.call`` stamps every result with ``data["scope"]``; the four
+    fields are the ones ``finish`` filters its evidence pack by. A ledger written
+    before the scope contract has no such block and is evaluated the legacy,
+    unscoped way (``stage_report`` and ``completion_chain`` say which one ran).
+    """
+    data = entry.get("data")
+    if not isinstance(data, Mapping):
+        return None
+    scope = data.get("scope")
+    if not isinstance(scope, Mapping):
+        return None
+    values = {field: scope.get(field) for field in SCOPE_FIELDS}
+    if not any(
+        values[field] not in (None, "")
+        for field in ("task_id", "subtask_id", "candidate_id")
+    ):
+        return None
+    return values
+
+
+def final_scope(entries: Sequence[Mapping]) -> dict | None:
+    """The scope in force at the end of a chain (last result that carries one)."""
+    for entry in reversed(list(entries)):
+        scope = entry_scope(entry)
+        if scope is not None:
+            return scope
+    return None
+
+
+def _stage_index_of_text(text: Any, task: TaskSpec) -> int | None:
+    """The stage a free-text goal names (exact first, then containment)."""
+    value = str(text or "").strip().casefold()
+    if not value:
+        return None
+    for stage in task.stages:
+        if value in (stage.step.casefold(), stage.label.casefold()):
+            return stage.index
+    best: tuple[int, int] | None = None
+    for stage in task.stages:
+        for candidate in (stage.step, stage.label):
+            needle = str(candidate or "").strip().casefold()
+            if needle and needle in value and (best is None or len(needle) > best[0]):
+                best = (len(needle), stage.index)
+    return None if best is None else best[1]
+
+
+def offline_plan_subtasks(legs: Sequence[LegResult], task: TaskSpec) -> list[dict]:
+    """The final sub-task list reconstructed from the run's own records.
+
+    The statuses a leg's plan started with (``carry.plan_subtasks``, written by
+    ``tool_impl_task.update_plan``) are updated by every ``plan_transitions``
+    entry the runtime logged. A plan the model restated with new ids adds those
+    ids; the driver's own positional convention (``st_1..st_n``) is the floor.
+    """
+    subtasks: dict[str, dict] = {}
+    order: list[str] = []
+
+    def put(subtask_id: str, goal: str, status: str) -> None:
+        if not subtask_id:
+            return
+        if subtask_id not in subtasks:
+            subtasks[subtask_id] = {
+                "id": subtask_id,
+                "goal": goal or "",
+                "status": status or "pending",
+            }
+            order.append(subtask_id)
+            return
+        if goal:
+            subtasks[subtask_id]["goal"] = goal
+        if status:
+            subtasks[subtask_id]["status"] = status
+
+    for leg in legs:
+        rows = leg.plan.carry.get("plan_subtasks") or []
+        for position, row in enumerate(rows):
+            if not isinstance(row, Mapping):
+                continue
+            goal = str(row.get("goal") or "")
+            if not goal and position < len(task.stages):
+                goal = task.stages[position].step
+            put(str(row.get("id") or f"st_{position + 1}"),
+                goal, str(row.get("status") or "pending"))
+        for position, step in enumerate(leg.plan.carry.get("plan_steps") or []):
+            if position < len(task.stages):
+                put(f"st_{position + 1}", str(step), "")
+        for transition in leg.log.get("plan_transitions") or []:
+            if isinstance(transition, Mapping):
+                put(str(transition.get("id") or ""), "", str(transition.get("to") or ""))
+    if not order:
+        for stage in task.stages:
+            put(f"st_{stage.index}", stage.step, "pending")
+    return [subtasks[subtask_id] for subtask_id in order]
+
+
+def stage_subtask_map(task: TaskSpec, legs: Sequence[LegResult] = ()) -> dict[str, int]:
+    """``subtask_id -> stage index`` for the plan the episode really ran.
+
+    The driver's plan names the stages ``st_1..st_n``; a plan the model rewrote
+    keeps those ids when it patches in place and is mapped by goal text
+    otherwise. Without any plan record the positional convention is all there is.
+    """
+    mapping = {f"st_{stage.index}": stage.index for stage in task.stages}
+    for leg in legs:
+        for row in leg.plan.carry.get("plan_subtasks") or []:
+            if not isinstance(row, Mapping):
+                continue
+            index = _stage_index_of_text(row.get("goal"), task)
+            subtask_id = str(row.get("id") or "")
+            if subtask_id and index:
+                mapping[subtask_id] = index
+    for subtask in offline_plan_subtasks(legs, task):
+        index = _stage_index_of_text(subtask.get("goal"), task)
+        if index:
+            mapping[str(subtask.get("id"))] = index
+    return mapping
+
+
+def entry_stage_index(entry: Mapping, mapping: Mapping[str, int]) -> int | None:
+    """The stage a result belongs to, by its scope's ``subtask_id``."""
+    scope = entry_scope(entry)
+    if scope is None:
+        return None
+    subtask_id = str(scope.get("subtask_id") or "")
+    if not subtask_id:
+        return None
+    if subtask_id in mapping:
+        return int(mapping[subtask_id])
+    match = re.fullmatch(r"st_(\d+)", subtask_id)
+    return int(match.group(1)) if match else None
+
+
+def offline_plan_completion(legs: Sequence[LegResult], task: TaskSpec) -> dict | None:
+    """The plan's completion verdict, through the task module's own function.
+
+    ``finish`` refuses a success claim on ``plan_completion(ctx)``; the driver
+    rebuilds that call from the leg artifacts (statuses from the plan record the
+    legs carried and the runtime's transitions) so the offline verdict uses the
+    same function, not a look-alike. ``evidence_missing`` in the returned rows is
+    not read by the report: the reconstructed records carry no executor evidence
+    marks; the scoped completion chain below is the evidence judge.
+    """
+    subtasks = offline_plan_subtasks(legs, task)
+    modules = m1_modules()
+    task_module = modules.get("task")
+    tools_module = modules.get("tools")
+    if not subtasks or task_module is None or tools_module is None:
+        return None
+    plan_id = ""
+    for leg in legs:
+        for entry in leg.entries:
+            scope = entry_scope(entry)
+            if scope and scope.get("task_id"):
+                plan_id = str(scope["task_id"])
+    record = {
+        "plan_id": plan_id or "plan_1",
+        "revision": sum(len(leg.log.get("plan_transitions") or []) for leg in legs),
+        "steps": [str(item.get("goal") or "") for item in subtasks],
+        "subtasks": subtasks,
+        "current_step": 1,
+        "done": [],
+        "done_when": "",
+        "note": "reconstructed from leg artifacts for offline evaluation",
+        "instruction": str(legs[0].plan.instruction if legs else "")[:160],
+        "episode_id": "offline_plan",
+    }
+    context = tools_module.ToolContext(
+        world=None,
+        memory=None,
+        episode_id="offline_plan",
+        observation_seq=0,
+        budget={"tool_calls_left": 0},
+        extra={"plan": record, "instruction": record["instruction"]},
+    )
+    try:
+        verdict = task_module.plan_completion(context)
+    except Exception:  # noqa: BLE001 - a reconstructed plan must not break a report
+        return None
+    if not isinstance(verdict, Mapping):
+        return None
+    verdict = dict(verdict)
+    verdict["source"] = "vlm_nav.tool_impl_task.plan_completion"
+    verdict["statuses"] = [
+        {"id": item["id"], "goal": item["goal"], "status": item["status"]}
+        for item in subtasks
+    ]
+    return verdict
+
+
+def _scope_fields(entry: Mapping) -> dict:
+    scope = entry_scope(entry) or {}
+    try:
+        revision = int(scope.get("evidence_revision") or 0)
+    except (TypeError, ValueError):
+        revision = 0
+    return {
+        "task_id": str(scope.get("task_id") or ""),
+        "subtask_id": str(scope.get("subtask_id") or ""),
+        "candidate_id": str(scope.get("candidate_id") or ""),
+        "evidence_revision": revision,
+    }
+
+
+def completion_records(entries: Sequence[Mapping]) -> list[dict]:
+    """Ledger entries in the evidence-pack shape ``_record_in_scope`` reads.
+
+    The pack stores one record per evidence event (verification, grounded
+    candidate, arrival) with the scope fields lifted to its ``data``; the ledger
+    keeps one entry per call with the scope nested. This adapter rebuilds the
+    pack shape from the calls, so the offline filter is the runtime's own.
+    """
+    records: list[dict] = []
+    for entry in entries:
+        tool = str(entry.get("tool") or "")
+        if not tool:
+            continue
+        data = entry.get("data") if isinstance(entry.get("data"), Mapping) else {}
+        fields = _scope_fields(entry)
+        refs = list(entry.get("evidence") or [])
+        status = str(entry.get("status") or "")
+        call = order_of(entry) or entry.get("seq")
+        if tool == "verify_goal":
+            records.append({
+                "tool": tool,
+                "status": status,
+                "data": {
+                    "verified": data.get("verified"),
+                    "checks": dict(data.get("checks") or {}),
+                    "observation_id": str(data.get("observation_id") or ""),
+                    **fields,
+                },
+                "evidence": refs,
+                "call": call,
+            })
+        elif tool in IDENTITY_TOOLS:
+            candidate_id = str(data.get("candidate_id") or "")
+            if not candidate_id:
+                candidates = data.get("candidates")
+                if isinstance(candidates, (list, tuple)) and candidates:
+                    top = candidates[0] if isinstance(candidates[0], Mapping) else {}
+                    candidate_id = str(top.get("id") or top.get("candidate_id") or "")
+            point = _as_position(data.get("position_flu"))
+            if point is None:
+                candidates = data.get("candidates")
+                if isinstance(candidates, (list, tuple)) and candidates:
+                    top = candidates[0] if isinstance(candidates[0], Mapping) else {}
+                    point = _as_position(top.get("position_flu"))
+            records.append({
+                "tool": tool,
+                "status": status,
+                "data": {
+                    "candidate_id": candidate_id,
+                    "observation_id": str(data.get("observation_id") or ""),
+                    "position_flu": list(point) if point is not None else None,
+                    **fields,
+                },
+                "evidence": refs,
+                "call": call,
+            })
+        elif tool in ARRIVAL_TOOLS and (
+            str(data.get("outcome") or "") in ARRIVAL_OUTCOMES
+            or data.get("arrived") is True
+        ):
+            records.append({
+                "tool": tool,
+                "status": status,
+                "data": {
+                    "outcome": str(data.get("outcome") or ""),
+                    "task_status": "arrived" if data.get("arrived") is True
+                    else str(data.get("task_status") or ""),
+                    "candidate_id": str(data.get("candidate_id") or data.get("target_id") or ""),
+                    "scope_task_id": fields["task_id"],
+                    **fields,
+                },
+                "evidence": refs,
+                "call": call,
+            })
+        elif tool == "task_status" and data.get("completed") and data.get("arrived"):
+            records.append({
+                "tool": tool,
+                "status": status,
+                "data": {
+                    "completed": True,
+                    "arrived": True,
+                    "candidate_id": str(data.get("candidate_id") or ""),
+                    "scope_task_id": fields["task_id"],
+                    **fields,
+                },
+                "evidence": refs,
+                "call": call,
+            })
+    return records
+
+
+def completion_chain(
+    entries: Sequence[Mapping],
+    *,
+    scope: Mapping | None = None,
+    task_scoped: bool | None = None,
+) -> dict:
+    """The runtime's own completion-chain verdict, filtered by the task scope.
 
     ``vlm_nav.tools.completion_evidence`` is the judge of a ``success: true``
     claim: a verification that passed, or a grounded candidate plus an arrival,
-    and at least one evidence reference. The driver reads the *same* chain from
-    its ledger (``call`` = the ledger seq) so the report's traceability verdict
-    is the runtime's, not a second opinion.
+    and at least one evidence reference. The records are first filtered through
+    ``vlm_nav.tools._record_in_scope`` with the scope in force at the end of the
+    chain - the same filter ``finish`` applies - so a confirmation of an earlier
+    candidate instance, revision or sub-task cannot back the claim. Without a
+    scope-carrying entry (a pre-v1 artifact) the raw chain is reported and
+    ``scoped`` says false.
     """
     modules = m1_modules()
     tools_module = modules.get("tools")
     if tools_module is None or not hasattr(tools_module, "completion_evidence"):
         return {"supported": False}
-    records = [
-        {
-            "tool": entry.get("tool"),
-            "status": entry.get("status"),
-            "data": entry.get("data") or {},
-            "evidence": entry.get("evidence") or [],
-            "call": entry.get("seq"),
-        }
-        for entry in entries
-        if entry.get("tool")
-    ]
+    records = completion_records(entries)
     verdict = dict(tools_module.completion_evidence(records))
     verdict["supported"] = True
-    return verdict
+    current = dict(scope) if isinstance(scope, Mapping) else final_scope(entries)
+    # ``_record_in_scope`` lives with the finish/evidence-pack contract in the
+    # navigation tool module (the same function ``completion_claim`` calls).
+    filter_fn = getattr(tools_module, "_record_in_scope", None)
+    if not callable(filter_fn):
+        navigation = modules.get("navigation")
+        filter_fn = getattr(navigation, "_record_in_scope", None)
+    if current is None or not callable(filter_fn):
+        verdict.update(scoped=False, raw_verified=bool(verdict["verified"]),
+                       rejected_records=0, scoped_records=len(records), scope=None)
+        return verdict
+    scoped_task = bool(current.get("subtask_id")) if task_scoped is None else bool(task_scoped)
+    kept = [record for record in records if filter_fn(record, current, scoped_task)]
+    scoped_verdict = dict(tools_module.completion_evidence(kept))
+    scoped_verdict.update(
+        supported=True,
+        scoped=True,
+        scope={field: current.get(field) for field in SCOPE_FIELDS},
+        raw_verified=bool(verdict["verified"]),
+        rejected_records=len(records) - len(kept),
+        scoped_records=len(kept),
+        task_scoped=scoped_task,
+    )
+    return scoped_verdict
+
+
+def finish_contract_rows(entries: Sequence[Mapping]) -> dict:
+    """Every ``finish`` call in the chain with the contract fields it answered.
+
+    The v1 contract makes ``finish`` answer ``blocked`` (with ``missing`` and
+    ``missing_subtasks``) instead of terminating when the plan is incomplete or
+    the confirmation is stale. The rows say what the call declared, what the
+    scope was, and whether the episode really continued afterwards.
+    """
+    ordered = list(entries)
+    rows: list[dict] = []
+    for position, entry in enumerate(ordered):
+        if str(entry.get("tool") or "") != "finish":
+            continue
+        data = entry.get("data") if isinstance(entry.get("data"), Mapping) else {}
+        args = entry.get("args") if isinstance(entry.get("args"), Mapping) else {}
+        after = ordered[position + 1:]
+        after_tools: dict[str, int] = {}
+        for item in after:
+            name = str(item.get("tool") or "")
+            if name:
+                after_tools[name] = after_tools.get(name, 0) + 1
+        declared = data.get("claimed")
+        if declared is None:
+            declared = args.get("success") is True
+        rows.append({
+            "seq": entry.get("seq"),
+            "leg": entry.get("leg"),
+            "status": str(entry.get("status") or ""),
+            "declared_success": args.get("success"),
+            "claimed": bool(declared),
+            "claim": str(data.get("claim") or ""),
+            "verified": data.get("verified"),
+            "success": data.get("success"),
+            "plan_complete": data.get("plan_complete"),
+            "missing": list(data.get("missing") or []),
+            "missing_subtasks": [
+                dict(item) for item in data.get("missing_subtasks") or []
+                if isinstance(item, Mapping)
+            ],
+            "scope": _scope_fields(entry),
+            "blocked": str(entry.get("status") or "") == "blocked",
+            "calls_after": len(after),
+            "tools_after": after_tools,
+            "continued_after_blocked": bool(
+                str(entry.get("status") or "") == "blocked" and after
+            ),
+        })
+    first_missing: list[dict] = []
+    for row in rows:
+        if row["missing_subtasks"]:
+            first_missing = row["missing_subtasks"]
+            break
+    return {
+        "rows": rows,
+        "n": len(rows),
+        "blocked": sum(1 for row in rows if row["blocked"]),
+        "blocked_continued": sum(1 for row in rows if row["continued_after_blocked"]),
+        "missing_subtasks": first_missing,
+        "claims": [row for row in rows if row["claimed"]],
+    }
+
+
+def completion_claims(
+    legs: Sequence[LegResult], entries: Sequence[Mapping], *, ordered_success: bool
+) -> dict:
+    """The episode's completion claim and whether the evaluation agrees.
+
+    A claim is a ``finish`` that declared ``success: true`` (or the runner's
+    final verdict). ``wrong`` is the goal.md "claimed done, not done" failure:
+    the claim exists and the ordered full chain was not established.
+    """
+    claims: list[dict] = []
+    for entry in entries:
+        if str(entry.get("tool") or "") != "finish":
+            continue
+        data = entry.get("data") if isinstance(entry.get("data"), Mapping) else {}
+        args = entry.get("args") if isinstance(entry.get("args"), Mapping) else {}
+        declared = data.get("claimed")
+        if declared is None:
+            declared = args.get("success") is True
+        if not declared:
+            continue
+        claims.append({
+            "leg": entry.get("leg"),
+            "seq": entry.get("seq"),
+            "status": str(entry.get("status") or ""),
+            "verified": data.get("verified"),
+            "plan_complete": data.get("plan_complete"),
+            "missing_subtasks": len(data.get("missing_subtasks") or []),
+        })
+    summary_claim = any(
+        isinstance(leg.summary, Mapping) and leg.summary.get("success") is True
+        for leg in legs
+    )
+    claimed = bool(claims) or summary_claim
+    return {
+        "claimed": claimed,
+        "claims": claims,
+        "n_claims": len(claims),
+        "runner_claimed": summary_claim,
+        "evaluated_complete": bool(ordered_success),
+        "wrong": bool(claimed and not ordered_success),
+    }
+
+
+def _collect_candidates(payload: Any, table: dict[str, list[float]], _depth: int = 0) -> None:
+    """``candidate_id -> place`` from every candidate the episode's results name."""
+    if _depth > 6:
+        return
+    if isinstance(payload, Mapping):
+        candidate_id = (
+            payload.get("candidate_id")
+            or payload.get("target_id")
+            or payload.get("id")
+        )
+        point = None
+        for key in ("position_flu", "position", "target_position", "candidate_position"):
+            point = _as_position(payload.get(key))
+            if point is not None:
+                break
+        if candidate_id not in (None, "") and point is not None:
+            table.setdefault(str(candidate_id), [float(v) for v in point])
+        for value in payload.values():
+            _collect_candidates(value, table, _depth + 1)
+    elif isinstance(payload, (list, tuple)):
+        for item in payload:
+            _collect_candidates(item, table, _depth + 1)
+
+
+def instance_acceptance(
+    entries: Sequence[Mapping], task: TaskSpec, mapping: Mapping[str, int]
+) -> dict:
+    """Arrivals/confirmations that accepted an object which is not the truth one.
+
+    Every acceptance event is an arrival (``outcome=arrived`` on an object
+    motion) or a passing ``verify_goal``. Its object instance is resolved from
+    the candidate table the episode's own groundings built (the scope's
+    ``candidate_id`` first, the result's place second) and compared with the
+    stage place the call was scoped to. A gap beyond that stage's ``locate_m``
+    is a wrong-instance acceptance; an event whose instance cannot be resolved
+    is reported as unresolved and kept out of the rate.
+    """
+    table: dict[str, list[float]] = {}
+    for entry in entries:
+        _collect_candidates(entry.get("data") or {}, table)
+    rows: list[dict] = []
+    resolved = wrong = 0
+    for entry in entries:
+        tool = str(entry.get("tool") or "")
+        data = entry.get("data") if isinstance(entry.get("data"), Mapping) else {}
+        kind = ""
+        if tool == "approach_candidate" and (
+            str(data.get("outcome") or "") in ARRIVAL_OUTCOMES
+            or data.get("arrived") is True
+        ):
+            kind = "arrival"
+        elif tool == "verify_goal" and data.get("verified") is True:
+            kind = "confirmation"
+        if not kind:
+            continue
+        scope = _scope_fields(entry)
+        candidate_id = str(
+            scope.get("candidate_id")
+            or data.get("candidate_id")
+            or data.get("target_id")
+            or ""
+        )
+        point = table.get(candidate_id)
+        if point is None:
+            for key in ("target_position", "candidate_position", "position_flu"):
+                point = _as_position(data.get(key))
+                if point is not None:
+                    break
+        stage_index = entry_stage_index(entry, mapping)
+        if point is None and stage_index is not None:
+            stage = task.stages[stage_index - 1]
+            if stage.position is not None:
+                point = [float(v) for v in stage.position]
+        stage = task.stages[stage_index - 1] if stage_index else None
+        if point is None or stage is None or stage.position is None:
+            rows.append({
+                "kind": kind, "leg": entry.get("leg"), "seq": entry.get("seq"),
+                "tool": tool, "candidate_id": candidate_id, "stage": None,
+                "distance_m": None, "wrong": None, "resolved": False,
+            })
+            continue
+        gap = _distance(point, stage.position)
+        is_wrong = gap > float(stage.locate_m)
+        resolved += 1
+        wrong += int(is_wrong)
+        rows.append({
+            "kind": kind, "leg": entry.get("leg"), "seq": entry.get("seq"),
+            "tool": tool, "candidate_id": candidate_id, "stage": stage.stage_id,
+            "distance_m": round(gap, 3), "locate_m": float(stage.locate_m),
+            "wrong": bool(is_wrong), "resolved": True,
+        })
+    return {
+        "events": len(rows),
+        "resolved": resolved,
+        "wrong": wrong,
+        "wrong_rate": _rate(wrong, resolved),
+        "unresolved": len(rows) - resolved,
+        "rows": rows,
+    }
+
+
+#: Tokens of a stage label that name its object/relation (the anchor check).
+_TOKEN_SPLIT_RE = re.compile(r"[的旁里边附近在是与和，,。;；、\s]+")
+
+
+def _label_tokens(*labels: str) -> list[str]:
+    tokens: list[str] = []
+    for label in labels:
+        for token in _TOKEN_SPLIT_RE.split(str(label or "")):
+            token = token.strip()
+            if token and token not in tokens:
+                tokens.append(token)
+    return tokens
+
+
+def _names_stage(text: str, stage: StageSpec) -> bool:
+    """True when the text contains the stage's full label or step."""
+    folded = text.casefold()
+    return any(
+        candidate and str(candidate).strip().casefold() in folded
+        for candidate in (stage.label, stage.step)
+    )
+
+
+def _classify_regrounding(instruction: str, stage: StageSpec | None, task: TaskSpec) -> str:
+    """Whether an automatic re-grounding asked for the current sub-goal or the task."""
+    text = str(instruction or "").strip()
+    if not text:
+        return "empty"
+    if stage is None:
+        return "unknown_stage"
+    global_text = str(task.instruction or "")
+    if global_text and (
+        text == global_text or text in global_text
+        or (global_text in text and len(text) - len(global_text) < 40)
+    ):
+        return "global_instruction"
+    if any(marker in text for marker in ("第一步", "第二步", "第三步")):
+        return "global_instruction"
+    named = [item for item in task.stages if _names_stage(text, item)]
+    if len(named) >= 2 and len(text) >= len(global_text) * 0.5:
+        return "global_instruction"
+    has_stage = _names_stage(text, stage) or any(
+        token in text for token in _label_tokens(stage.label, stage.step)
+    )
+    anchor = next((s for s in task.stages if s.stage_id == stage.anchor), None)
+    anchor_tokens = _label_tokens(anchor.label, anchor.step) if anchor else []
+    has_anchor = any(token in text for token in anchor_tokens) if anchor_tokens else False
+    if has_stage and (has_anchor or not anchor_tokens):
+        return "subgoal+anchor"
+    if has_stage:
+        return "subgoal"
+    return "other"
+
+
+#: Tools that turn a visible/remembered object into a candidate (a re-grounding).
+REGROUND_TOOLS = ("ground_target", "search_target")
+
+
+def _call_rows_for_regrounding(leg: LegResult) -> list[dict]:
+    """The leg's calls in order, with a turn when the trace is available.
+
+    A finished leg has ``tool_trace.jsonl`` (one row per decision turn); an
+    interrupted leg has none, and its ledger's outer entries are the same calls.
+    """
+    trace = read_trace(leg.out_dir)
+    if trace:
+        return [
+            {
+                "turn": int(item.get("turn") or 0),
+                "tool": str(item.get("tool") or ""),
+                "status": str(item.get("status") or ""),
+                "args": dict(item.get("args") or {}),
+                "data": dict(item.get("data") or {}),
+                "evidence": list(item.get("evidence") or []),
+            }
+            for item in trace
+        ]
+    return [
+        {
+            "turn": int(entry.get("seq") or 0),
+            "tool": str(entry.get("tool") or ""),
+            "status": str(entry.get("status") or ""),
+            "args": dict(entry.get("args") or {}),
+            "data": dict(entry.get("data") or {}),
+            "evidence": list(entry.get("evidence") or []),
+        }
+        for entry in leg.entries
+        if entry.get("outer")
+    ]
+
+
+def recovery_regrounding(legs: Sequence[LegResult], task: TaskSpec) -> dict:
+    """What a loop-protected recovery asked the next re-grounding to look for.
+
+    goal.md v1 (seed23): a recovery must re-locate the *current sub-task* and its
+    relation anchor, not restate the three-stage instruction. Two sources are
+    paired with the ``ground_target``/``search_target`` the episode really
+    executed:
+
+    - ``recovery``: the runtime's stagnation advice (``EpisodeLog.recoveries``);
+    - ``next_action``: a failed/blocked movement whose own answer names a
+      re-grounding call (``_ground_again_action``), which is the path the
+      seed23 loop protection takes.
+
+    The instruction of the executed call is classified as ``subgoal+anchor``
+    (current stage plus its relation anchor), ``subgoal``, ``global_instruction``
+    (the whole task restated) or ``other``.
+    """
+    rows: list[dict] = []
+    mapping = stage_subtask_map(task, legs)
+    for leg in legs:
+        calls = _call_rows_for_regrounding(leg)
+        by_turn = {call["turn"]: call for call in calls}
+        seen: set[tuple] = set()
+
+        def follow_for(index: int, wanted: str) -> dict | None:
+            for item in calls[index + 1:index + 4]:
+                if item["tool"] == wanted:
+                    return item
+            for item in calls[index + 1:]:
+                if item["tool"] in REGROUND_TOOLS:
+                    return item
+            return None
+
+        def add(source: str, index: int, stalled: dict, advice: list[str]) -> None:
+            scope = _scope_fields(stalled)
+            stage_index = (
+                entry_stage_index(stalled, mapping)
+                if scope.get("subtask_id") else None
+            )
+            stage = task.stages[stage_index - 1] if stage_index else None
+            next_action = stalled["data"].get("next_action")
+            wanted = (
+                str(next_action.get("tool") or "")
+                if isinstance(next_action, Mapping) else ""
+            )
+            if wanted in REGROUND_TOOLS:
+                follow = follow_for(index, wanted)
+            else:
+                follow = follow_for(index, "ground_target") or follow_for(index, "search_target")
+            instruction = ""
+            if follow is not None:
+                instruction = str(follow["args"].get("instruction") or "")
+            key = (
+                int(stalled["turn"]), follow["turn"] if follow is not None else None,
+                source,
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            rows.append({
+                "leg": leg.plan.label,
+                "source": source,
+                "turn": int(stalled["turn"]),
+                "stalled_tool": str(stalled["tool"] or ""),
+                "stalled_status": str(stalled["status"] or ""),
+                "stage": None if stage is None else stage.stage_id,
+                "advice": [str(item) for item in advice],
+                "executed": follow is not None,
+                "follow_tool": "" if follow is None else follow["tool"],
+                "follow_turn": None if follow is None else follow["turn"],
+                "instruction": instruction,
+                "classification": _classify_regrounding(instruction, stage, task),
+                "new_evidence": bool(follow["evidence"]) if follow is not None else False,
+            })
+
+        recovery_turns: dict[int, dict] = {}
+        for record in leg.log.get("recoveries") or []:
+            if not isinstance(record, Mapping):
+                continue
+            turn = int(record.get("turn") or 0)
+            recovery_turns[turn] = dict(record)
+            stalled = by_turn.get(turn) or {"turn": turn, "tool": "", "status": "",
+                                           "args": {}, "data": {}, "evidence": []}
+            index = next(
+                (position for position, call in enumerate(calls) if call["turn"] == turn),
+                -1,
+            )
+            if index >= 0:
+                add("recovery", index, stalled, list(record.get("advice") or []))
+        for index, call in enumerate(calls):
+            if call["turn"] in recovery_turns:
+                continue  # already reported by the runtime's own recovery event
+            next_action = call["data"].get("next_action")
+            if not isinstance(next_action, Mapping):
+                continue
+            if str(next_action.get("tool") or "") not in REGROUND_TOOLS:
+                continue
+            add("next_action", index, call, [])
+    subgoal = sum(
+        1 for row in rows if row["classification"] in ("subgoal", "subgoal+anchor")
+    )
+    global_rows = sum(1 for row in rows if row["classification"] == "global_instruction")
+    return {
+        "events": len(rows),
+        "executed": sum(1 for row in rows if row["executed"]),
+        "subgoal_scoped": subgoal,
+        "global_instruction": global_rows,
+        "with_anchor": sum(1 for row in rows if row["classification"] == "subgoal+anchor"),
+        "by_source": {
+            source: sum(1 for row in rows if row["source"] == source)
+            for source in ("recovery", "next_action")
+        },
+        "rows": rows,
+    }
 
 
 def decision_anatomy(log: Mapping | None, *, fallback_turns: int) -> dict:
@@ -1698,25 +2444,70 @@ def _scan_entries(entries: Sequence[dict], stage: StageSpec) -> dict | None:
     return located
 
 
+def _entries_for_stage(
+    entries: Sequence[dict],
+    stage: StageSpec,
+    mapping: Mapping[str, int],
+) -> tuple[list[dict], int, int]:
+    """``(entries, excluded, unscoped)`` of one stage under its task scope.
+
+    A tool result counts for a stage only when the scope it was produced under
+    names that stage's sub-task. This is the offline half of the v1 contract:
+    a grounding made while another sub-task was executing cannot complete this
+    stage (goal.md: "candidate, arrival and confirmation must belong to the same
+    sub-task"). Entries without any scope (pre-v1 artifacts) are excluded from a
+    scoped verdict and counted, never silently reused.
+    """
+    if not mapping:
+        return list(entries), 0, 0
+    selected: list[dict] = []
+    excluded = 0
+    unscoped = 0
+    for entry in entries:
+        scope = entry_scope(entry)
+        if scope is None:
+            unscoped += 1
+            continue
+        if entry_stage_index(entry, mapping) == stage.index:
+            selected.append(entry)
+        else:
+            excluded += 1
+    return selected, excluded, unscoped
+
+
 def stage_report(
     entries: Sequence[dict],
     task: TaskSpec,
     *,
     poses: Sequence[Sequence[float]] = (),
+    subtask_map: Mapping[str, int] | None = None,
+    scoped: bool | None = None,
 ) -> dict:
-    """Per-stage reach/locate/complete verdicts, from evidence only.
+    """Per-stage reach/locate/complete verdicts, from scoped evidence only.
 
     A stage is *reached* when the executor carried the drone inside ``reach_m``
-    of the stage's place (any pose the ledger or the world's trajectory shows) and
-    *located* when a tool result carried a place inside ``locate_m`` of it; the
-    stage is complete when both hold. Nothing here reads the model's prose: a
-    plan step, a ``finish`` reason or a recovery note cannot complete a stage.
+    of the stage's place and *located* when a tool result carried a place inside
+    ``locate_m`` of it; the stage is complete when both hold. Nothing here reads
+    the model's prose: a plan step, a ``finish`` reason or a recovery note cannot
+    complete a stage.
+
+    The v1 scope contract narrows both halves to the sub-task that stage was
+    executing: an observation, candidate or arrival produced while another
+    sub-task was current does not count for this one. The mode is automatic -
+    a ledger whose results carry ``data["scope"]`` is judged scoped, a pre-v1
+    ledger (and every synthetic fixture that predates the contract) keeps the
+    historical unscoped verdict, reported under ``scope.active = false``.
     """
-    pose_points: list[tuple[float, float, float]] = []
-    for item in poses:
-        point = _as_position(item)
-        if point is not None:
-            pose_points.append(point)
+    scope_entries = sum(1 for entry in entries if entry_scope(entry) is not None)
+    if scoped is None:
+        scoped = bool(subtask_map) and scope_entries > 0
+    mapping = dict(subtask_map or {f"st_{stage.index}": stage.index for stage in task.stages})
+    external_poses: list[tuple[float, float, float]] = []
+    if not scoped:
+        for item in poses:
+            point = _as_position(item)
+            if point is not None:
+                external_poses.append(point)
     stages: dict[str, dict] = {}
     for stage in task.stages:
         row: dict[str, Any] = {
@@ -1749,14 +2540,22 @@ def stage_report(
             "closest_place_flu": None,
             "closest_place_tool": "",
             "unevaluable": stage.position is None,
+            "scoped_entries": 0,
+            "scope_excluded_entries": 0,
         }
+        if scoped:
+            stage_entries, excluded, _unscoped = _entries_for_stage(entries, stage, mapping)
+        else:
+            stage_entries, excluded = list(entries), 0
+        row["scoped_entries"] = len(stage_entries)
+        row["scope_excluded_entries"] = excluded
         if stage.position is not None:
             best_reach: tuple[float, int | None] | None = None
-            for point in pose_points:
+            for point in external_poses:
                 gap = _distance(point, stage.position)
                 if gap <= stage.reach_m and (best_reach is None or gap < best_reach[0]):
                     best_reach = (gap, None)
-            for entry in entries:
+            for entry in stage_entries:
                 # both ends of every call: a leg that carried the drone *through*
                 # the stage's place and on to somewhere else still reached it
                 for value in (entry.get("pose_before"), entry.get("pose_after")):
@@ -1774,7 +2573,7 @@ def stage_report(
             # stage the agent never established still says whether it looked at
             # the right place at all (a candidate 3 m away is a different object)
             closest: tuple[float, tuple[float, float, float], str] | None = None
-            for entry in entries:
+            for entry in stage_entries:
                 for point in positions_in(entry.get("data") or {}):
                     gap = _distance(point, stage.position)
                     if closest is None or gap < closest[0]:
@@ -1783,7 +2582,7 @@ def stage_report(
                 row["closest_place_distance_m"] = round(closest[0], 3)
                 row["closest_place_flu"] = [float(v) for v in closest[1]]
                 row["closest_place_tool"] = closest[2]
-            located = _scan_entries(entries, stage)
+            located = _scan_entries(stage_entries, stage)
             if located is not None:
                 row.update(
                     {
@@ -1838,6 +2637,17 @@ def stage_report(
         "relation_ok": all(
             row["relation_ok"] is not False for row in stages.values()
         ),
+        "scope": {
+            "active": bool(scoped),
+            "entries": len(entries),
+            "scoped_entries": scope_entries,
+            "unscoped_entries": len(entries) - scope_entries,
+            "mapping": {str(key): int(value) for key, value in mapping.items()},
+            "unmapped_stages": [
+                stage.stage_id for stage in task.stages
+                if not any(index == stage.index for index in mapping.values())
+            ],
+        },
     }
 
 
@@ -1967,7 +2777,9 @@ def build_resume_state(
     record's ``instruction`` is the *resumed* instruction (brief included), which
     is what ``resume_plan``'s guard compares against.
     """
-    report = report or stage_report(leg.entries, task)
+    report = report or stage_report(
+        leg.entries, task, subtask_map=stage_subtask_map(task, [leg])
+    )
     stages = report.get("stages") or {}
     done = [stage.index for stage in task.stages if (stages.get(stage.stage_id) or {}).get("complete")]
     total = len(task.stages)
@@ -2068,6 +2880,7 @@ def leg_metrics(
     logged_model_turns = summary.get("model_turns")
     if not isinstance(logged_model_turns, int):
         logged_model_turns = int(decision_turns)
+    completion = completion_chain(entries)
     return {
         "decision_turns": int(decision_turns),
         # P4-B: deterministic continuation steps the executor ran itself (no
@@ -2108,7 +2921,12 @@ def leg_metrics(
         "runner_completion": (
             None if leg.summary is None else leg.summary.get("completion")
         ),
-        "driver_completion_verified": bool(completion_chain(entries).get("verified")),
+        "driver_completion_verified": bool(completion.get("verified")),
+        "completion_scope": {
+            key: completion.get(key)
+            for key in ("scoped", "scope", "rejected_records", "scoped_records",
+                        "raw_verified", "task_scoped")
+        },
         "progress_kinds": kinds,
         "tools": tool_histogram(entries),
         "wall_time_s": round(float(leg.wall_time_s), 3),
@@ -2186,10 +3004,15 @@ def combined_verdict(
             point = _as_position(value)
             if point is not None and (not poses or poses[-1] != point):
                 poses.append(point)
-    report = stage_report(entries, task, poses=poses)
+    mapping = stage_subtask_map(task, legs)
+    report = stage_report(entries, task, poses=poses, subtask_map=mapping)
     target_stage = next((stage for stage in task.stages if stage.target), None)
     verify = verify_evidence(entries, target_stage, gate_m)
     chain_completion = completion_chain(entries)
+    plan_completion = offline_plan_completion(legs, task)
+    finish_contract = finish_contract_rows(entries)
+    acceptance = instance_acceptance(entries, task, mapping)
+    recovery_scope = recovery_regrounding(legs, task)
     final = legs[-1] if legs else None
     success = bool(final is not None and isinstance(final.summary, dict) and final.summary.get("success"))
     evidence_complete = all(
@@ -2200,18 +3023,21 @@ def combined_verdict(
         if chain_completion.get("supported")
         else verify["ok"]
     )
+    ordered_success = bool(report["chain_complete"] and report["order_ok"])
     traceable = bool(
-        report["chain_complete"]
-        and report["order_ok"]
+        ordered_success
         and report["relation_ok"]
         and evidence_complete
         and chain_ok
         and success
     )
+    claim = completion_claims(legs, entries, ordered_success=ordered_success)
     interrupted_leg = next((leg for leg in legs if leg.interrupted), None)
     before = (
         stage_report(
-            [entry for entry in entries if entry["leg"] == interrupted_leg.plan.label], task
+            [entry for entry in entries if entry["leg"] == interrupted_leg.plan.label],
+            task,
+            subtask_map=mapping,
         ).get("complete_count", 0)
         if interrupted_leg is not None
         else 0
@@ -2228,6 +3054,12 @@ def combined_verdict(
         "stages": report,
         "verify": verify,
         "completion_chain": chain_completion,
+        "plan_completion": plan_completion,
+        "finish_contract": finish_contract,
+        "instance_acceptance": acceptance,
+        "completion_claim": claim,
+        "recovery_regrounding": recovery_scope,
+        "ordered_success": ordered_success,
         "evidence_complete": evidence_complete,
         "traceable_success": traceable,
         "interrupted": interrupted,
@@ -2237,7 +3069,7 @@ def combined_verdict(
         "resume_used_carry": bool(
             interrupted and any(leg.plan.carry.get("mode") == "resume" for leg in legs[1:])
         ),
-        "done_stage_recheck": done_stage_recheck(entries, task, interrupted_leg),
+        "done_stage_recheck": done_stage_recheck(entries, task, interrupted_leg, mapping),
         "entries": entries,
         "annotations": (
             annotations(task, legs, report, verify, traceable=traceable) if annotate else []
@@ -2329,7 +3161,9 @@ def plan_vs_evidence_by_leg(
                 statuses[subtask_id] = str(
                     transition.get("to") or statuses.get(subtask_id, "")
                 )
-        report = stage_report(evidence_entries, task)
+        report = stage_report(
+            evidence_entries, task, subtask_map=stage_subtask_map(task, legs)
+        )
         leg_disagreements: list[dict] = []
         compared = 0
         for stage in task.stages:
@@ -2463,7 +3297,10 @@ def episode_metrics(
 
 
 def done_stage_recheck(
-    entries: Sequence[dict], task: TaskSpec, interrupted_leg: LegResult | None
+    entries: Sequence[dict],
+    task: TaskSpec,
+    interrupted_leg: LegResult | None,
+    subtask_map: Mapping[str, int] | None = None,
 ) -> int:
     """Information calls of a follow-up leg inside a stage it already established.
 
@@ -2479,7 +3316,9 @@ def done_stage_recheck(
     prefix = [entry for entry in entries if entry.get("leg") == label]
     done = [
         stage for stage in task.stages
-        if (stage_report(prefix, task)["stages"][stage.stage_id])["complete"]
+        if (stage_report(
+            prefix, task, subtask_map=subtask_map or stage_subtask_map(task, [interrupted_leg])
+        )["stages"][stage.stage_id])["complete"]
     ]
     if not done:
         return 0
@@ -2663,6 +3502,39 @@ def aggregate(episodes: Sequence[Mapping], task: TaskSpec, meta: Mapping) -> dic
         row["executor_ticks"] += int(leg["executor"]["ticks"])
         row["wall_time_s"] = round(row["wall_time_s"] + float(leg["wall_time_s"]), 3)
         row["decision_nodes"] += int(leg["decision_nodes"])
+    ordered = [row for row in episodes if row.get("ordered_success")]
+    acceptance_rows = [
+        row.get("instance_acceptance") or {} for row in episodes
+    ]
+    acceptance_events = sum(int(row.get("events") or 0) for row in acceptance_rows)
+    acceptance_resolved = sum(int(row.get("resolved") or 0) for row in acceptance_rows)
+    acceptance_wrong = sum(int(row.get("wrong") or 0) for row in acceptance_rows)
+    claim_rows = [row.get("completion_claim") or {} for row in episodes]
+    episodes_claiming = sum(1 for row in claim_rows if row.get("claimed"))
+    wrong_completions = sum(1 for row in claim_rows if row.get("wrong"))
+    unsafe_done = [
+        item
+        for row in episodes
+        for item in ((row.get("plan_vs_evidence_by_leg") or {}).get("unsafe_done_claims") or [])
+    ]
+    compared_stage_rows = sum(
+        len(
+            [
+                item
+                for item in ((row.get("plan_vs_evidence_by_leg") or {}).get("rows") or [])
+                if item.get("agree") is not None
+            ]
+        )
+        for row in episodes
+    )
+    finish_rows = [
+        item for row in episodes
+        for item in ((row.get("finish_contract") or {}).get("rows") or [])
+    ]
+    recovery_rows = [
+        item for row in episodes
+        for item in ((row.get("recovery_regrounding") or {}).get("rows") or [])
+    ]
     return {
         "n_episodes": n,
         "n_legs": len(leg_rows),
@@ -2676,6 +3548,74 @@ def aggregate(episodes: Sequence[Mapping], task: TaskSpec, meta: Mapping) -> dic
         ),
         "chain_complete_rate": _rate(sum(1 for row in episodes if row["stages"]["chain_complete"]), n),
         "order_ok_rate": _rate(sum(1 for row in episodes if row["stages"]["order_ok"]), n),
+        # goal.md v1 main metric: the whole chain in the declared stage order
+        "ordered_success_rate": _rate(len(ordered), n),
+        "complete_ordered_task_success": {
+            "count": len(ordered), "n": n, "rate": _rate(len(ordered), n)
+        },
+        "wrong_instance_acceptance": {
+            "events": acceptance_events,
+            "resolved": acceptance_resolved,
+            "wrong": acceptance_wrong,
+            "unresolved": acceptance_events - acceptance_resolved,
+            "rate": _rate(acceptance_wrong, acceptance_resolved),
+            "episodes_with_wrong": sum(
+                1 for row in acceptance_rows if int(row.get("wrong") or 0)
+            ),
+        },
+        "wrong_completion": {
+            "episodes_claiming": episodes_claiming,
+            "wrong": wrong_completions,
+            "rate": _rate(wrong_completions, episodes_claiming),
+            "claims": sum(int(row.get("n_claims") or 0) for row in claim_rows),
+            # the stage-level form of the same failure (r5's "unsafe done"):
+            # the plan closed a sub-task whose stage the evidence does not support
+            "unsafe_done_stage_claims": len(unsafe_done),
+            "unsafe_done_stage_rate": _rate(len(unsafe_done), compared_stage_rows),
+            "unsafe_done_episodes": sum(
+                1 for row in episodes
+                if (row.get("plan_vs_evidence_by_leg") or {}).get("unsafe_done_claims")
+            ),
+            "by_episode": [
+                {
+                    "label": row.get("label"),
+                    "seed": row.get("seed"),
+                    "claimed": bool((row.get("completion_claim") or {}).get("claimed")),
+                    "evaluated_complete": bool(
+                        (row.get("completion_claim") or {}).get("evaluated_complete")
+                    ),
+                    "wrong": bool((row.get("completion_claim") or {}).get("wrong")),
+                }
+                for row in episodes
+            ],
+        },
+        "finish_contract": {
+            "calls": len(finish_rows),
+            "blocked": sum(1 for row in finish_rows if row.get("blocked")),
+            "blocked_then_continued": sum(
+                1 for row in finish_rows if row.get("continued_after_blocked")
+            ),
+            "episodes_with_missing_subtasks": sum(
+                1 for row in episodes
+                if (row.get("finish_contract") or {}).get("missing_subtasks")
+            ),
+        },
+        "recovery_scope": {
+            "events": len(recovery_rows),
+            "executed": sum(1 for row in recovery_rows if row.get("executed")),
+            "subgoal_scoped": sum(
+                1 for row in recovery_rows
+                if row.get("classification") in ("subgoal", "subgoal+anchor")
+            ),
+            "with_anchor": sum(
+                1 for row in recovery_rows
+                if row.get("classification") == "subgoal+anchor"
+            ),
+            "global_instruction": sum(
+                1 for row in recovery_rows
+                if row.get("classification") == "global_instruction"
+            ),
+        },
         "success_rate": _rate(sum(1 for row in episodes if row["success"]), n),
         "traceable_success_rate": _rate(sum(1 for row in episodes if row["traceable_success"]), n),
         "evidence_complete_rate": _rate(sum(1 for row in episodes if row["evidence_complete"]), n),
@@ -2724,7 +3664,14 @@ def aggregate(episodes: Sequence[Mapping], task: TaskSpec, meta: Mapping) -> dic
             "wall_time_per_leg_s": round(wall_time / len(leg_rows), 3) if leg_rows else None,
             "model_calls": model_calls,
             "model_calls_per_episode": round(model_calls / n, 3) if n else None,
+            "outer_tool_calls": sum(leg["outer_tool_calls"] for leg in leg_rows),
+            "inner_tool_calls": sum(leg["inner_tool_calls"] for leg in leg_rows),
             "tool_calls": sum(leg["outer_tool_calls"] + leg["inner_tool_calls"] for leg in leg_rows),
+            "executor_auto_steps": sum(
+                int(leg.get("executor_auto_steps") or 0) for leg in leg_rows
+            ),
+            "executor_legs": executor_legs,
+            "executor_ticks": executor_ticks,
             "evidence_refs": sum(leg["evidence_refs"] for leg in leg_rows),
         },
         "meta": dict(meta),
@@ -2849,6 +3796,39 @@ def protocol_checks(
         "seen": sorted(set(kinds)),
         "all_known": all(kind in PROGRESS_KINDS for kind in kinds),
     }
+    scope_rows = [
+        {
+            "episode": row.get("label"),
+            "leg": leg.get("label"),
+            "entries": int(leg.get("outer_tool_calls") or 0) + int(leg.get("inner_tool_calls") or 0),
+            "scope_active": bool((row.get("stages") or {}).get("scope", {}).get("active")),
+        }
+        for row in episodes
+        for leg in row.get("legs", [])
+    ]
+    checks["scope_contract"] = {
+        "episodes_scoped": sum(
+            1 for row in episodes
+            if (row.get("stages") or {}).get("scope", {}).get("active")
+        ),
+        "episodes": len(episodes),
+        "rows": scope_rows,
+    }
+    finish_rows = [
+        item for row in episodes
+        for item in ((row.get("finish_contract") or {}).get("rows") or [])
+    ]
+    checks["finish_contract"] = {
+        "calls": len(finish_rows),
+        "blocked": sum(1 for item in finish_rows if item.get("blocked")),
+        "blocked_then_continued": sum(
+            1 for item in finish_rows if item.get("continued_after_blocked")
+        ),
+        "episodes_with_missing_subtasks": sum(
+            1 for row in episodes
+            if (row.get("finish_contract") or {}).get("missing_subtasks")
+        ),
+    }
     return checks
 
 
@@ -2889,9 +3869,38 @@ def report_markdown(report: Mapping) -> str:
         chain_status = "ok"
     else:
         chain_status = "PROBLEMS (" + "; ".join(chain.get("problems") or []) + ")"
+    ordered = agg.get("complete_ordered_task_success") or {}
+    wrong_instance = agg.get("wrong_instance_acceptance") or {}
+    wrong_completion = agg.get("wrong_completion") or {}
+    cost = agg.get("cost") or {}
     lines += [
         "",
         f"scene chain check: {chain_status}",
+        "",
+        "## goal.md v1 main metrics",
+        "",
+        "| metric | value | denominator |",
+        "|---|---|---|",
+        f"| complete ordered task success | {ordered.get('count')}/{ordered.get('n')} "
+        f"({ordered.get('rate')}) | episodes (full chain + stage order) |",
+        f"| wrong-instance acceptance | {wrong_instance.get('wrong')}/{wrong_instance.get('resolved')} "
+        f"({wrong_instance.get('rate')}) | resolved arrival/confirmation events "
+        f"({wrong_instance.get('unresolved')} unresolved) |",
+        f"| wrong completion | {wrong_completion.get('wrong')}/{wrong_completion.get('episodes_claiming')} "
+        f"({wrong_completion.get('rate')}) | episodes with a success claim |",
+        f"| unsafe `done` stages | {wrong_completion.get('unsafe_done_stage_claims')} "
+        f"({wrong_completion.get('unsafe_done_stage_rate')}) | stage rows compared |",
+        f"| total model calls | {cost.get('model_calls')} | incl. routine/inner calls |",
+        f"| total tool calls | {cost.get('tool_calls')} | outer {cost.get('outer_tool_calls')} + "
+        f"inner {cost.get('inner_tool_calls')} |",
+        f"| executor auto steps | {cost.get('executor_auto_steps')} | calls without a model turn |",
+        "",
+        "_complete ordered task success_ = every stage reached and located, and the "
+        "stage completion order is the declared one (the offline evaluator's verdict, "
+        "not the model's). _wrong-instance acceptance_ = an arrival/verification whose "
+        "object is farther than the stage's `locate_m` from the true instance. "
+        "_wrong completion_ = a `finish` claiming success while that ordered chain "
+        "was not established.",
         "",
         "## stages (per episode share)",
         "",
@@ -2909,15 +3918,17 @@ def report_markdown(report: Mapping) -> str:
         "",
         "## episodes",
         "",
-        "| episode | seed | legs (roles) | stages (reach/locate/complete) | chain | success | traceable | interrupted | recovered |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| episode | seed | legs (roles) | stages (reach/locate/complete) | ordered | chain | success | traceable | wrong inst. | wrong completion | interrupted | recovered |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for row in report.get("episodes", []):
         stages = row.get("stages", {})
         legs = row.get("legs", [])
         roles = "+".join(str(leg.get("role")) for leg in legs) or "n/a"
+        acceptance = row.get("instance_acceptance") or {}
+        claim = row.get("completion_claim") or {}
         lines.append(
-            "| {label} | {seed} | {legs} ({roles}) | {reach}/{locate}/{complete} | {chain} | {success} | {traceable} | {intr} | {rec} |".format(
+            "| {label} | {seed} | {legs} ({roles}) | {reach}/{locate}/{complete} | {ordered} | {chain} | {success} | {traceable} | {wrong_i} | {wrong_c} | {intr} | {rec} |".format(
                 label=row.get("label") or (legs[0]["label"] if legs else "n/a"),
                 seed=row.get("seed", "-"),
                 legs=row.get("n_legs"),
@@ -2925,9 +3936,12 @@ def report_markdown(report: Mapping) -> str:
                 reach=stages.get("reach_count"),
                 locate=stages.get("locate_count"),
                 complete=stages.get("complete_count"),
+                ordered=row.get("ordered_success"),
                 chain=stages.get("chain_complete"),
                 success=row.get("success"),
                 traceable=row.get("traceable_success"),
+                wrong_i=f"{acceptance.get('wrong')}/{acceptance.get('resolved')}",
+                wrong_c=claim.get("wrong"),
                 intr=row.get("interrupted"),
                 rec=row.get("interrupt_recovered"),
             )
@@ -2936,7 +3950,41 @@ def report_markdown(report: Mapping) -> str:
             lines.append(
                 f"|   arm {arm.get('role')} | {arm.get('label')} | "
                 f"{arm.get('stages_complete')} complete | {arm.get('chain_complete')} | "
-                f"{arm.get('success')} | {arm.get('traceable_success')} | - | - |"
+                f"- | {arm.get('chain_complete')} | {arm.get('success')} | "
+                f"{arm.get('traceable_success')} | - | - | - | - |"
+            )
+    lines += [
+        "",
+        "## finish contract (goal.md v1)",
+        "",
+        "| episode | leg | status | claimed | verified | plan complete | missing sub-tasks | calls after |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    for row in report.get("episodes", []):
+        for item in ((row.get("finish_contract") or {}).get("rows") or []):
+            missing = ", ".join(
+                f"{entry.get('subtask_id')}[{entry.get('status')}]"
+                for entry in item.get("missing_subtasks") or []
+            )
+            lines.append(
+                f"| {row.get('label')} | {item.get('leg')} | {item.get('status')} | "
+                f"{item.get('claimed')} | {item.get('verified')} | {item.get('plan_complete')} | "
+                f"{missing or '-'} | {item.get('calls_after')} |"
+            )
+    lines += [
+        "",
+        "## recovery re-grounding scope (goal.md v1, seed23)",
+        "",
+        "| episode / leg | turn | stalled tool | stage | executed | instruction | classification |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for row in report.get("episodes", []):
+        for item in ((row.get("recovery_regrounding") or {}).get("rows") or []):
+            instruction = str(item.get("instruction") or "").replace("|", "\\|")
+            lines.append(
+                f"| {row.get('label')} / {item.get('leg')} | {item.get('turn')} | "
+                f"{item.get('stalled_tool')} | {item.get('stage')} | {item.get('executed')} | "
+                f"{instruction or '-'} | {item.get('classification')} |"
             )
     lines += [
         "",
@@ -3688,8 +4736,11 @@ def main(argv: list[str] | None = None) -> dict:
                 "n_legs": metrics["n_legs"],
                 "success": metrics["success"],
                 "traceable_success": metrics["traceable_success"],
+                "ordered_success": metrics["ordered_success"],
                 "chain_complete": metrics["stages"]["chain_complete"],
                 "complete_count": metrics["stages"]["complete_count"],
+                "wrong_instance": (metrics["instance_acceptance"] or {}).get("wrong"),
+                "wrong_completion": (metrics["completion_claim"] or {}).get("wrong"),
                 "interrupted": metrics["interrupted"],
                 "interrupt_recovered": metrics["interrupt_recovered"],
                 "verify_ok": metrics["verify"]["ok"],

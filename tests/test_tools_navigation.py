@@ -44,7 +44,8 @@ from vlm_nav.observations import (
     register_observation,
 )
 from vlm_nav.tool_impl_navigation import register_navigation_tools
-from vlm_nav.tools import ToolContext, ToolRegistry
+from vlm_nav.tool_impl_task import current_subtask, plan_state
+from vlm_nav.tools import STATUS_BLOCKED, STATUS_OK, ToolContext, ToolRegistry
 
 TOOL_NAMES = [
     "approach_candidate",
@@ -3291,6 +3292,282 @@ class NavigationVocabularyTest(unittest.TestCase):
         self.assertIn("navigate", registry.names())
         for name in MOVE_TOOLS:
             self.assertNotIn(name, registry.names(), name)
+
+
+class TaskScopeContractTest(unittest.TestCase):
+    """goal.md version 1: every result belongs to one task/sub-task/candidate.
+
+    seed17: a single verified candidate stage may not finish a three-stage plan.
+    seed23: a recovery re-grounding names the *current* sub-task (with its
+    relation anchor), never the whole instruction again.
+    """
+
+    GLOBAL = (
+        "fly to the wooden door; confirm the cabinet beside it; "
+        "report what is inside the cabinet"
+    )
+
+    def plan_registry(self):
+        from vlm_nav.tool_impl_task import register_task_tools
+
+        reg = registry()
+        register_task_tools(reg)
+        return reg
+
+    def three_stage_plan(self, reg, ctx):
+        return reg.call(
+            "update_plan",
+            {
+                "steps": [
+                    {
+                        "id": "st_1",
+                        "goal": "confirm the cabinet beside the wooden door",
+                        "done_when": "the cabinet is verified",
+                    },
+                    {
+                        "id": "st_2",
+                        "goal": "approach the cabinet",
+                        "done_when": "the cabinet is reached",
+                    },
+                    {"id": "st_3", "goal": "report what is inside the cabinet"},
+                ]
+            },
+            ctx,
+        )
+
+    @staticmethod
+    def step_event(name, args, result, turn=1):
+        return {
+            "tool": name,
+            "args": dict(args),
+            "status": result.status,
+            "data": dict(result.data),
+            "evidence": [ref.to_dict() for ref in result.evidence],
+            "turn": turn,
+        }
+
+    def test_seed17_one_verified_stage_cannot_finish_the_whole_plan(self):
+        from vlm_nav.tool_impl_task import executor_step
+
+        ctx = make_context(
+            FakeWorld(position=(0.0, 0.0, 0.0), target=(3.0, 0.0, 0.0)),
+            extra={"instruction": self.GLOBAL, "done_dist": 10.0},
+        )
+        reg = self.plan_registry()
+        self.three_stage_plan(reg, ctx)
+        store_candidate(ctx, "cand_3", position=[3.0, 0.0, 0.0])
+
+        verified = reg.call("verify_goal", {"candidate_id": "cand_3"}, ctx)
+        self.assertIs(verified.data["verified"], True)
+        outcome = executor_step(
+            ctx, self.step_event("verify_goal", {"candidate_id": "cand_3"}, verified)
+        )
+        self.assertEqual(outcome["completed"], "st_1")
+        self.assertEqual(outcome["active"], "st_2")
+
+        finish = reg.call("finish", {"reason": "the candidate is verified", "success": True}, ctx)
+
+        self.assertEqual(finish.status, STATUS_BLOCKED)
+        self.assertIs(finish.data["success"], False)
+        self.assertIs(finish.data["verified"], False)
+        self.assertIs(finish.data["claimed"], True)
+        self.assertEqual(
+            [item["subtask_id"] for item in finish.data["missing_subtasks"]],
+            ["st_2", "st_3"],
+        )
+        missing = " | ".join(finish.data["missing"])
+        self.assertIn("st_2", missing)
+        self.assertIn("st_3", missing)
+
+    def test_the_runtime_does_not_terminate_on_a_single_verified_stage(self):
+        """seed17 through the decision loop: the blocked finish is not terminal."""
+        from vlm_nav.runtime import AgentRuntime
+
+        class Seed17VLM:
+            name = "seed17"
+
+            def __init__(self):
+                self.turn = 0
+
+            def decide_with_tools(self, frames, system_prompt, user_prompt,
+                                  tools_text="", context=None):
+                self.turn += 1
+                if self.turn == 1:
+                    return json.dumps({
+                        "tool": "update_plan",
+                        "args": {"steps": [
+                            {"id": "st_1", "goal": "confirm the cabinet beside the door",
+                             "done_when": "the cabinet is verified"},
+                            {"id": "st_2", "goal": "approach the cabinet",
+                             "done_when": "the cabinet is reached"},
+                            {"id": "st_3", "goal": "report what is inside"},
+                        ]},
+                    })
+                if self.turn == 2:
+                    return json.dumps(
+                        {"tool": "verify_goal", "args": {"candidate_id": "cand_3"}}
+                    )
+                if self.turn == 3:
+                    return json.dumps(
+                        {"tool": "finish", "args": {"reason": "verified", "success": True}}
+                    )
+                return json.dumps(
+                    {"tool": "finish", "args": {"reason": "give up", "success": False}}
+                )
+
+        ctx = make_context(
+            FakeWorld(position=(0.0, 0.0, 0.0), target=(3.0, 0.0, 0.0)),
+            extra={"done_dist": 10.0},
+        )
+        store_candidate(ctx, "cand_3", position=[3.0, 0.0, 0.0])
+        vlm = Seed17VLM()
+        log = AgentRuntime(
+            self.plan_registry(), ctx.world, None, vlm, budget=8, max_turns=8,
+            tool_context=ctx,
+        ).run(self.GLOBAL)
+
+        finishes = [turn for turn in log.turns if turn.tool == "finish"]
+        self.assertGreaterEqual(len(finishes), 2, log.tool_names())
+        self.assertEqual(finishes[0].status, STATUS_BLOCKED)
+        self.assertIs(finishes[0].data["success"], False)
+        self.assertIn("st_2", " | ".join(finishes[0].data["missing"]))
+        self.assertEqual(log.finish_reason, "finish")
+        self.assertFalse(log.success)
+
+    def test_a_complete_plan_with_the_current_confirmation_still_finishes(self):
+        from vlm_nav.tool_impl_task import executor_step
+
+        ctx = make_context(
+            FakeWorld(position=(0.0, 0.0, 0.0), target=(3.0, 0.0, 0.0)),
+            extra={"instruction": self.GLOBAL, "done_dist": 10.0},
+        )
+        reg = self.plan_registry()
+        reg.call(
+            "update_plan",
+            {
+                "steps": [
+                    {
+                        "id": "st_1",
+                        "goal": "confirm the cabinet",
+                        "done_when": "the cabinet is verified",
+                    }
+                ]
+            },
+            ctx,
+        )
+        store_candidate(ctx, "cand_3", position=[3.0, 0.0, 0.0])
+        verified = reg.call("verify_goal", {"candidate_id": "cand_3"}, ctx)
+        executor_step(
+            ctx, self.step_event("verify_goal", {"candidate_id": "cand_3"}, verified)
+        )
+
+        finish = reg.call("finish", {"reason": "verified", "success": True}, ctx)
+
+        self.assertEqual(finish.status, STATUS_OK)
+        self.assertIs(finish.data["success"], True)
+        self.assertIs(finish.data["verified"], True)
+        self.assertEqual(finish.data["missing"], [])
+        self.assertIs(finish.data["plan_complete"], True)
+
+    def test_switching_candidate_invalidates_the_earlier_confirmation(self):
+        from vlm_nav.tool_impl_perception import register_perception_tools
+
+        ctx = make_context(
+            FakeWorld(position=(0.0, 0.0, 0.0), target=(4.0, 0.0, 0.0), depth=4.0),
+            extra={"done_dist": 10.0},
+        )
+        backend = StubGroundingVLM('{"candidates": [{"box": [450, 450, 100, 100]}]}')
+        reg = ToolRegistry()
+        register_perception_tools(reg, vlm=backend)
+        register_navigation_tools(reg)
+        observed = reg.call("observe", {"mode": "forward"}, ctx)
+        frame = observed.data["observation_id"]
+
+        first = reg.call(
+            "ground_target", {"instruction": "the cabinet", "observation_id": frame}, ctx
+        )
+        cand_1 = first.data["candidates"][0]["id"]
+        self.assertEqual(first.data["candidate_id"], cand_1)
+        verified = reg.call("verify_goal", {"candidate_id": cand_1}, ctx)
+        self.assertIs(verified.data["verified"], True)
+        accepted = reg.call("finish", {"reason": "verified", "success": True}, ctx)
+        self.assertEqual(accepted.status, STATUS_OK)
+        self.assertIs(accepted.data["success"], True)
+
+        second = reg.call(
+            "ground_target", {"instruction": "the cabinet", "observation_id": frame}, ctx
+        )
+        cand_2 = second.data["candidates"][0]["id"]
+        self.assertNotEqual(cand_1, cand_2)
+        self.assertEqual(second.data["candidate_id"], cand_2)
+        self.assertGreater(
+            second.data["evidence_revision"], first.data["evidence_revision"]
+        )
+
+        stale = reg.call("finish", {"reason": "verified", "success": True}, ctx)
+        self.assertEqual(stale.status, STATUS_BLOCKED)
+        self.assertIs(stale.data["success"], False)
+        self.assertIs(stale.data["verified"], False)
+        self.assertEqual(stale.data["candidate_id"], cand_2)
+        self.assertIn(cand_2, " ".join(stale.data["missing"]))
+
+    def test_seed23_recovery_regrounds_the_current_subtask(self):
+        ctx = make_context(
+            FakeWorld(position=(0.0, 0.0, 0.0)), extra={"instruction": self.GLOBAL}
+        )
+        reg = self.plan_registry()
+        reg.call(
+            "update_plan",
+            {
+                "steps": [
+                    {"id": "st_1", "goal": "fly to the wooden door"},
+                    {
+                        "id": "st_2",
+                        "goal": "confirm the cabinet",
+                        "expected_observation": "the cabinet beside the wooden door",
+                        "preconditions": ["the wooden door was confirmed at obs_7"],
+                    },
+                    {"id": "st_3", "goal": "report what is inside the cabinet"},
+                ]
+            },
+            ctx,
+        )
+        reg.call("update_plan", {"patch": [{"id": "st_1", "status": "done"}]}, ctx)
+        plan = plan_state(ctx)
+        self.assertEqual(current_subtask(ctx)["id"], "st_2")
+
+        result = reg.call("check_path", {"target_id": "obs_404"}, ctx)
+
+        next_action = result.data["next_action"]
+        self.assertEqual(next_action["tool"], "ground_target")
+        instruction = next_action["args"]["instruction"]
+        self.assertIn("cabinet", instruction)
+        self.assertIn("wooden door", instruction)
+        self.assertNotIn("report what is inside", instruction)
+        self.assertEqual(next_action["scope"]["task_id"], plan["plan_id"])
+        self.assertEqual(next_action["scope"]["subtask_id"], "st_2")
+        self.assertEqual(
+            next_action["scope"]["evidence_revision"], result.data["evidence_revision"]
+        )
+        # the recovery also names the evidence step that can unblock the stage
+        self.assertIn("observe", result.data["hint"])
+        self.assertIn("ground_target", result.data["hint"])
+
+    def test_every_result_carries_the_scope_of_its_task_and_subtask(self):
+        ctx = make_context(
+            FakeWorld(position=(0.0, 0.0, 0.0)), extra={"instruction": self.GLOBAL}
+        )
+        reg = self.plan_registry()
+        self.three_stage_plan(reg, ctx)
+        plan = plan_state(ctx)
+
+        result = reg.call("check_path", {"target_id": "obs_404"}, ctx)
+
+        self.assertEqual(result.data["task_id"], plan["plan_id"])
+        self.assertEqual(result.data["subtask_id"], "st_1")
+        self.assertEqual(result.data["candidate_id"], "")
+        self.assertEqual(result.data["evidence_revision"], 0)
+        self.assertEqual(result.data["next_action"]["scope"]["subtask_id"], "st_1")
 
 
 if __name__ == "__main__":

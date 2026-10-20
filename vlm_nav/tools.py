@@ -61,6 +61,13 @@ Two further contracts live here because both adapters share them:
   pack (``ctx.extra["evidence_pack"]``) by the tools that produce it, so the
   runtime, the runner and an MCP client judge one pack the same way: an unbacked
   claim is downgraded to an *unverified* claim and is never counted as success.
+- the task scope (``task_scope``): every result carries
+  ``{task_id, subtask_id, candidate_id, evidence_revision}`` under ``scope``.
+  A confirmation/arrival belongs to one sub-task and candidate instance; a
+  candidate switch or a re-grounding bumps ``evidence_revision``, and an older
+  confirmation no longer backs ``finish``. When a plan exists, ``finish`` also
+  requires every sub-task to be ``done`` and reports the open stages in
+  ``missing_subtasks`` (goal.md version 1).
 """
 
 from __future__ import annotations
@@ -201,7 +208,8 @@ CATALOG_DISPATCH_NOTE = (
     "serial with its own task_id. A repeated request for a place already reached "
     "answers already_done (nothing flies again). finish with success=true is only "
     "counted with the evidence trail it reports (a verify_goal that returned "
-    "verified=true, or a grounded candidate plus an arrival)."
+    "verified=true, or a grounded candidate plus an arrival) and, when a plan "
+    "exists, every sub-task done; the answer lists the open stages."
 )
 #: Default character budget of a state-aware catalogue: enough for the state's
 #: own tools with their full arguments plus every other tool's name. The
@@ -285,12 +293,27 @@ def tool_state(extra: Mapping | None = None, ctx: Any = None) -> ToolState:
                 intents.append(intent)
 
     pack = extra.get(EVIDENCE_PACK_KEY)
+    scope = extra.get(TASK_SCOPE_KEY) if isinstance(extra, Mapping) else None
+    scope = scope if isinstance(scope, Mapping) else {}
     verified = False
     if isinstance(pack, Mapping):
         for item in pack.get("verifications") or ():
-            if isinstance(item, Mapping) and item.get("verified") is True:
-                verified = True
-                break
+            if not isinstance(item, Mapping) or item.get("verified") is not True:
+                continue
+            # a confirmation of an earlier candidate/revision is not current
+            candidate = str(scope.get("candidate_id") or "")
+            if candidate and str(item.get("candidate_id") or "") != candidate:
+                continue
+            revision = item.get("evidence_revision")
+            if revision is not None and scope:
+                try:
+                    stale = int(revision) != int(scope.get("evidence_revision", 0))
+                except (TypeError, ValueError):
+                    stale = True
+                if stale:
+                    continue
+            verified = True
+            break
 
     observations = _count(extra.get("observations")) or _count(extra.get(OBSERVATION_STORE_KEY))
     viewpoints = _count(extra.get("viewpoints_by_id")) or _count(extra.get("viewpoints"))
@@ -789,6 +812,220 @@ MISSING_ARRIVAL = "no arrival evidence (a movement call with outcome=arrived)"
 MISSING_IDENTITY = "no grounded candidate (cand_N from ground_target/search_target)"
 MISSING_REFERENCE = "the evidence carries no reference (kind:ref)"
 
+# ---------------------------------------------------------------------------
+# task scope: one identity for every call and every result (goal.md v1)
+# ---------------------------------------------------------------------------
+
+#: ``ctx.extra`` key of the episode's scope: ``{task_id, subtask_id,
+#: candidate_id, evidence_revision}``. Every tool result carries the same four
+#: fields, so a confirmation, an arrival and a candidate can be traced to the
+#: task/sub-task/object instance that produced them.
+TASK_SCOPE_KEY = "task_scope"
+SCOPE_FIELDS = ("task_id", "subtask_id", "candidate_id", "evidence_revision")
+
+MISSING_PLAN_COMPLETE = "the plan is not complete"
+MISSING_STALE_CONFIRMATION = (
+    "the completion evidence belongs to an earlier candidate instance or "
+    "sub-task (candidate/revision changed since it was recorded)"
+)
+MISSING_SCOPE_MISMATCH = "the finish call declares a task scope that is not current"
+
+#: Tools whose answer selects a candidate instance for the current sub-task.
+SCOPE_CANDIDATE_TOOLS = ("verify_goal", "approach_candidate")
+#: Outcomes of ``compare_candidates`` that resolve an identity question.
+SCOPE_IDENTITY_RESOLVED = ("same", "match", "identical", "confirmed")
+
+
+def _plan_identity(ctx: ToolContext) -> tuple[str, str]:
+    """``(task_id, subtask_id)`` of the live plan, or two empty strings."""
+    try:
+        from .tool_impl_task import current_subtask, plan_state
+
+        record = plan_state(ctx)
+        if not isinstance(record, dict):
+            return "", ""
+        current = current_subtask(ctx)
+        return (
+            str(record.get("plan_id") or ""),
+            str((current or {}).get("id") or ""),
+        )
+    except Exception:  # noqa: BLE001 - a foreign context may not carry a plan
+        return "", ""
+
+
+def task_scope(ctx: ToolContext) -> dict:
+    """The episode's current ``{task_id, subtask_id, candidate_id, revision}``.
+
+    The task/sub-task half follows the live plan (``plan_id`` and the executing
+    sub-task); the candidate half follows the candidate the episode is working
+    on. A change of task or sub-task clears the candidate and bumps
+    ``evidence_revision``, so a confirmation recorded for another stage or
+    another candidate instance is no longer accepted by ``finish``.
+    """
+    if not isinstance(ctx.extra, dict):
+        ctx.extra = {}
+    stored = ctx.extra.get(TASK_SCOPE_KEY)
+    scope = dict(stored) if isinstance(stored, Mapping) else {}
+    plan_task, plan_subtask = _plan_identity(ctx)
+    task_id = plan_task or str(ctx.extra.get("task_id") or ctx.episode_id or "")
+    try:
+        revision = int(scope.get("evidence_revision", 0))
+    except (TypeError, ValueError):
+        revision = 0
+    old_task = str(scope.get("task_id") or "")
+    old_subtask = str(scope.get("subtask_id") or "")
+    if old_task != task_id:
+        scope = {
+            "task_id": task_id,
+            "subtask_id": plan_subtask,
+            "candidate_id": "",
+            "evidence_revision": 0,
+        }
+    elif old_subtask != plan_subtask:
+        scope = {
+            "task_id": task_id,
+            "subtask_id": plan_subtask,
+            "candidate_id": "",
+            "evidence_revision": revision + 1,
+        }
+    else:
+        scope = {
+            "task_id": task_id,
+            "subtask_id": plan_subtask,
+            "candidate_id": str(scope.get("candidate_id") or ""),
+            "evidence_revision": revision,
+        }
+    ctx.extra[TASK_SCOPE_KEY] = scope
+    return scope
+
+
+def scope_active(ctx: ToolContext, scope: Mapping | None = None) -> bool:
+    """True when the episode is executing a task scope (a plan or a candidate)."""
+    scope = scope if isinstance(scope, Mapping) else task_scope(ctx)
+    if str(scope.get("candidate_id") or ""):
+        return True
+    try:
+        from .tool_impl_task import plan_state
+
+        return isinstance(plan_state(ctx), dict)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def select_scope_candidate(ctx: ToolContext, candidate_id: Any, *, reground: bool = False) -> dict:
+    """Bind ``candidate_id`` to the current scope, bumping the revision on change.
+
+    A switch to another candidate instance, or a fresh grounding of the same
+    one (``reground=True``), increments ``evidence_revision``; every
+    confirmation recorded against the previous revision then stops being
+    accepted by ``finish``.
+    """
+    scope = task_scope(ctx)
+    candidate = str(candidate_id or "")
+    if not candidate:
+        return scope
+    revision = int(scope.get("evidence_revision", 0))
+    if candidate != str(scope.get("candidate_id") or ""):
+        scope["candidate_id"] = candidate
+        scope["evidence_revision"] = revision + 1
+    elif reground:
+        scope["evidence_revision"] = revision + 1
+    ctx.extra[TASK_SCOPE_KEY] = scope
+    return scope
+
+
+def _scope_candidate_from_result(tool: str, data: Mapping) -> tuple[str, bool]:
+    """``(candidate_id, is_reground)`` a result names, or ``("", False)``."""
+    if tool in IDENTITY_TOOLS:
+        candidate = str(data.get("candidate_id") or "")
+        if not candidate:
+            candidates = data.get("candidates")
+            if isinstance(candidates, (list, tuple)) and candidates:
+                top = candidates[0] if isinstance(candidates[0], Mapping) else {}
+                candidate = str(top.get("id") or "")
+        return candidate, True
+    if tool == "approach_candidate":
+        return (
+            str(data.get("candidate_id") or data.get("target_id") or ""),
+            False,
+        )
+    # go_to_viewpoint / return_to_observation target a place (vp_N / obs_N),
+    # never a candidate instance
+    return "", False
+
+
+def _candidate_known(ctx: ToolContext, candidate_id: str) -> bool:
+    """True when the id names an existing candidate record/position."""
+    store = ctx.extra.get(CANDIDATE_STORE_KEY) if isinstance(ctx.extra, dict) else None
+    if isinstance(store, Mapping) and (
+        candidate_id in store or f"cand_{candidate_id}" in store
+    ):
+        return True
+    table = ctx.extra.get("candidate_positions") if isinstance(ctx.extra, dict) else None
+    return isinstance(table, Mapping) and (
+        candidate_id in table or f"cand_{candidate_id}" in table
+    )
+
+
+def _prepare_scope(ctx: ToolContext, tool: str, args: Mapping) -> None:
+    """Bind a candidate the call itself selects *before* its handler records it.
+
+    Only an id that really names a candidate is bound: a typo/missing id (the
+    call is about to fail) must not invalidate the confirmation of the
+    candidate the episode is actually working on.
+    """
+    if tool not in SCOPE_CANDIDATE_TOOLS:
+        return
+    candidate = str(args.get("candidate_id") or "")
+    if candidate and _candidate_known(ctx, candidate):
+        select_scope_candidate(ctx, candidate)
+
+
+def stamp_result_scope(
+    ctx: ToolContext, tool: str, args: Mapping, result: ToolResult, *, update: bool = True,
+) -> ToolResult:
+    """Put the task scope on one result (and, when ``update``, advance it).
+
+    Every adapter goes through :meth:`ToolRegistry.call`, so the local call and
+    the MCP call return the same four fields. A successful grounding/re-grounding
+    selects the candidate and bumps the revision; a candidate-selecting call
+    binds its candidate; a resolved identity comparison bumps the revision too.
+    A replayed (cached) result is stamped with the *current* scope but never
+    changes it - a replay is not new evidence.
+    """
+    data = result.data if isinstance(result.data, dict) else {}
+    result.data = data
+    if update and isinstance(data, Mapping):
+        if tool in IDENTITY_TOOLS:
+            candidate, reground = _scope_candidate_from_result(tool, data)
+            if candidate:
+                select_scope_candidate(ctx, candidate, reground=reground)
+        elif tool in SCOPE_CANDIDATE_TOOLS or tool in ARRIVAL_TOOLS:
+            candidate, _ = _scope_candidate_from_result(tool, data)
+            if candidate and _candidate_known(ctx, candidate):
+                select_scope_candidate(ctx, candidate)
+        elif tool == "compare_candidates":
+            verdict = str(data.get("verdict") or "").strip().lower()
+            if verdict in SCOPE_IDENTITY_RESOLVED:
+                scope = task_scope(ctx)
+                scope["evidence_revision"] = int(scope.get("evidence_revision", 0)) + 1
+                ctx.extra[TASK_SCOPE_KEY] = scope
+    scope = task_scope(ctx)
+    # ``data["scope"]`` is the uniform contract. The four fields are also lifted
+    # to the top level where the tool does not already use that name for its own
+    # schema: movement results keep ``task_id``/``candidate_id`` as their
+    # navigation task and intent id, and the scope's values stay unambiguous in
+    # ``data["scope"]``.
+    data["scope"] = {field: scope[field] for field in SCOPE_FIELDS}
+    for field in SCOPE_FIELDS:
+        data.setdefault(field, scope[field])
+    next_action = data.get("next_action")
+    if isinstance(next_action, dict) and scope_active(ctx, scope):
+        next_action.setdefault(
+            "scope", {field: scope[field] for field in SCOPE_FIELDS}
+        )
+    return result
+
 #: The ``finish`` contract of both adapters: the outcome the model declares.
 FINISH_SCHEMA = {
     "type": "object",
@@ -801,8 +1038,16 @@ FINISH_SCHEMA = {
             "type": "boolean",
             "description": (
                 "true only with evidence (a verify_goal that returned verified=true, "
-                "or a grounded candidate plus an arrival); false is the honest give-up"
+                "or a grounded candidate plus an arrival) and, when a plan exists, "
+                "every sub-task done; false is the honest give-up"
             ),
+        },
+        "task_id": {"type": "string", "description": "the task/plan id this call ends"},
+        "subtask_id": {"type": "string", "description": "the sub-task whose confirmation it cites"},
+        "candidate_id": {"type": "string", "description": "the confirmed candidate instance"},
+        "evidence_revision": {
+            "type": "integer",
+            "description": "the candidate revision the confirmation belongs to",
         },
     },
     "required": ["reason"],
@@ -847,9 +1092,21 @@ def _append_pack(pack: dict, key: str, record: dict) -> dict:
     return record
 
 
+def _scope_fields_of(ctx: ToolContext, candidate_id: str = "") -> dict:
+    """The four scope fields as they stand right now."""
+    scope = task_scope(ctx)
+    return {
+        "task_id": str(scope.get("task_id") or ""),
+        "subtask_id": str(scope.get("subtask_id") or ""),
+        "candidate_id": str(candidate_id or scope.get("candidate_id") or ""),
+        "evidence_revision": int(scope.get("evidence_revision", 0)),
+    }
+
+
 def record_verification(
     ctx: ToolContext, *, verified: Any, observation_id: str = "", checks: Any = None,
-    evidence: Any = (), reason: str = "", call: int | None = None,
+    evidence: Any = (), reason: str = "", candidate_id: str = "",
+    call: int | None = None,
 ) -> dict:
     """Record one completion check (``verify_goal``) in the episode's pack."""
     record = {
@@ -858,6 +1115,7 @@ def record_verification(
         "checks": dict(checks) if isinstance(checks, Mapping) else {},
         "reason": str(reason or ""),
         "evidence": _ref_dicts(evidence),
+        **_scope_fields_of(ctx, candidate_id),
         "call": int(call if call is not None else len(getattr(ctx, "log", []) or ()) + 1),
     }
     return _append_pack(evidence_pack(ctx), "verifications", record)
@@ -873,8 +1131,10 @@ def record_candidate(
         "observation_id": str(observation_id or ""),
         "position": list(position) if position is not None else None,
         "evidence": _ref_dicts(evidence),
+        **_scope_fields_of(ctx, candidate_id),
         "call": int(call if call is not None else len(getattr(ctx, "log", []) or ()) + 1),
     }
+    # ``task_id`` here means the *plan* identity, not the navigation task id
     return _append_pack(evidence_pack(ctx), "candidates", record)
 
 
@@ -884,6 +1144,9 @@ def record_arrival(
     remaining_m: Any = None, evidence: Any = (), call: int | None = None,
 ) -> dict:
     """Record that a movement call reached its place (``outcome=arrived``)."""
+    scope = _scope_fields_of(ctx, target_id)
+    # the movement's own nav task id stays where it always was; the scope's
+    # task/sub-task identity is reported under its own names
     record = {
         "task_id": str(task_id or ""),
         "target_id": str(target_id or ""),
@@ -893,6 +1156,10 @@ def record_arrival(
         "position": list(position) if position is not None else None,
         "remaining_m": None if remaining_m is None else float(remaining_m),
         "evidence": _ref_dicts(evidence),
+        "scope_task_id": scope["task_id"],
+        "subtask_id": scope["subtask_id"],
+        "candidate_id": scope["candidate_id"],
+        "evidence_revision": scope["evidence_revision"],
         "call": int(call if call is not None else len(getattr(ctx, "log", []) or ()) + 1),
     }
     return _append_pack(evidence_pack(ctx), "arrivals", record)
@@ -910,7 +1177,11 @@ def evidence_records_from_pack(pack: Any) -> list[dict]:
             "tool": "verify_goal",
             "status": STATUS_OK,
             "data": {"verified": item.get("verified"), "checks": dict(item.get("checks") or {}),
-                     "observation_id": item.get("observation_id", "")},
+                     "observation_id": item.get("observation_id", ""),
+                     "task_id": item.get("task_id", ""),
+                     "subtask_id": item.get("subtask_id", ""),
+                     "candidate_id": item.get("candidate_id", ""),
+                     "evidence_revision": item.get("evidence_revision")},
             "evidence": list(item.get("evidence") or []),
             "call": item.get("call"),
         })
@@ -922,7 +1193,10 @@ def evidence_records_from_pack(pack: Any) -> list[dict]:
             "status": STATUS_OK,
             "data": {"candidate_id": item.get("candidate_id", ""),
                      "observation_id": item.get("observation_id", ""),
-                     "position_flu": item.get("position")},
+                     "position_flu": item.get("position"),
+                     "task_id": item.get("task_id", ""),
+                     "subtask_id": item.get("subtask_id", ""),
+                     "evidence_revision": item.get("evidence_revision")},
             "evidence": list(item.get("evidence") or []),
             "call": item.get("call"),
         })
@@ -935,7 +1209,10 @@ def evidence_records_from_pack(pack: Any) -> list[dict]:
             "data": {"outcome": item.get("outcome", ""), "task_id": item.get("task_id", ""),
                      "task_status": "arrived" if item.get("outcome") in ARRIVAL_OUTCOMES else "",
                      "candidate_id": item.get("target_id", ""),
-                     "last_observation_id": item.get("observation_id", "")},
+                     "last_observation_id": item.get("observation_id", ""),
+                     "scope_task_id": item.get("scope_task_id", ""),
+                     "subtask_id": item.get("subtask_id", ""),
+                     "evidence_revision": item.get("evidence_revision")},
             "evidence": list(item.get("evidence") or []),
             "call": item.get("call"),
         })
@@ -1259,12 +1536,17 @@ class ToolRegistry:
         a call the model made on its own).
         """
         if name == BATCH_TOOL_NAME and name in self._tools:
-            return self.batch(args, ctx)
+            return stamp_result_scope(
+                ctx, name, args, self.batch(args, ctx), update=False
+            )
         if ctx.budget.get("tool_calls_left", 0) <= 0:
             return ToolResult(STATUS_FAILED, {"reason": "budget_exhausted"})
         spec = self.get(name)
         args = dict(args or {})
         cache = tool_cache(ctx)
+        # a candidate the call itself selects is bound before the handler runs,
+        # so the confirmation it records already carries the new revision
+        _prepare_scope(ctx, name, args)
         # getattr keeps duck-typed specs (a hand-built stub) working
         cacheable = bool(getattr(spec, "cacheable", True)) and not spec.side_effects
         t0 = time.time()
@@ -1272,6 +1554,7 @@ class ToolRegistry:
             entry = cache.get(name, args)
             if entry is not None:
                 result = cache.hit_result(entry)
+                result = stamp_result_scope(ctx, name, args, result, update=False)
                 ctx.budget["tool_calls_left"] = ctx.budget.get("tool_calls_left", 1) - 1
                 ctx.log.append(self._log_entry(name, args, result, t0))
                 return result
@@ -1279,6 +1562,7 @@ class ToolRegistry:
             result = spec.handler(ctx, args)
         except Exception as exc:  # tools never crash the runtime
             result = ToolResult(STATUS_FAILED, {"error": f"{type(exc).__name__}: {exc}"})
+        result = stamp_result_scope(ctx, name, args, result)
         ctx.budget["tool_calls_left"] = ctx.budget.get("tool_calls_left", 1) - 1
         if spec.side_effects or result.evidence:
             cache.clear()  # state advanced: earlier read answers are no longer current
@@ -1499,9 +1783,12 @@ cancel_task report and stop it.
 Boxes/regions are [x1, y1, x2, y2] corners (normalized 0-1000), as the schemas
 say; a box the tool returns can be fed back.
 Call verify_goal before finish: answer {"success": true} only when a verify_goal
-call of this episode returned verified=true. When a check is unmet, keep working
-(approach_candidate / return_to_observation / go_to_viewpoint / observe /
-query_memory) or finish with a reason but no success flag."""
+call of this episode returned verified=true, bound to the current candidate and
+evidence_revision, and - when a plan exists - every sub-task is done. A single
+verified stage never finishes the whole task: finish then answers blocked with
+missing_subtasks. When a check is unmet, keep working (approach_candidate /
+return_to_observation / go_to_viewpoint / observe / query_memory) or finish with
+a reason but no success flag."""
 
 # the worked examples come from PROMPT_EXAMPLES, the same list the tests check
 # against the registered schemas and the runtime cites in its turn prompt

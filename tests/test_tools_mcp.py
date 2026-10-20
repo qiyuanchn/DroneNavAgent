@@ -423,7 +423,14 @@ TOOL_SPECS = [
         self.assertEqual(session.provider, "tools")
         self.assertEqual(session.registry.get("verify_goal").description, "injected verify")
         self.assertEqual(session.stub_tools, set(mcp_server.ALL_TOOL_NAMES) - {"verify_goal"})
-        self.assertEqual(session.call("verify_goal", {}).data, {"injected": True})
+        # every result now carries the task scope (goal.md v1): the injected
+        # payload survives, plus the four scope fields under ``scope``
+        data = session.call("verify_goal", {}).data
+        self.assertIs(data["injected"], True)
+        self.assertEqual(
+            set(data["scope"]),
+            {"task_id", "subtask_id", "candidate_id", "evidence_revision"},
+        )
 
     def test_explicit_missing_module_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -906,6 +913,50 @@ class TestResultImageBudget(unittest.TestCase):
 
         images = [block for block in result.content if block.type == "image"]
         self.assertLessEqual(len(images), mcp_server.MAX_RESULT_IMAGES)
+
+
+class TestTaskScopeContract(unittest.TestCase):
+    """The MCP service carries the same task scope and finish contract."""
+
+    def test_finish_over_mcp_reports_missing_subtasks_and_scope(self) -> None:
+        from vlm_nav.tool_impl_navigation import register_navigation_tools
+        from vlm_nav.tool_impl_task import register_task_tools
+
+        registry = ToolRegistry()
+        register_navigation_tools(registry)
+        register_task_tools(registry)
+        ctx = ToolContext(world=_MockWorld(), memory=_MockMemory(), episode_id="ep_scope")
+        session = mcp_server.build_session(ctx, tools=registry, services=("env",))
+        session.call(
+            "update_plan",
+            {
+                "steps": [
+                    {"id": "st_1", "goal": "confirm the cabinet"},
+                    {"id": "st_2", "goal": "approach the cabinet"},
+                    {"id": "st_3", "goal": "report what is inside"},
+                ]
+            },
+        )
+        session.call("update_plan", {"patch": [{"id": "st_1", "status": "done"}]})
+
+        async def scenario(client):
+            return await client.call_tool(
+                "finish", {"reason": "the cabinet is verified", "success": True}
+            )
+
+        result = _run_in_memory("env", session, scenario)
+        data = result.structuredContent["data"]
+
+        self.assertEqual(result.structuredContent["status"], "blocked")
+        self.assertIs(data["success"], False)
+        self.assertEqual(
+            [item["subtask_id"] for item in data["missing_subtasks"]],
+            ["st_2", "st_3"],
+        )
+        for key in ("task_id", "subtask_id", "candidate_id", "evidence_revision"):
+            self.assertIn(key, data)
+        # the shared registry stamps the direct call the same way
+        self.assertIn("task_id", session.call("get_plan", {}).data)
 
 
 if __name__ == "__main__":

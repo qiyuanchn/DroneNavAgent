@@ -1147,14 +1147,30 @@ E2E_STAGES = [
      "position_flu": [2.0, 0.5, 0.0], "anchor": "object", "within_m": 0.5,
      "reach_m": 1.5, "locate_m": 2.0, "step": "确认柜子旁边的目标"},
 ]
+#: One ground+approach cycle per stage: the v1 scope contract judges each stage
+#: on the calls made while that stage's sub-task was executing, so the scripted
+#: model has to establish the chain stage by stage (all three stage places are
+#: the same point in this tiny scene).
 E2E_MOCK_SCRIPT = [
     {"tool": "observe", "args": {"mode": "forward", "reason": "look ahead"}},
     {"tool": "ground_target", "args": {"observation_id": "$observation_id",
                                        "instruction": "$target_name",
-                                       "reason": "locate the object ahead"}},
+                                       "reason": "locate the landmark"}},
     {"tool": "approach_candidate", "args": {"candidate_id": "$candidate_id",
                                             "standoff_m": 1.0}},
-    {"tool": "verify_goal", "args": {"reason": "confirm before finishing"}},
+    {"tool": "verify_goal", "args": {"reason": "confirm the landmark"}},
+    {"tool": "ground_target", "args": {"observation_id": "$observation_id",
+                                       "instruction": "$target_name",
+                                       "reason": "locate the object of stage 2"}},
+    {"tool": "approach_candidate", "args": {"candidate_id": "$candidate_id",
+                                            "standoff_m": 1.5}},
+    {"tool": "verify_goal", "args": {"reason": "confirm the object"}},
+    {"tool": "ground_target", "args": {"observation_id": "$observation_id",
+                                       "instruction": "$target_name",
+                                       "reason": "locate the target of stage 3"}},
+    {"tool": "approach_candidate", "args": {"candidate_id": "$candidate_id",
+                                            "standoff_m": 1.2}},
+    {"tool": "verify_goal", "args": {"reason": "confirm the target"}},
     {"tool": "finish", "args": {"reason": "target reached and verified", "success": True}},
 ]
 
@@ -1169,8 +1185,8 @@ class EndToEndTest(unittest.TestCase):
             "--ply", str(scene),
             "--backend", "mock",
             "--mock-script", str(script),
-            "--tool-budget", "10",
-            "--max-turns", "10",
+            "--tool-budget", "16",
+            "--max-turns", "16",
             *extra,
         ]
         env = dict(os.environ)
@@ -1520,3 +1536,273 @@ class AnalyzeRunTest(unittest.TestCase):
             text = DRIVER.report_markdown(report)
             self.assertIn("Long-horizon verification", text)
 
+
+
+# ---------------------------------------------------------------------------
+# goal.md v1 offline contract: scope-filtered stages/completion and main metrics
+# ---------------------------------------------------------------------------
+
+
+def scoped_entry(
+    seq: int,
+    tool: str,
+    *,
+    subtask: str,
+    candidate: str = "",
+    revision: int = 0,
+    data: dict | None = None,
+    task_id: str = "plan_1",
+    **kwargs,
+) -> dict:
+    """One ledger entry whose result carries the v1 task scope."""
+    payload = dict(data or {})
+    payload["scope"] = {
+        "task_id": task_id,
+        "subtask_id": subtask,
+        "candidate_id": candidate,
+        "evidence_revision": int(revision),
+    }
+    return entry(seq, tool, data=payload, **kwargs)
+
+
+class ScopeContractTest(unittest.TestCase):
+    """The offline evaluator applies the same scope filter as ``finish``."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.task = make_task(Path(self.tmp.name))
+        self.places = [stage.position for stage in self.task.stages]
+        self.mapping = DRIVER.stage_subtask_map(self.task, [])
+
+    def test_stage_report_ignores_a_result_of_another_subtask(self):
+        # the object place is located by a call made while the *landmark*
+        # sub-task was executing: legacy evaluation would count it for stage 2
+        entries = [
+            scoped_entry(1, "ground_target", subtask="st_1",
+                         data={"candidates": [{"position_flu": list(self.places[1])}]},
+                         pose=list(self.places[1]), evidence=[ref("observation", "obs_1")]),
+        ]
+        legacy = DRIVER.stage_report(entries, self.task, scoped=False)
+        self.assertTrue(legacy["stages"]["object"]["located"])
+        scoped = DRIVER.stage_report(
+            entries, self.task, subtask_map=self.mapping, scoped=True
+        )
+        self.assertFalse(scoped["stages"]["object"]["located"])
+        self.assertTrue(scoped["scope"]["active"])
+        self.assertEqual(scoped["stages"]["object"]["scope_excluded_entries"], 1)
+        # the landmark row is still judged on its own scoped call
+        self.assertFalse(scoped["stages"]["landmark"]["located"])
+
+    def test_scoped_stage_report_counts_the_subtask_own_call(self):
+        entries = [
+            scoped_entry(1, "ground_target", subtask="st_2",
+                         data={"candidates": [{"position_flu": list(self.places[1])}]},
+                         pose=list(self.places[1]), evidence=[ref("observation", "obs_2")]),
+        ]
+        report = DRIVER.stage_report(
+            entries, self.task, subtask_map=self.mapping, scoped=True
+        )
+        self.assertTrue(report["stages"]["object"]["located"])
+        self.assertTrue(report["stages"]["object"]["reach"])
+        self.assertTrue(report["stages"]["object"]["complete"])
+        self.assertFalse(report["stages"]["landmark"]["complete"])
+
+    def test_scoped_completion_rejects_a_stale_candidate_confirmation(self):
+        target = self.places[2]
+        entries = [
+            scoped_entry(1, "ground_target", subtask="st_3", candidate="cand_1",
+                         revision=1,
+                         data={"candidate_id": "cand_1",
+                               "position_flu": list(target)},
+                         evidence=[ref("memory", "cand_1")]),
+            scoped_entry(2, "verify_goal", subtask="st_3", candidate="cand_1",
+                         revision=1, data={"verified": True},
+                         evidence=[ref("observation", "obs_1")]),
+            scoped_entry(3, "ground_target", subtask="st_3", candidate="cand_2",
+                         revision=2,
+                         data={"candidate_id": "cand_2",
+                               "position_flu": list(target)},
+                         evidence=[ref("memory", "cand_2")]),
+        ]
+        verdict = DRIVER.completion_chain(entries)
+        self.assertTrue(verdict["raw_verified"])
+        self.assertFalse(verdict["verified"])
+        self.assertTrue(verdict["scoped"])
+        self.assertGreaterEqual(verdict["rejected_records"], 1)
+        # the current candidate's arrival closes the scoped chain
+        entries.append(
+            scoped_entry(4, "approach_candidate", subtask="st_3",
+                         candidate="cand_2", revision=2,
+                         data={"candidate_id": "cand_2", "outcome": "arrived",
+                               "target_position": list(target)},
+                         evidence=[ref("memory", "cand_2")])
+        )
+        verdict = DRIVER.completion_chain(entries)
+        self.assertTrue(verdict["verified"])
+
+    def test_offline_plan_completion_uses_the_task_module(self):
+        stages = self.task.stages
+        leg = make_leg(
+            [scoped_entry(1, "observe", subtask="st_1",
+                          data={}, evidence=[ref("observation", "obs_1")])],
+            carry={"plan_subtasks": [
+                {"id": f"st_{s.index}", "status": "done" if s.index == 1 else "pending"}
+                for s in stages
+            ]},
+            log={"plan_transitions": [
+                {"id": "st_1", "from": "active", "to": "done", "reason": "done_when_met"},
+                {"id": "st_2", "from": "pending", "to": "active", "reason": "auto_advanced"},
+            ]},
+        )
+        verdict = DRIVER.offline_plan_completion([leg], self.task)
+        self.assertIsNotNone(verdict)
+        self.assertEqual(verdict["source"], "vlm_nav.tool_impl_task.plan_completion")
+        self.assertFalse(verdict["complete"])
+        self.assertEqual(
+            [item["subtask_id"] for item in verdict["open_subtasks"]], ["st_2", "st_3"]
+        )
+        self.assertEqual(verdict["done_subtasks"], ["st_1"])
+
+        done = make_leg(
+            [], carry={"plan_subtasks": [
+                {"id": f"st_{s.index}", "status": "done"} for s in stages
+            ]}
+        )
+        self.assertTrue(DRIVER.offline_plan_completion([done], self.task)["complete"])
+
+    def test_wrong_instance_acceptance_flags_an_arrival_at_another_object(self):
+        true_place = self.places[0]
+        wrong_place = [true_place[0] + 6.0, true_place[1], true_place[2]]
+        entries = [
+            scoped_entry(1, "ground_target", subtask="st_1", candidate="cand_9",
+                         revision=1,
+                         data={"candidate_id": "cand_9",
+                               "position_flu": list(wrong_place)},
+                         evidence=[ref("memory", "cand_9")]),
+            scoped_entry(2, "approach_candidate", subtask="st_1", candidate="cand_9",
+                         revision=1,
+                         data={"candidate_id": "cand_9", "outcome": "arrived",
+                               "target_position": list(wrong_place)},
+                         evidence=[ref("memory", "cand_9")]),
+        ]
+        verdict = DRIVER.instance_acceptance(entries, self.task, self.mapping)
+        self.assertEqual(verdict["events"], 1)
+        self.assertEqual(verdict["resolved"], 1)
+        self.assertEqual(verdict["wrong"], 1)
+        self.assertEqual(verdict["wrong_rate"], 1.0)
+        self.assertEqual(verdict["rows"][0]["stage"], "landmark")
+
+        good = [
+            scoped_entry(1, "ground_target", subtask="st_1", candidate="cand_1",
+                         revision=1,
+                         data={"candidate_id": "cand_1",
+                               "position_flu": list(true_place)},
+                         evidence=[ref("memory", "cand_1")]),
+            scoped_entry(2, "approach_candidate", subtask="st_1", candidate="cand_1",
+                         revision=1,
+                         data={"candidate_id": "cand_1", "outcome": "arrived",
+                               "target_position": list(true_place)},
+                         evidence=[ref("memory", "cand_1")]),
+        ]
+        self.assertEqual(DRIVER.instance_acceptance(good, self.task, self.mapping)["wrong"], 0)
+
+    def test_wrong_completion_is_a_claim_without_the_ordered_chain(self):
+        first = scoped_entry(1, "ground_target", subtask="st_1",
+                             data={"candidates": [{"position_flu": list(self.places[0])}]},
+                             pose=list(self.places[0]),
+                             evidence=[ref("observation", "obs_1")])
+        finish = scoped_entry(10, "finish", subtask="st_2",
+                              data={"claimed": True, "verified": False,
+                                    "plan_complete": False,
+                                    "missing_subtasks": [
+                                        {"subtask_id": "st_2", "status": "active"},
+                                        {"subtask_id": "st_3", "status": "pending"},
+                                    ]},
+                              status="blocked", evidence=[])
+        finish["args"] = {"success": True, "reason": "done"}
+        leg = make_leg([first, finish], summary={"success": False, "finish_reason": "max_turns"})
+        row = DRIVER.episode_metrics(self.task, [leg], gate_m=2.0)
+        self.assertFalse(row["ordered_success"])
+        self.assertTrue(row["completion_claim"]["wrong"])
+        self.assertEqual(row["finish_contract"]["blocked"], 1)
+        self.assertEqual(row["finish_contract"]["missing_subtasks"][0]["subtask_id"], "st_2")
+        self.assertEqual(row["finish_contract"]["rows"][0]["calls_after"], 0)
+
+    def test_recovery_regrounding_classifies_subgoal_and_global(self):
+        trace = [
+            {"turn": 2, "tool": "approach_candidate", "status": "failed",
+             "data": {"scope": {"task_id": "plan_1", "subtask_id": "st_2",
+                                "candidate_id": "cand_1", "evidence_revision": 1}},
+             "evidence": []},
+            {"turn": 3, "tool": "ground_target", "status": "ok",
+             "args": {"instruction": "门旁边的柜子 - 木门附近的柜子"},
+             "evidence": [ref("memory", "cand_2")]},
+        ]
+        leg = make_leg([], log={"recoveries": [
+            {"turn": 2, "stalled_tool": "approach_candidate",
+             "advice": ["re-ground the current sub-task"]},
+        ]})
+        (leg.out_dir / "tool_trace.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in trace) + "\n"
+        )
+        report = DRIVER.recovery_regrounding([leg], self.task)
+        self.assertEqual(report["events"], 1)
+        self.assertTrue(report["rows"][0]["executed"])
+        self.assertEqual(report["rows"][0]["classification"], "subgoal+anchor")
+        self.assertEqual(report["subgoal_scoped"], 1)
+
+        global_trace = [
+            trace[0],
+            {"turn": 3, "tool": "ground_target", "status": "ok",
+             "args": {"instruction": self.task.instruction}, "evidence": []},
+        ]
+        leg2 = make_leg([], log={"recoveries": [
+            {"turn": 2, "stalled_tool": "approach_candidate", "advice": []},
+        ]})
+        (leg2.out_dir / "tool_trace.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in global_trace) + "\n"
+        )
+        report = DRIVER.recovery_regrounding([leg2], self.task)
+        self.assertEqual(report["rows"][0]["classification"], "global_instruction")
+        self.assertEqual(report["global_instruction"], 1)
+
+    def test_aggregate_exposes_the_goal_md_main_metrics(self):
+        first = scoped_entry(1, "ground_target", subtask="st_1",
+                             data={"candidates": [{"position_flu": list(self.places[0])}]},
+                             pose=list(self.places[0]),
+                             evidence=[ref("observation", "obs_1")])
+        finish = scoped_entry(10, "finish", subtask="st_2",
+                              data={"claimed": True, "verified": False,
+                                    "plan_complete": False},
+                              status="blocked", evidence=[])
+        finish["args"] = {"success": True}
+        bad = make_leg([first, finish], summary={"success": False,
+                                                 "finish_reason": "max_turns"})
+        good_entries = [
+            scoped_entry(i + 1, "ground_target", subtask=f"st_{i + 1}",
+                         data={"candidates": [{"position_flu": list(place)}]},
+                         pose=list(place), evidence=[ref("observation", f"obs_{i + 1}")])
+            for i, place in enumerate(self.places)
+        ]
+        good_entries.append(
+            scoped_entry(9, "verify_goal", subtask="st_3",
+                         data={"verified": True},
+                         pose=list(self.places[2]),
+                         evidence=[ref("observation", "obs_9")])
+        )
+        good = make_leg(good_entries,
+                        summary={"success": True, "finish_reason": "finish"})
+        episodes = [
+            DRIVER.episode_metrics(self.task, [bad], gate_m=2.0),
+            DRIVER.episode_metrics(self.task, [good], gate_m=2.0),
+        ]
+        agg = DRIVER.aggregate(episodes, self.task, {})
+        self.assertEqual(agg["ordered_success_rate"], 0.5)
+        self.assertEqual(agg["complete_ordered_task_success"]["count"], 1)
+        self.assertEqual(agg["wrong_completion"]["wrong"], 1)
+        self.assertEqual(agg["wrong_completion"]["episodes_claiming"], 2)
+        self.assertEqual(agg["wrong_completion"]["rate"], 0.5)
+        self.assertIn("wrong_instance_acceptance", agg)
+        self.assertIn("finish_contract", agg)
+        self.assertEqual(agg["finish_contract"]["blocked"], 1)

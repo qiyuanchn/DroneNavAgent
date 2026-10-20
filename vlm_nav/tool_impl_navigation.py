@@ -179,7 +179,11 @@ from .tool_impl_perception import (
 )
 from .tools import (
     FINISH_SCHEMA,
+    MISSING_PLAN_COMPLETE,
+    MISSING_SCOPE_MISMATCH,
+    MISSING_STALE_CONFIRMATION,
     PROGRESS_INFORMATION,
+    SCOPE_FIELDS,
     STATUS_BLOCKED,
     STATUS_CACHED,
     STATUS_EMPTY,
@@ -197,6 +201,8 @@ from .tools import (
     record_candidate,
     record_verification,
     register_batch_tool,
+    scope_active,
+    task_scope,
 )
 from .world import estimate_point_world
 
@@ -790,18 +796,46 @@ def _instruction(ctx: ToolContext) -> str:
     return "" if value in (None, "") else str(value)
 
 
+def _ground_again_instruction(ctx: ToolContext) -> str:
+    """What an automatic re-grounding asks for: the current sub-goal, not the task.
+
+    The plan's executing sub-task (with its relation anchor and preconditions)
+    wins; without a plan the harness-published ``subgoal`` is the current scope;
+    only with neither does the global instruction apply (goal.md v1, seed23).
+    """
+    try:
+        from .tool_impl_task import subtask_ground_instruction
+
+        text = subtask_ground_instruction(ctx)
+    except Exception:  # noqa: BLE001 - a context without the task module
+        text = ""
+    if not text:
+        value = ctx.extra.get("subgoal") if isinstance(ctx.extra, dict) else None
+        text = str(value) if value not in (None, "") else _instruction(ctx)
+    return text or "<what you are looking for>"
+
+
 def _ground_again_action(ctx: ToolContext, observation_id: str = "") -> dict:
     """The executable call that turns "I see it" into a candidate to approach.
 
-    ``ground_target`` needs an instruction and a frame; the runtime publishes the
-    instruction and ``obs_id`` is the frame the model is looking at, so the model
-    can issue the returned call unchanged instead of re-inventing an id.
+    ``ground_target`` needs an instruction and a frame; the instruction is the
+    executing sub-task (its relation anchor included) and ``obs_id`` is the
+    frame the model is looking at, so the model can issue the returned call
+    unchanged instead of re-inventing an id. The call carries the same task
+    scope as its result: task/sub-task/candidate/evidence revision.
     """
-    instruction = _instruction(ctx) or "<what you are looking for>"
-    args: dict[str, Any] = {"instruction": instruction}
+    args: dict[str, Any] = {"instruction": _ground_again_instruction(ctx)}
     if observation_id:
         args["observation_id"] = observation_id
-    return {"tool": "ground_target", "args": args}
+    action: dict[str, Any] = {"tool": "ground_target", "args": args}
+    scope = task_scope(ctx)
+    if scope_active(ctx, scope):
+        for field in SCOPE_FIELDS:
+            value = scope.get(field)
+            if value not in (None, ""):
+                args[field] = value
+        action["scope"] = {field: scope[field] for field in SCOPE_FIELDS}
+    return action
 
 
 def _target_error_result(ctx: ToolContext, args: dict, error: str) -> ToolResult:
@@ -3446,6 +3480,8 @@ def _tool_verify_goal(ctx: ToolContext, args: dict) -> ToolResult:
         verified = True
         reason = "verified"
 
+    scope = task_scope(ctx)
+    checked_candidate = str(candidate_id) if candidate_id not in (None, "") else ""
     data = {
         "verified": verified,
         "evidence": [e.to_dict() for e in evidence],
@@ -3453,12 +3489,17 @@ def _tool_verify_goal(ctx: ToolContext, args: dict) -> ToolResult:
         "checks": checks,
         "reason": reason,
         "hint": _verify_hint(verified, unmet),
+        "task_id": scope["task_id"],
+        "subtask_id": scope["subtask_id"],
+        "candidate_id": checked_candidate or scope["candidate_id"],
+        "evidence_revision": scope["evidence_revision"],
     }
     if pixel is not None:
         data["pixel"] = [float(pixel[0]), float(pixel[1])]
     # the verdict goes into the episode's evidence pack: it is what a later
     # finish call's claim is judged on (the same pack the MCP adapter and the
-    # runner read - one trail, one verdict)
+    # runner read - one trail, one verdict), bound to the candidate instance
+    # and revision it was taken against
     record_verification(
         ctx,
         verified=verified,
@@ -3466,6 +3507,7 @@ def _tool_verify_goal(ctx: ToolContext, args: dict) -> ToolResult:
         checks=checks,
         evidence=evidence,
         reason=reason,
+        candidate_id=checked_candidate,
     )
     return ToolResult(STATUS_OK, data, evidence)
 
@@ -3563,18 +3605,116 @@ FINISH_HINT_NONE = (
 )
 
 
+def _record_in_scope(record: dict, scope: dict, task_scoped: bool) -> bool:
+    """Whether one pack record belongs to the *current* task/candidate instance.
+
+    A confirmation or arrival recorded for another candidate (or another
+    evidence revision) cannot stand in for the current one. A record written
+    before the scoped contract carries no revision; it is only accepted when no
+    candidate is current, and never for a planned task.
+    """
+    data = record.get("data") if isinstance(record.get("data"), dict) else {}
+    current_candidate = str(scope.get("candidate_id") or "")
+    record_candidate = str(data.get("candidate_id") or "")
+    if current_candidate and record_candidate != current_candidate:
+        return False
+    revision = data.get("evidence_revision")
+    if revision is None:
+        if current_candidate or task_scoped:
+            return False
+    else:
+        try:
+            if int(revision) != int(scope.get("evidence_revision", 0)):
+                return False
+        except (TypeError, ValueError):
+            return False
+    if task_scoped:
+        record_task = str(data.get("scope_task_id") or data.get("task_id") or "")
+        if record_task and record_task != str(scope.get("task_id") or ""):
+            return False
+        if str(data.get("subtask_id") or "") != str(scope.get("subtask_id") or ""):
+            return False
+    return True
+
+
+def _declared_scope_problem(args: dict, scope: dict) -> str:
+    """A readable mismatch between the finish arguments and the live scope."""
+    wanted = {
+        "task_id": str(args.get("task_id") or ""),
+        "subtask_id": str(args.get("subtask_id") or ""),
+        "candidate_id": str(args.get("candidate_id") or ""),
+    }
+    for field, value in wanted.items():
+        if value and value != str(scope.get(field) or ""):
+            return (
+                f"{MISSING_SCOPE_MISMATCH}: {field}={value} but the current "
+                f"{field} is {scope.get(field) or '<none>'}"
+            )
+    if args.get("evidence_revision") not in (None, ""):
+        try:
+            declared_revision = int(args["evidence_revision"])
+        except (TypeError, ValueError):
+            return f"{MISSING_SCOPE_MISMATCH}: evidence_revision is not an integer"
+        if declared_revision != int(scope.get("evidence_revision", 0)):
+            return (
+                f"{MISSING_SCOPE_MISMATCH}: evidence_revision={declared_revision} "
+                f"but the current revision is {scope.get('evidence_revision', 0)}"
+            )
+    return ""
+
+
 def completion_claim(ctx: ToolContext, args: dict) -> tuple[dict, list[EvidenceRef]]:
     """The verdict of one ``finish`` call: what it declares and what backs it.
 
     The chain is judged on the episode's own evidence pack
     (``ctx.extra["evidence_pack"]``, ``vlm_nav.tools.completion_evidence``), so
-    the local adapter, an MCP client and the runner read one trail. A declared
-    success without it comes back as ``success: false`` + ``claim=unverified``:
-    the episode may end, but it is not counted as a success.
+    the local adapter, an MCP client and the runner read one trail. The records
+    are first filtered to the *current* task/sub-task/candidate revision: a
+    confirmation of an earlier candidate instance can not be inherited.
+
+    When a plan exists, success additionally requires every sub-task to be
+    ``done`` and the terminal confirmation (or arrival) to belong to the
+    executing sub-task. A single verified candidate is therefore a stage
+    completion, never the whole task; the answer lists every open stage in
+    ``missing_subtasks``/``missing``.
     """
     declared = args.get("success")
     declared = None if declared is None else bool(declared)
-    chain = completion_evidence(evidence_records_from_pack(evidence_pack(ctx)))
+    try:
+        from .tool_impl_task import plan_completion
+    except Exception:  # pragma: no cover - the module is part of this package
+        plan_completion = None  # type: ignore[assignment]
+    plan = plan_completion(ctx) if plan_completion is not None else None
+    task_scoped = plan is not None
+
+    scope = task_scope(ctx)
+    records = evidence_records_from_pack(evidence_pack(ctx))
+    scoped_records = [
+        record for record in records if _record_in_scope(record, scope, task_scoped)
+    ]
+    raw_chain = completion_evidence(records)
+    chain = completion_evidence(scoped_records)
+
+    missing: list[str] = []
+    if task_scoped and not plan["complete"]:
+        open_count = len(plan["open_subtasks"])
+        total = len(plan["done_subtasks"]) + open_count
+        missing.append(
+            f"{MISSING_PLAN_COMPLETE}: {open_count}/{total} sub-task(s) still open"
+        )
+        missing.extend(plan["missing"])
+    missing.extend(chain["missing"])
+    if not chain["verified"] and raw_chain["verified"]:
+        current_candidate = str(scope.get("candidate_id") or "<none>")
+        missing.append(
+            f"{MISSING_STALE_CONFIRMATION} (current candidate {current_candidate}, "
+            f"revision {int(scope.get('evidence_revision', 0))})"
+        )
+    declared_problem = _declared_scope_problem(args, scope)
+    if declared_problem:
+        missing.append(declared_problem)
+
+    verified = bool(chain["verified"]) and not missing
     trail = [
         EvidenceRef(
             str(ref.get("kind") or "memory"),
@@ -3587,15 +3727,28 @@ def completion_claim(ctx: ToolContext, args: dict) -> tuple[dict, list[EvidenceR
     data: dict[str, Any] = {
         "reason": str(args.get("reason") or "")[:200],
         "claimed": declared is True,
-        "verified": bool(chain["verified"]),
+        "verified": verified,
         "evidence_trail": [ref.to_dict() for ref in trail],
-        "missing": list(chain["missing"]),
+        "missing": missing,
         "evidence_kind": str(chain["kind"]),
+        "task_id": scope["task_id"],
+        "subtask_id": scope["subtask_id"],
+        "candidate_id": scope["candidate_id"],
+        "evidence_revision": int(scope["evidence_revision"]),
+        "plan_complete": bool(plan["complete"]) if task_scoped else None,
+        "missing_subtasks": list(plan["open_subtasks"]) if task_scoped else [],
     }
-    if declared is True and chain["verified"]:
+    if task_scoped:
+        data["plan_id"] = plan["task_id"]
+        data["plan_revision"] = plan["revision"]
+        data["done_subtasks"] = list(plan["done_subtasks"])
+    if declared is True and verified:
         data.update(success=True, claim=CLAIM_VERIFIED, hint=FINISH_HINT_VERIFIED)
     elif declared is True:
-        data.update(success=False, claim=CLAIM_UNVERIFIED, hint=FINISH_HINT_UNVERIFIED)
+        hint = FINISH_HINT_UNVERIFIED
+        if missing:
+            hint += " missing: " + "; ".join(missing)
+        data.update(success=False, claim=CLAIM_UNVERIFIED, hint=hint)
     elif declared is False:
         data.update(success=False, claim=CLAIM_GIVE_UP, hint=FINISH_HINT_GIVE_UP)
     else:
@@ -3610,9 +3763,21 @@ def _tool_finish(ctx: ToolContext, args: dict) -> ToolResult:
     prefers a registered finish over its own stub) and reads the ``success``
     field of the answer, so a claim without evidence is downgraded here, at the
     one place both adapters go through.
+
+    A ``success: true`` claim inside a task scope that does not hold (an
+    incomplete plan, a stale candidate confirmation, a declared scope that is
+    not current) returns ``blocked`` instead of ``ok``: the runtime does not
+    terminate, and the next turn reads exactly which stages/evidence are still
+    missing. Outside a task scope the historical behaviour is kept (the episode
+    may end, but an unbacked claim is still *unverified*, never a success).
     """
     data, trail = completion_claim(ctx, args)
-    return ToolResult(STATUS_OK, data, trail)
+    blocked = (
+        args.get("success") is True
+        and not data.get("verified")
+        and scope_active(ctx)
+    )
+    return ToolResult(STATUS_BLOCKED if blocked else STATUS_OK, data, trail)
 
 
 # ---------------------------------------------------------------------------
@@ -3994,9 +4159,13 @@ def register_navigation_tools(registry: ToolRegistry) -> None:
             description=(
                 "End the episode with an explicit outcome and the evidence behind it. "
                 'Answer {"success": true} only when this episode left the trail: a '
-                "verify_goal that returned verified=true, or a grounded candidate plus "
-                "an arrival (outcome=arrived). The answer reports evidence_trail, "
-                "verified and claim; a success without that trail is downgraded to an "
+                "verify_goal that returned verified=true for the current candidate and "
+                "evidence_revision, or a grounded candidate plus an arrival "
+                "(outcome=arrived) - and, when a plan exists, every sub-task is done. "
+                "A single verified stage never finishes the whole task: the call then "
+                "comes back blocked with missing_subtasks (the stages still open) and "
+                "missing (the evidence they owe). The answer also reports evidence_trail, "
+                "verified and claim; a success without the trail is downgraded to an "
                 'unverified claim and never counted as success. Use {"success": false} '
                 "for an honest give-up and always state the reason."
             ),
