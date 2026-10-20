@@ -120,6 +120,7 @@ class ReplayAccuracyTest(unittest.TestCase):
         truth = ACCURACY.ground_truth(views, TARGET)
         self.assertEqual(truth["best_index"], 0)
         self.assertEqual(truth["visible_indices"], list(range(8)))
+        self.assertFalse(truth["exact_available"])  # all views point at the target
         self.assertTrue(all(item["visible"] for item in truth["views"]))
 
     def test_score_choice(self):

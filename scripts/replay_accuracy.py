@@ -122,16 +122,27 @@ def ground_truth(views: Sequence, target: Sequence[float]) -> dict:
             "the target is not visible in any scan view; the replay set cannot "
             "provide ground truth for this check"
         )
-    best = min(
+    ranked = sorted(
         visible,
         key=lambda item: math.hypot(
             item["pixel"][0] - 500.0, item["pixel"][1] - 500.0
         ),
     )
+    best = ranked[0]
+    # When every visible view points straight at the target (the window-chair
+    # scan plan does), "most centred" is a tie and exact-match is not a
+    # meaningful accuracy signal. Keep exact only when a unique best exists;
+    # visible-view accuracy remains the primary check.
+    exact_available = len(ranked) == 1
+    if len(ranked) > 1:
+        first = math.hypot(ranked[0]["pixel"][0] - 500.0, ranked[0]["pixel"][1] - 500.0)
+        second = math.hypot(ranked[1]["pixel"][0] - 500.0, ranked[1]["pixel"][1] - 500.0)
+        exact_available = abs(first - second) > 5.0
     return {
         "best_index": int(best["index"]),
         "best_view_id": best["view_id"],
         "visible_indices": [int(item["index"]) for item in visible],
+        "exact_available": bool(exact_available),
         "views": projected,
     }
 
@@ -153,11 +164,19 @@ def score_choice(
             "visible": False,
             "within_one": False,
         }
+    in_visible = int(choice) in visible
+    if not truth.get("exact_available", True):
+        # no unique best: any visible view is an acceptable answer
+        exact = in_visible
+        within_one = in_visible
+    else:
+        exact = int(choice) == best
+        within_one = _circular_distance(int(choice), best, n_views) <= 1
     return {
         "parse_ok": True,
-        "exact": int(choice) == best,
-        "visible": int(choice) in visible,
-        "within_one": _circular_distance(int(choice), best, n_views) <= 1,
+        "exact": exact,
+        "visible": in_visible,
+        "within_one": within_one,
     }
 
 
@@ -314,10 +333,14 @@ def evaluate(
         for event in logs if isinstance(event, dict)
     ]
     metrics = [item for item in metrics if item]
-    for name in ("baseline", "optimized"):
-        for index, record in enumerate(records[name]):
-            if index < len(metrics):
-                record["usage_metrics"] = metrics[index]
+    metric_index = 0
+    # calls are logged baseline, optimized, baseline, optimized...
+    for repeat in range(len(records["baseline"])):
+        for name in ("baseline", "optimized"):
+            record = records[name][repeat]
+            if metric_index < len(metrics):
+                record["usage_metrics"] = metrics[metric_index]
+            metric_index += 1
     result = {
         "schema": SCHEMA,
         "created_utc": datetime.now(timezone.utc).isoformat(),
@@ -348,6 +371,7 @@ def evaluate(
     baseline = result["baseline"]["summary"]
     optimized = result["optimized"]["summary"]
     result["comparison"] = {
+        "exact_available": bool(truth.get("exact_available", True)),
         "exact_delta": optimized["exact_rate"] - baseline["exact_rate"],
         "visible_delta": optimized["visible_rate"] - baseline["visible_rate"],
         "within_one_delta": (
@@ -409,6 +433,7 @@ def write_report(report: Mapping, out_dir: Path) -> dict:
         )
     lines += [
         "",
+        f"- exact-match meaningful: {comparison.get('exact_available', True)}",
         f"- exact delta: {comparison.get('exact_delta', 0):+.3f}",
         f"- visible delta: {comparison.get('visible_delta', 0):+.3f}",
         f"- image count ratio: {comparison.get('image_count_ratio')}",
