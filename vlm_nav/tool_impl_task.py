@@ -1189,6 +1189,174 @@ def subtask_ground_instruction(ctx: ToolContext) -> str:
     return " - ".join(parts)[:MAX_STEP_CHARS]
 
 
+def ensure_anchor_subtask(
+    ctx: ToolContext,
+    *,
+    relation: Mapping | None,
+    target_subtask_id: str = "",
+) -> dict:
+    """Insert a dependent "find and locate the anchor" sub-task, once.
+
+    Called when a relation instruction's anchor has no evidence yet (the window
+    in "窗边的木椅"). The anchor sub-task takes over as the active step, the
+    original target becomes pending *after* it (``depends_on``), and every piece
+    of the target's state - candidates, recorded evidence, spent budget, failure
+    branch - is left untouched, so finishing the anchor returns to the same
+    target instead of starting over. The creation is idempotent: a second
+    grounding of the same relation finds the existing anchor step and does not
+    duplicate it.
+    """
+    if not isinstance(relation, Mapping):
+        return {"created": False, "reason": "no_relation"}
+    phrase = str(relation.get("anchor") or "").strip()
+    if not phrase:
+        return {"created": False, "reason": "no_anchor_phrase"}
+    record = plan_state(ctx)
+    if not isinstance(record, dict):
+        return {"created": False, "reason": "no_plan"}
+    subtasks = plan_subtasks(ctx) or []
+    if not subtasks:
+        return {"created": False, "reason": "no_subtasks"}
+    target = None
+    if target_subtask_id:
+        target = next(
+            (item for item in subtasks if str(item.get("id") or "") == str(target_subtask_id)),
+            None,
+        )
+    if target is None:
+        target = current_subtask(ctx)
+    if not isinstance(target, Mapping):
+        return {"created": False, "reason": "no_target_subtask"}
+    phrase_key = phrase.casefold()
+    existing = next(
+        (
+            item
+            for item in subtasks
+            if str(item.get("_relation_chain_role") or "") == "anchor"
+            and phrase_key in str(item.get("_anchor_phrase") or item.get("goal") or "").casefold()
+        ),
+        None,
+    )
+    if isinstance(existing, Mapping):
+        existing_id = str(existing.get("id") or "")
+        target_id = str(target.get("id") or "")
+        released = isinstance(target.get("_anchor_released"), Mapping)
+        blocked = str(existing.get("status") or "") in (SUBTASK_BLOCKED, SUBTASK_FAILED)
+        if (
+            existing_id
+            and existing_id != target_id
+            and str(target.get("_relation_chain_role") or "") != "anchor"
+            and not released
+            and not blocked
+            and existing_id not in (target.get("depends_on") or [])
+        ):
+            deps = list(target.get("depends_on") or [])
+            deps.append(existing_id)
+            target["depends_on"] = deps
+            _resolve_dependencies(subtasks)
+            _sync(record)
+        return {
+            "created": False,
+            "existing": True,
+            "anchor_subtask": existing_id,
+            "target_subtask": target_id,
+        }
+    if str(target.get("_relation_chain_role") or "") == "anchor":
+        return {
+            "created": False,
+            "existing": True,
+            "anchor_subtask": str(target.get("id") or ""),
+            "target_subtask": str(target.get("_anchor_for") or ""),
+            "reason": "current_subtask_is_anchor",
+        }
+    if str(target.get("status") or "") == SUBTASK_DONE:
+        return {"created": False, "reason": "target_already_done"}
+    used = {str(item.get("id") or "") for item in subtasks}
+    anchor_id = _unique_id("st_anchor", used)
+    anchor = _blank_subtask(
+        anchor_id,
+        f"找到并定位{phrase}（关系锚点）",
+        status=SUBTASK_ACTIVE,
+    )
+    anchor.update(
+        {
+            "done_when": "锚点对象被定位：某次工具结果报告了它的位置",
+            "done_when_type": "located",
+            "expected_observation": f"{phrase}（{str(relation.get('relation') or '关系')}）",
+            "locate_m": 1.5,
+            "reach_m": 1.5,
+            "failure_branch": [
+                f"换一个视角寻找{phrase}",
+                "扩大观察范围后再确认锚点位置",
+            ],
+            # the anchor is often outside the forward frame; the search skill
+            # sweeps first and grounds in the scan views, instead of asking the
+            # same empty view again
+            "next_step": {
+                "tool": "search_target",
+                "args": {
+                    "instruction": f"找到并定位{phrase}",
+                    "mode": "lookaround",
+                },
+            },
+            "budget": dict(DEFAULT_SUBTASK_BUDGET),
+        }
+    )
+    anchor["_relation_chain_role"] = "anchor"
+    anchor["_anchor_phrase"] = phrase[:40]
+    anchor["_anchor_category"] = str(relation.get("anchor_category") or "")
+    anchor["_anchor_for"] = str(target.get("id") or "")
+    # the anchor inherits the target's prerequisites, so it never runs before
+    # the stages the plan already requires; the target then depends on it
+    anchor["depends_on"] = list(target.get("depends_on") or [])
+    target_status_before = str(target.get("status") or "")
+    if target_status_before == SUBTASK_ACTIVE:
+        target["status"] = SUBTASK_PENDING
+        target["reason"] = "anchor_subtask_inserted"
+    target_deps = [
+        str(dep) for dep in target.get("depends_on") or [] if str(dep) != anchor_id
+    ]
+    target["depends_on"] = [anchor_id] + target_deps
+    target["_anchor_subtask"] = anchor_id
+    target["_anchor_phrase"] = phrase[:40]
+    position = next(
+        (index for index, item in enumerate(subtasks) if item is target),
+        len(subtasks),
+    )
+    subtasks.insert(position, anchor)
+    _resolve_dependencies(subtasks)
+    record["revision"] = int(record.get("revision") or 0) + 1
+    record["note"] = (
+        f"temporary anchor sub-task {anchor_id} inserted for {phrase!r}: "
+        f"{target.get('id')} resumes after it"
+    )
+    record["updated_t"] = round(time.time(), 3)
+    _sync(record)
+    spent = target.get("spent") if isinstance(target.get("spent"), Mapping) else {}
+    return {
+        "created": True,
+        "anchor_subtask": anchor_id,
+        "anchor_phrase": phrase,
+        "target_subtask": str(target.get("id") or ""),
+        "target_status_before": target_status_before,
+        "target_status_after": str(target.get("status") or ""),
+        "target_depends_on": list(target.get("depends_on") or []),
+        "candidates_preserved": len(
+            [
+                item
+                for item in _extra(ctx).get(CANDIDATE_STORE_KEY, {}).values()
+                if isinstance(item, Mapping)
+                and str(item.get("subtask_key") or "")
+                == "stage:"
+                + " ".join(str(target.get("goal") or "").lower().split())[:120]
+            ]
+        ),
+        "evidence_preserved": len(target.get("_evidence_marks") or []),
+        "spent_preserved": dict(spent),
+        "plan_revision": int(record.get("revision") or 0),
+    }
+
+
 #: The resume brief's section order: object identity, relation anchor, open
 #: questions, then the interrupted sub-task. This is the priority goal.md asks
 #: long-term memory to keep - the rest (ledger, candidate places, pose) follows.
@@ -2696,7 +2864,15 @@ def executor_step(ctx: ToolContext, event: Mapping | None) -> dict:
     _remember_event(subtask, event)
 
     subtask_id = str(subtask.get("id") or "")
-    if _event_closes_subtask(event) and subtask.get("status") != SUBTASK_DONE:
+    if str(subtask.get("_relation_chain_role") or "") == "anchor":
+        # the temporary anchor step exists to *locate one object*; only a
+        # result that names that object may close it (the target grounding that
+        # created it names the target, and search_target's ``confirmed`` flag
+        # belongs to that target grounding)
+        closes_subtask = _event_closes_anchor(subtask, event)
+    else:
+        closes_subtask = _event_closes_subtask(event)
+    if closes_subtask and subtask.get("status") != SUBTASK_DONE:
         verdict = evidence_verdict(subtask)
         open_ids = _predecessors_open(index, subtasks) if verdict["ok"] else []
         outcome["evidence_weak"] = bool(verdict["evidence_weak"])
@@ -2736,6 +2912,10 @@ def executor_step(ctx: ToolContext, event: Mapping | None) -> dict:
             )
             outcome["blocked"] = subtask_id
             outcome["blocked_reason"] = blocked_reason
+            if str(subtask.get("_relation_chain_role") or "") == "anchor":
+                outcome["anchor_released"] = release_anchor_dependency(
+                    ctx, subtask_id, blocked_reason
+                )
         budget_exceeded = _budget_exceeded(subtask.get("budget"), spent)
         if budget_exceeded and subtask.get("status") not in (SUBTASK_DONE, SUBTASK_FAILED):
             verdict = evidence_verdict(subtask)
@@ -2787,6 +2967,10 @@ def executor_step(ctx: ToolContext, event: Mapping | None) -> dict:
                 )
                 outcome["failed"] = subtask_id
                 outcome["budget_exceeded"].append(subtask_id)
+                if str(subtask.get("_relation_chain_role") or "") == "anchor":
+                    outcome["anchor_released"] = release_anchor_dependency(
+                        ctx, subtask_id, "budget_exceeded"
+                    )
 
     # P4/A + P4: a claim is re-judged on every call charged to the plan, so
     # evidence that arrived without a completion signal (ep_007) and a later
@@ -2824,6 +3008,102 @@ def executor_step(ctx: ToolContext, event: Mapping | None) -> dict:
     record["executor"]["decision"] = outcome["decision"]
     record["updated_t"] = round(time.time(), 3)
     return outcome
+
+
+def _event_closes_anchor(subtask: Mapping, event: Mapping) -> bool:
+    """Whether a result located *this* anchor, not the target that spawned it.
+
+    The anchor step is created inside the very call that grounded the target
+    (``ground_target``/``search_target``); that call's own ``confirmed``/
+    ``located`` evidence belongs to the target and must not close the anchor it
+    just spawned. Only a result whose instruction names the anchor object (or a
+    later cross-frame relation evidence) satisfies the anchor step.
+    """
+    data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
+    marks = _evidence_marks(event)
+    if MARK_LOCATED not in marks:
+        return False
+    candidates = data.get("candidates")
+    usable = [
+        item
+        for item in (candidates if isinstance(candidates, (list, tuple)) else [])
+        if isinstance(item, Mapping)
+        and not item.get("instance_suspect")
+        and _as_point(item.get("position_flu")) is not None
+    ]
+    if not usable:
+        # an empty grounding's visibility block carries the *drone's* pose;
+        # that is not a located anchor
+        return False
+    instruction = " ".join(str(data.get("instruction") or "").split())
+    goal = " ".join(str(subtask.get("goal") or "").split())
+    if instruction and goal and (instruction in goal or goal in instruction):
+        return True
+    category = _anchor_category_for_goal(instruction)
+    return bool(category) and category == _anchor_category_for_goal(goal)
+
+
+def _anchor_category_for_goal(text: str) -> str:
+    """Coarse object category of a goal/grounding instruction ("" when unknown)."""
+    try:
+        from .tool_impl_perception import _anchor_category, _target_phrase
+
+        return _anchor_category(_target_phrase(str(text or "")))
+    except Exception:  # noqa: BLE001 - the category is only a completion hint
+        return ""
+
+
+def release_anchor_dependency(
+    ctx: ToolContext,
+    anchor_subtask_id: str,
+    reason: str = "",
+) -> dict:
+    """Let the original target continue when its temporary anchor task failed.
+
+    The anchor sub-task is a *detour*, not a gate on the mission: when it is
+    blocked/failed (the window could not be located), the target must still be
+    able to run with the relation marked ``unknown`` - a confirmation view that
+    holds both objects can establish the relation there. Releasing the
+    dependency preserves the anchor's own record and the target's evidence.
+    """
+    record = plan_state(ctx)
+    if not isinstance(record, dict):
+        return {"released": False, "reason": "no_plan"}
+    subtasks = plan_subtasks(ctx) or []
+    anchor = next(
+        (item for item in subtasks if str(item.get("id") or "") == str(anchor_subtask_id)),
+        None,
+    )
+    if not isinstance(anchor, Mapping):
+        return {"released": False, "reason": "unknown_anchor"}
+    released: list[str] = []
+    for target in subtasks:
+        if str(target.get("id") or "") == str(anchor_subtask_id):
+            continue
+        deps = [str(dep) for dep in target.get("depends_on") or []]
+        if str(anchor_subtask_id) not in deps:
+            continue
+        target["depends_on"] = [dep for dep in deps if dep != str(anchor_subtask_id)]
+        target["_anchor_released"] = {
+            "anchor_subtask": str(anchor_subtask_id),
+            "reason": str(reason or "")[:160],
+        }
+        if str(target.get("status") or "") == SUBTASK_PENDING:
+            target["status"] = SUBTASK_ACTIVE
+        released.append(str(target.get("id") or ""))
+    if released:
+        record["revision"] = int(record.get("revision") or 0) + 1
+        record["note"] = (
+            f"anchor sub-task {anchor_subtask_id} released ({reason}); "
+            f"target(s) {released} continue with relation=unknown"
+        )
+        _sync(record)
+    return {
+        "released": bool(released),
+        "anchor_subtask": str(anchor_subtask_id),
+        "targets": released,
+        "reason": str(reason or "")[:160],
+    }
 
 
 def _auto_advance(record: dict, turn: int, transitions: list[dict]) -> int:

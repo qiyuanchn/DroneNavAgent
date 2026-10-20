@@ -469,8 +469,9 @@ class ConfirmCandidateTest(unittest.TestCase):
         The candidate is at (1.5, 0, 0); the model points at the object at
         (1.5, 2.2, 0). Reading depth at the *candidate's* projected pixel (the
         old check) returns the candidate point itself and delta 0.0, so any
-        candidate was accepted. Measuring the model's box sees the 2.2 m gap
-        and rejects the candidate.
+        candidate was accepted. Measuring the model's box sees the 2.2 m gap.
+        The position-only gap stays uncertain (missing distance): a rejection
+        also needs visual contrary identity evidence.
         """
         from vlm_nav.skills_approach import world_to_pixel
 
@@ -490,15 +491,16 @@ class ConfirmCandidateTest(unittest.TestCase):
 
         result = registry.call(
             "confirm_candidate",
-            {"candidate_id": "cand_1", "instruction": "the wooden cabinet"},
+            {"candidate_id": "cand_1", "instruction": "the wooden cabinet", "max_views": 1},
             ctx,
         )
 
-        self.assertEqual(result.data["verdict"], "rejected", result.data)
-        self.assertEqual(result.data["reason"], "position_inconsistent")
+        self.assertEqual(result.data["verdict"], "uncertain", result.data)
+        self.assertEqual(result.data["reason"], "position_too_far_from_candidate")
         check = result.data["position_check"]
         self.assertIs(check["available"], True, check)
         self.assertEqual(check["method"], "observed_box")
+        self.assertEqual(check["measurement_method"], "support_cluster")
         self.assertAlmostEqual(check["delta_m"], 2.2, delta=0.2)
         self.assertNotEqual(check.get("candidate_estimate_flu"), check.get("measured_position_flu"))
         self.assertEqual(result.data["confirmation_count"], 0)
@@ -612,11 +614,13 @@ class ConfirmCandidateTest(unittest.TestCase):
         self.assertGreaterEqual(check["box_area_fraction"], 0.5)
         self.assertEqual(result.data["confirmation_count"], 0)
 
-    def test_the_box_centre_is_the_measurement_not_the_nearest_sample(self):
-        """A normal box measures its centre; a closer bottom sample must not win."""
+    def test_a_coherent_support_cluster_is_preferred_to_the_box_centre(self):
+        """The bottom edge is the object's support contact: a coherent cluster
+        there is the object's near surface, while the centre may read the wall
+        behind it (the v1 2-4.8 m false position_inconsistent failures)."""
         world = ConfirmWorld(position=(0.0, 0.0, 0.0), target=(1.5, 0.0, 0.0))
         world.depth_at_pixel = lambda pixel: (
-            0.5 if float(pixel[1]) > 530.0 else 1.5
+            0.3 if float(pixel[1]) > 530.0 else 1.5
         )
         vlm = ScriptedVLM([ACCEPTED])
         ctx = make_context(world, vlm)
@@ -629,10 +633,13 @@ class ConfirmCandidateTest(unittest.TestCase):
             ctx,
         )
 
-        self.assertEqual(result.data["verdict"], "accepted", result.data)
         check = result.data["position_check"]
-        self.assertEqual(check["chosen_sample"], "centre")
-        self.assertAlmostEqual(check["depth_m"], 1.5, places=3)
+        self.assertEqual(check["measurement_method"], "support_cluster")
+        self.assertNotEqual(check["chosen_sample"], "centre")
+        self.assertAlmostEqual(check["depth_m"], 0.3, places=3)
+        self.assertIs(check["centre_rejected"], True)
+        self.assertEqual(result.data["verdict"], "uncertain", result.data)
+        self.assertEqual(result.data["reason"], "position_too_far_from_candidate")
 
     def test_a_distance_conflicted_candidate_is_refused_before_any_view(self):
         """A grounding whose depth contradicted the model cannot be confirmed.
@@ -1022,8 +1029,10 @@ class ConfirmCandidateTest(unittest.TestCase):
         self.assertIs(result.data["new_confirmation"], False)
         self.assertEqual(result.data["confirmation_count"], 0)
 
-    def test_a_position_inconsistent_confirmation_is_rejected(self):
-        """A fresh depth point 2+ m from the candidate is a different surface."""
+    def test_a_background_measurement_is_unknown_not_a_rejection(self):
+        """Every sample reads the wall behind the candidate: that measures the
+        background, not the object. The measurement is unknown (no rejection):
+        a position-only disagreement is not proof of a different instance."""
         vlm = ScriptedVLM([ACCEPTED])
         world = ConfirmWorld(position=(1.8, 0.0, 0.0))
         world.depth = 3.3  # candidate is 1.2 m ahead; the ray hits a wall at 3.3 m
@@ -1037,11 +1046,172 @@ class ConfirmCandidateTest(unittest.TestCase):
             ctx,
         )
 
-        self.assertEqual(result.data["verdict"], "rejected", result.data)
-        self.assertEqual(result.data["reason"], "position_inconsistent")
+        self.assertEqual(result.data["verdict"], "uncertain", result.data)
+        check = result.data["position_check"]
+        self.assertIs(check["available"], False, check)
+        self.assertIs(check["inconsistent"], True, check)
+        self.assertEqual(check["unknown_reason"], "support_point_matches_background")
         self.assertEqual(
-            ctx.extra["perception.candidates"]["cand_1"].get("status"), "rejected"
+            ctx.extra["perception.candidates"]["cand_1"].get("status"), None
         )
+
+    def test_a_background_centre_uses_the_support_cluster(self):
+        """The box centre reads the wall behind the chair; the bottom-edge
+        support cluster reads the chair. The support contact is the measurement."""
+        vlm = ScriptedVLM([ACCEPTED])
+        world = ConfirmWorld(position=(1.8, 0.0, 0.0), target=(3.0, 0.0, 0.0))
+        world.depth_at_pixel = lambda pixel: (
+            1.2 if float(pixel[1]) >= 540.0 else 4.8
+        )
+        ctx = make_context(world, vlm)
+        registry = make_registry(vlm)
+        store_candidate(ctx)
+
+        result = registry.call(
+            "confirm_candidate",
+            {"candidate_id": "cand_1", "instruction": "the wooden cabinet"},
+            ctx,
+        )
+
+        self.assertEqual(result.data["verdict"], "accepted", result.data)
+        check = result.data["position_check"]
+        self.assertEqual(check["method"], "observed_box")
+        self.assertEqual(check["measurement_method"], "support_cluster")
+        self.assertNotEqual(check["chosen_sample"], "centre")
+        self.assertIs(check["centre_rejected"], True)
+        self.assertLessEqual(check["delta_m"], 1.0)
+        self.assertGreaterEqual(check["support_cluster"]["samples"], 2)
+
+    def test_a_far_but_trusted_measurement_is_uncertain_not_rejected(self):
+        """A trustworthy support point 1.2 m past the candidate is a position
+        disagreement only: the identity stays open (missing distance), it is
+        not a rejection without visual contrary evidence."""
+        vlm = ScriptedVLM([ACCEPTED])
+        world = ConfirmWorld(position=(1.8, 0.0, 0.0), target=(3.0, 0.0, 0.0))
+        world.depth = 2.4
+        ctx = make_context(world, vlm)
+        registry = make_registry(vlm)
+        store_candidate(ctx)
+
+        result = registry.call(
+            "confirm_candidate",
+            {"candidate_id": "cand_1", "instruction": "the wooden cabinet", "max_views": 1},
+            ctx,
+        )
+
+        self.assertEqual(result.data["verdict"], "uncertain", result.data)
+        self.assertEqual(result.data["reason"], "position_too_far_from_candidate")
+        self.assertIn("distance", result.data["missing"])
+        check = result.data["position_check"]
+        self.assertIs(check["available"], True, check)
+        self.assertGreater(check["delta_m"], 1.0)
+        self.assertEqual(
+            ctx.extra["perception.candidates"]["cand_1"].get("status"), None
+        )
+
+    def test_a_different_instance_claim_with_a_matching_position_is_not_a_rejection(self):
+        """seed31: the model said different_instance at a 0.38 m delta. A
+        decided visual contradiction alone is not a terminal rejection when the
+        fresh measurement places the box where the candidate is: the instance
+        question stays open instead of closing a correct candidate."""
+        reply = dict(
+            WRONG_INSTANCE,
+            target=True,
+            same_instance=False,
+            attributes_match=True,
+            box=[450, 450, 550, 550],
+        )
+        vlm = ScriptedVLM([reply])
+        world = ConfirmWorld(position=(1.8, 0.0, 0.0), target=(3.0, 0.0, 0.0))
+        world.depth = 1.2
+        ctx = make_context(world, vlm)
+        registry = make_registry(vlm)
+        store_candidate(ctx)
+
+        result = registry.call(
+            "confirm_candidate",
+            {"candidate_id": "cand_1", "instruction": "the wooden cabinet", "max_views": 1},
+            ctx,
+        )
+
+        self.assertEqual(result.data["verdict"], "uncertain", result.data)
+        self.assertEqual(result.data["reason"], "identity_disputed_position_consistent")
+        self.assertIn("identity", result.data["missing"])
+        self.assertEqual(
+            ctx.extra["perception.candidates"]["cand_1"].get("status"), None
+        )
+
+    def test_two_views_that_measure_different_surfaces_are_unknown(self):
+        """Two fresh views disagree by more than a metre about the support
+        point: at most one can be the object. The measurement is unknown, and
+        the candidate is neither accepted nor rejected."""
+        vlm = ScriptedVLM([ACCEPTED, ACCEPTED])
+        world = ConfirmWorld(position=(1.8, 0.0, 0.0), target=(3.0, 0.0, 0.0))
+
+        def depth_by_heading(pixel):
+            yaw = (math.degrees(world.state.yaw_rad) + 180.0) % 360.0 - 180.0
+            return 1.2 if abs(yaw) < 5.0 else 2.0
+
+        world.depth_at_pixel = depth_by_heading
+        ctx = make_context(world, vlm)
+        registry = make_registry(vlm)
+        store_candidate(ctx)
+
+        result = registry.call(
+            "confirm_candidate",
+            {"candidate_id": "cand_1", "instruction": "the wooden cabinet", "max_views": 2},
+            ctx,
+        )
+
+        self.assertEqual(result.data["verdict"], "uncertain", result.data)
+        check = result.data["position_check"]
+        self.assertEqual(check["unknown_reason"], "multi_view_disagreement")
+        self.assertIs(check["inconsistent"], True, check)
+        self.assertGreater(check["multi_view_spread_m"], 1.0)
+        self.assertEqual(
+            ctx.extra["perception.candidates"]["cand_1"].get("status"), None
+        )
+
+    def test_a_detector_mask_supplies_the_support_cluster(self):
+        """SAM3 available: the mask's bottom contact selects the measured
+        pixels instead of the box bottom, which may include the background."""
+        from vlm_nav.detectors import Detection
+
+        mask = np.zeros((180, 320), dtype=bool)
+        mask[81:100, 144:177] = True
+        detector = SimpleNamespace(
+            name="fake-sam3",
+            available=lambda: True,
+            detect=lambda frame, instruction, labels=None, context=None: [
+                Detection(
+                    box=[450.0, 450.0, 550.0, 550.0],
+                    confidence=0.9,
+                    label="chair",
+                    mask=mask,
+                )
+            ],
+        )
+        world = ConfirmWorld(position=(1.8, 0.0, 0.0), target=(3.0, 0.0, 0.0))
+        world.depth_at_pixel = lambda pixel: (
+            1.2 if float(pixel[1]) >= 540.0 else 4.8
+        )
+        vlm = ScriptedVLM([ACCEPTED])
+        ctx = make_context(world, vlm)
+        ctx.extra["perception.detector"] = detector
+        registry = make_registry(vlm)
+        store_candidate(ctx)
+
+        result = registry.call(
+            "confirm_candidate",
+            {"candidate_id": "cand_1", "instruction": "the wooden cabinet"},
+            ctx,
+        )
+
+        self.assertEqual(result.data["verdict"], "accepted", result.data)
+        check = result.data["position_check"]
+        self.assertEqual(check["measurement_method"], "sam3_support_cluster")
+        self.assertEqual(check["support_cluster"]["source"], "mask")
+        self.assertIs(check["centre_rejected"], True)
 
     def test_a_zero_confidence_view_blocks_acceptance(self):
         """Every independent view has to support; a 0.0 view cannot be ignored."""
@@ -1067,9 +1237,11 @@ class ConfirmCandidateTest(unittest.TestCase):
         self.assertIn("low", states, result.data["views"])
 
     def test_an_opposing_view_prevents_acceptance(self):
-        """One view naming a different instance is at least uncertain/rejected."""
+        """A different-instance view plus a disagreeing position rejects: both
+        halves of the terminal-rejection rule are present."""
         vlm = ScriptedVLM([ACCEPTED, WRONG_INSTANCE])
         world = ConfirmWorld(position=(1.8, 0.0, 0.0))
+        world.depth = 2.4  # the fresh support point is 1.2 m past the candidate
         ctx = make_context(world, vlm)
         registry = make_registry(vlm)
         store_candidate(ctx)
@@ -1184,6 +1356,143 @@ class ConfirmCandidateTest(unittest.TestCase):
         self.assertTrue(results[2].data["strategy_change"])
         self.assertNotEqual(
             results[2].data["next_action"]["tool"], "confirm_candidate"
+        )
+
+    def test_cross_frame_relation_keeps_a_candidate_whose_anchor_left_the_frame(self):
+        """The window not being in the fresh view is unknown, not negative."""
+        reply = dict(ACCEPTED)
+        reply.update(anchor_visible=False, relation_supported=None)
+        vlm = ScriptedVLM([reply, reply])
+        ctx = make_context(ConfirmWorld(), vlm)
+        ctx.extra["relation_chain"] = True
+        registry = make_registry(vlm)
+        source = registry.call("observe", {"mode": "forward"}, ctx)
+        store_candidate(ctx, observation_id=source.data["observation_id"])
+        ctx.extra.setdefault("perception.candidates", {})["cand_anchor"] = {
+            "id": "cand_anchor",
+            "source": "ground_target",
+            "box": [100.0, 200.0, 300.0, 500.0],
+            "box_format": "xyxy",
+            "attrs": {"object_type": "door"},
+            "confidence": 0.9,
+            "observation_id": "obs_anchor",
+            "instruction": "the wooden door",
+            "subtask_key": "stage:anchor",
+            "position_source": "depth",
+            "range_m": 2.0,
+            "position_flu": [3.0, 2.0, 0.0],
+        }
+
+        result = registry.call(
+            "confirm_candidate",
+            {"candidate_id": "cand_1", "instruction": "the wooden cabinet next to the wooden door"},
+            ctx,
+        )
+
+        self.assertEqual(result.data["verdict"], "accepted", result.data)
+        evidence = result.data["relation_evidence"]
+        self.assertEqual(evidence["state"], "supports")
+        self.assertEqual(evidence["source"], "cross_frame_pose")
+        self.assertEqual(evidence["current_frame_state"], "unknown")
+
+    def test_an_explicit_relation_contradiction_rejects_the_candidate(self):
+        """A seen anchor that is not in the relation is explicit negative evidence."""
+        reply = dict(ACCEPTED)
+        reply.update(anchor_visible=True, relation_supported=False)
+        vlm = ScriptedVLM([reply])
+        ctx = make_context(ConfirmWorld(), vlm)
+        ctx.extra["relation_chain"] = True
+        registry = make_registry(vlm)
+        source = registry.call("observe", {"mode": "forward"}, ctx)
+        store_candidate(ctx, observation_id=source.data["observation_id"])
+
+        result = registry.call(
+            "confirm_candidate",
+            {"candidate_id": "cand_1", "instruction": "the wooden cabinet next to the wooden door"},
+            ctx,
+        )
+
+        self.assertEqual(result.data["verdict"], "rejected", result.data)
+        self.assertEqual(result.data["reason"], "relation_conflicted")
+        self.assertEqual(result.data["relation_evidence"]["state"], "contradicts")
+        self.assertEqual(
+            ctx.extra["perception.candidates"]["cand_1"]["status"], "rejected"
+        )
+
+    def test_an_unestablished_anchor_returns_a_directed_anchor_observation(self):
+        """No relation evidence: keep the candidate and observe the anchor itself."""
+        reply = dict(ACCEPTED)
+        reply.update(anchor_visible=False, relation_supported=None)
+        vlm = ScriptedVLM([reply, reply])
+        ctx = make_context(ConfirmWorld(), vlm)
+        ctx.extra["relation_chain"] = True
+        registry = make_registry(vlm)
+        source = registry.call("observe", {"mode": "forward"}, ctx)
+        store_candidate(ctx, observation_id=source.data["observation_id"])
+
+        result = registry.call(
+            "confirm_candidate",
+            {"candidate_id": "cand_1", "instruction": "the wooden cabinet next to the wooden door"},
+            ctx,
+        )
+
+        self.assertEqual(result.data["verdict"], "uncertain", result.data)
+        self.assertEqual(result.data["reason"], "relation_unknown")
+        self.assertIn("relation", result.data["missing"])
+        self.assertEqual(result.data["next_action"]["tool"], "ground_target")
+        self.assertIn("wooden door", result.data["next_action"]["args"]["instruction"])
+        self.assertEqual(
+            ctx.extra["perception.candidates"]["cand_1"].get("status"), None
+        )
+
+    def test_a_ray_only_anchor_requires_parallax_before_its_relation_counts(self):
+        """A bearing with no range cannot place the anchor. The relation stays
+        unknown, and the next action asks for a second bearing from a real
+        baseline (two rays intersect at the anchor), not another model look."""
+        reply = dict(ACCEPTED)
+        reply.update(anchor_visible=False, relation_supported=None)
+        vlm = ScriptedVLM([reply, reply])
+        ctx = make_context(ConfirmWorld(), vlm)
+        ctx.extra["relation_chain"] = True
+        registry = make_registry(vlm)
+        source = registry.call("observe", {"mode": "forward"}, ctx)
+        store_candidate(ctx, observation_id=source.data["observation_id"])
+        ctx.extra.setdefault("perception.candidates", {})["cand_anchor"] = {
+            "id": "cand_anchor",
+            "source": "ground_target",
+            "box": [100.0, 200.0, 300.0, 500.0],
+            "box_format": "xyxy",
+            "attrs": {"object_type": "door"},
+            "confidence": 0.9,
+            "observation_id": "obs_anchor",
+            "instruction": "找到并定位door",
+            "subtask_key": "stage:anchor",
+            "position_source": "ray",
+            "range_status": "unknown",
+            "ray": {
+                "origin_flu": [0.0, 0.0, 0.0],
+                "bearing_deg": 90.0,
+                "elevation_deg": 0.0,
+                "yaw_deg": 0.0,
+            },
+        }
+
+        result = registry.call(
+            "confirm_candidate",
+            {"candidate_id": "cand_1", "instruction": "the wooden cabinet next to the wooden door"},
+            ctx,
+        )
+
+        self.assertEqual(result.data["verdict"], "uncertain", result.data)
+        self.assertEqual(result.data["reason"], "relation_unknown")
+        evidence = result.data["relation_evidence"]
+        self.assertEqual(evidence["state"], "unknown")
+        self.assertEqual(evidence["reason"], "anchor_ray_only")
+        parallax = result.data["next_action"]["parallax"]
+        self.assertIs(parallax["required"], True)
+        self.assertGreaterEqual(parallax["min_baseline_m"], 1.0)
+        self.assertEqual(
+            ctx.extra["perception.candidates"]["cand_1"].get("status"), None
         )
 
     def test_the_mcp_contract_serves_confirm_candidate(self):

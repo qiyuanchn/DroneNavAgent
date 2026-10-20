@@ -4573,7 +4573,12 @@ def _anchor_record_category(record: Mapping) -> str:
         if isinstance(attrs, Mapping)
         else ""
     )
-    category = _anchor_category(f"{phrase} {attr_text}")
+    # the instruction's head phrase leads: an attribute such as the colour
+    # "light beige" must not turn a curtained window into a lamp ("light")
+    category = _anchor_category(phrase)
+    if category:
+        return category
+    category = _anchor_category(attr_text)
     if category:
         return category
     return _anchor_category(instruction) if not phrase else ""
@@ -4700,8 +4705,69 @@ def _anchor_visibility(
     }
 
 
+def _anchor_position_trusted(record: Mapping) -> bool:
+    """Whether an anchor's position is a measurement, not an estimate.
+
+    A border-large window grounded by the model's own distance is not a
+    geometric fact: it cannot prove a candidate 4-5 m away wrong. Such an
+    anchor may still support a relation when a confirmation view shows both
+    objects, but its distance is ``unknown`` for the reject test.
+    """
+    if record.get("distance_uncertain") is True:
+        return False
+    if str(record.get("distance_source") or "") == "conflict":
+        return False
+    if record.get("border_large_box"):
+        return False
+    source = str(record.get("position_source") or "")
+    # a legacy record that does not say how it was placed is treated as a
+    # measurement; an explicit model estimate or ray is not
+    return source in ("", POSITION_DEPTH, POSITION_TRIANGULATED)
+
+
+def _anchor_ray_triangulation(anchors: list[dict]) -> dict | None:
+    """The best ray pair of one anchor group that intersects with real parallax.
+
+    A ray-only anchor is a bearing from a known pose. Two bearings from
+    different poses intersect at the anchor when the baseline and the angle
+    between them are large enough (the same gates the candidate triangulation
+    uses); the closest-approach point is then a measured anchor position.
+    ``None`` when no pair has parallax (rotation alone does not).
+    """
+    rays = [
+        anchor for anchor in anchors
+        if anchor.get("ray_only") and isinstance(anchor.get("ray"), Mapping)
+    ]
+    best: tuple[dict, dict, dict] | None = None
+    for first in range(len(rays)):
+        for second in range(first + 1, len(rays)):
+            combined = _triangulate_rays(rays[first]["ray"], rays[second]["ray"])
+            if combined is None:
+                continue
+            if best is None or combined["residual_m"] < best[0]["residual_m"]:
+                best = (combined, rays[first], rays[second])
+    if best is None:
+        return None
+    combined, left, right = best
+    return {
+        **combined,
+        "anchor_ids": [str(left.get("id") or ""), str(right.get("id") or "")],
+        "sightings": len(rays),
+        "min_baseline_m": TRIANGULATION_MIN_BASELINE_M,
+        "min_angle_deg": TRIANGULATION_MIN_ANGLE_DEG,
+    }
+
+
 def _known_anchors(ctx: ToolContext, subtask_key: str) -> list[dict]:
-    """Earlier-stage candidate positions usable as relation anchors."""
+    """Earlier-stage candidates usable as relation anchors.
+
+    A measured (depth/triangulated) position is the normal anchor. A candidate
+    grounded with a bearing only (``position_source=ray``) is kept as a
+    *ray-only* anchor: it cannot place the relatum by itself, but two such
+    bearings from different poses triangulate it. The triangulated point is
+    appended as a located anchor so every later relation check re-runs against
+    a real measurement.
+    """
     anchors: list[dict] = []
     for key, record in _candidate_store(ctx).items():
         if not isinstance(record, Mapping):
@@ -4713,7 +4779,8 @@ def _known_anchors(ctx: ToolContext, subtask_key: str) -> list[dict]:
         if str(record.get("status") or "") in ("rejected", "merged", "superseded"):
             continue
         point = _instance_point(record.get("position_flu"))
-        if point is None:
+        ray = record.get("ray") if isinstance(record.get("ray"), Mapping) else None
+        if point is None and ray is None:
             continue
         attrs = record.get("attrs")
         text = " ".join(
@@ -4728,11 +4795,99 @@ def _known_anchors(ctx: ToolContext, subtask_key: str) -> list[dict]:
             {
                 "id": str(record.get("id") or key),
                 "position": point,
+                "ray": None if ray is None else dict(ray),
+                "ray_only": point is None and ray is not None,
                 "category": _anchor_record_category(record),
                 "text": text[:200],
+                "position_source": str(record.get("position_source") or ""),
+                "distance_uncertain": bool(record.get("distance_uncertain")),
+                "border_large_box": bool(record.get("border_large_box")),
+                "trusted": (
+                    _anchor_position_trusted(record) if point is not None else False
+                ),
+            }
+        )
+    groups: dict[str, list[dict]] = {}
+    for anchor in anchors:
+        if anchor.get("ray_only"):
+            groups.setdefault(
+                str(anchor.get("category") or anchor.get("text") or ""), []
+            ).append(anchor)
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        triangulated = _anchor_ray_triangulation(group)
+        if triangulated is None:
+            continue
+        source = group[0]
+        anchors.append(
+            {
+                "id": f"anchor_triangulated_{len(anchors) + 1}",
+                "position": tuple(float(value) for value in triangulated["point"]),
+                "ray": None,
+                "ray_only": False,
+                "category": source.get("category") or "",
+                "text": source.get("text") or "",
+                "position_source": POSITION_TRIANGULATED,
+                "distance_uncertain": False,
+                "border_large_box": False,
+                "trusted": True,
+                "triangulated": {
+                    key: triangulated[key]
+                    for key in (
+                        "baseline_m", "angle_deg", "residual_m",
+                        "anchor_ids", "sightings",
+                    )
+                },
             }
         )
     return anchors
+
+
+def _anchor_parallax_requirement(
+    relation: Mapping | None, anchors: list[dict],
+) -> dict:
+    """What would locate a ray-only anchor: a second bearing with a baseline.
+
+    One bearing is a line, not a point. The requirement is explicit so the
+    relation is not judged on an invented range: move sideways, look at the
+    anchor again from the new pose, and the two rays intersect at the anchor.
+    """
+    phrase = str((relation or {}).get("anchor") or "")
+    instruction = f"找到并定位{phrase}" if phrase else ""
+    sightings = [
+        str(anchor.get("id") or "")
+        for anchor in anchors
+        if anchor.get("ray_only")
+    ]
+    return {
+        "required": True,
+        "reason": "anchor_ray_only",
+        "anchor": phrase,
+        "anchor_candidates": sightings[-8:],
+        "sightings": len(sightings),
+        "min_baseline_m": TRIANGULATION_MIN_BASELINE_M,
+        "min_angle_deg": TRIANGULATION_MIN_ANGLE_DEG,
+        "why": (
+            "the anchor was grounded with a bearing and no range: one ray "
+            f"cannot place it. Take a second bearing from at least "
+            f"{TRIANGULATION_MIN_BASELINE_M:g} m to the side (a new pose, not "
+            "only a new heading); the two rays intersect at the anchor and "
+            "the relation is re-checked against that measured point"
+        ),
+        "action": {
+            "tool": "ground_target",
+            "args": {
+                "instruction": instruction,
+                "require_parallax": True,
+                "min_baseline_m": TRIANGULATION_MIN_BASELINE_M,
+            },
+            "observe_first": {
+                "tool": "propose_viewpoints",
+                "args": {"count": 2},
+            },
+        },
+    }
 
 
 def _anchor_conflict(
@@ -4753,6 +4908,11 @@ def _anchor_conflict(
     relation = relation if relation is not None else _relation_anchor(instruction)
     matched = _matching_anchors(anchors, relation)
     pool = matched or anchors
+    # only measured anchor positions may contradict a candidate: a border-large
+    # window placed at the model's estimated range is not a geometric fact
+    pool = [anchor for anchor in pool if anchor.get("trusted", True)]
+    if not pool:
+        return None
     limit = (
         float(relation["limit_m"])
         if relation is not None and matched
@@ -4779,6 +4939,1382 @@ def _anchor_conflict(
         conflict["anchor_phrase"] = relation["anchor"]
         conflict["anchor_matched"] = bool(matched)
     return conflict
+
+
+# ---------------------------------------------------------------------------
+# relation chain: instance hypotheses and typed relation evidence
+# ---------------------------------------------------------------------------
+#
+# The relation gate used to be stateless: a candidate of "窗边的木椅" was only
+# approved when the window happened to be inside the *same* frame, and a fresh
+# confirmation view that did not hold the window vetoed the candidate. That is
+# wrong in both directions - "the window is not in this frame" is not "the
+# chair is not by the window" - and it is exactly what stopped the bedroom
+# relation chains. This block keeps the two records apart:
+#
+# - *instance hypotheses*: one entity per instructed target, with the candidate
+#   ids that were associated to it (same target phrase, compatible attributes,
+#   a position inside the accumulated uncertainty) and its observation set;
+# - *relation evidence*: (anchor entity, relation type, source, confidence,
+#   timestamp). A relation can be established while both objects are visible
+#   (``co_visible``) or from the located anchor's world position
+#   (``cross_frame_pose``); losing the anchor from the frame only makes the
+#   *current* view ``unknown`` - the historical relation stays valid until an
+#   explicit contradiction (the candidate measured outside the relation bound,
+#   or the anchor seen in frame without the relation) or a freshness failure.
+#
+# Every consumer keeps three verdicts apart: ``supports`` / ``contradicts`` /
+# ``unknown``. Only ``contradicts`` can reject a candidate; ``unknown`` keeps it
+# and names the observation that would settle the question.
+
+RELATION_CHAIN_KEY = "relation_chain.state"
+RELATION_CHAIN_SWITCH = "relation_chain"
+RELATION_SCHEMA = "relation-chain-v1"
+
+RELATION_SUPPORTS = "supports"
+RELATION_CONTRADICTS = "contradicts"
+RELATION_UNKNOWN = "unknown"
+
+RELATION_SOURCE_CO_VISIBLE = "co_visible"
+RELATION_SOURCE_CROSS_FRAME = "cross_frame_pose"
+RELATION_SOURCE_MODEL = "model_self_report"
+RELATION_SOURCE_NONE = "none"
+
+UNCERTAINTY_CATEGORY = "category"
+UNCERTAINTY_INSTANCE = "instance"
+UNCERTAINTY_DISTANCE = "distance"
+UNCERTAINTY_ANCHOR_RELATION = "anchor_relation"
+UNCERTAINTY_REACHABILITY = "reachability"
+UNCERTAINTY_TYPES = (
+    UNCERTAINTY_CATEGORY,
+    UNCERTAINTY_INSTANCE,
+    UNCERTAINTY_DISTANCE,
+    UNCERTAINTY_ANCHOR_RELATION,
+    UNCERTAINTY_REACHABILITY,
+)
+
+#: Two sightings are the same instance when their positions agree inside the
+#: accumulated uncertainty plus this slack. Different frames of one chair from
+#: a few metres apart stay one hypothesis; two chairs across the room do not.
+RELATION_ASSOCIATION_RADIUS_M = 1.5
+#: How many competing hypotheses of one target stay active (goal.md section 4).
+RELATION_MAX_COMPETING = 3
+#: A re-grounded anchor farther than this from the recorded anchor position is
+#: an anchor re-localization conflict (unknown, never by itself a rejection).
+RELATION_ANCHOR_RELOC_TOL_M = 1.5
+#: A *perceptual* relation (model self-report, no located anchor) goes stale
+#: after this much episode time; a geometric relation to a located anchor does
+#: not (the world points do not move with the drone).
+RELATION_STALE_AFTER_S = 180.0
+#: A perceptual relation established from a pose farther than this from the
+#: current one is no longer trusted without re-observation.
+RELATION_POSE_DRIFT_MAX_M = 8.0
+#: A relation is only used for a decision when its evidence reached this.
+RELATION_MIN_CONFIDENCE = 0.35
+#: Bounded observation-decision journal (one entry per supplementary look).
+MAX_RELATION_OBSERVATIONS = 48
+#: Bounded per-instance observation set.
+MAX_INSTANCE_OBSERVATIONS = 12
+
+
+def relation_chain_enabled(ctx: ToolContext) -> bool:
+    """The relation-chain switch (``ctx.extra["relation_chain"]``).
+
+    Absent means off: a bare ``ToolContext`` (unit tests, older callers) keeps
+    the previous co-visibility gate. The runtime publishes the switch from its
+    own constructor (``VLM_NAV_RELATION_CHAIN`` by default), so an experiment
+    arm can enable it without changing any tool signature.
+    """
+    extra = _extra(ctx)
+    value = extra.get(RELATION_CHAIN_SWITCH)
+    if isinstance(value, Mapping):
+        value = value.get("enabled", True)
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in ("on", "true", "1", "yes")
+    return bool(value)
+
+
+def relation_state(ctx: ToolContext) -> dict:
+    """The episode's relation-chain record (created on first use)."""
+    extra = _extra(ctx)
+    state = extra.get(RELATION_CHAIN_KEY)
+    if not isinstance(state, dict) or state.get("schema") != RELATION_SCHEMA:
+        state = {
+            "schema": RELATION_SCHEMA,
+            "instances": {},
+            "relations": {},
+            "competitors": {},
+            "observations": [],
+            "seq": 0,
+            "counts": {name: 0 for name in UNCERTAINTY_TYPES},
+        }
+        extra[RELATION_CHAIN_KEY] = state
+    state.setdefault("instances", {})
+    state.setdefault("relations", {})
+    state.setdefault("competitors", {})
+    state.setdefault("observations", [])
+    counts = state.setdefault("counts", {})
+    for name in UNCERTAINTY_TYPES:
+        counts.setdefault(name, 0)
+    return state
+
+
+def _relation_now(ctx: ToolContext) -> float:
+    try:
+        return float(_episode_time_s(ctx))
+    except Exception:  # noqa: BLE001 - the journal must never break a tool
+        return 0.0
+
+
+def _candidate_position_sigma(candidate: Mapping) -> float:
+    """Position uncertainty of one candidate, in metres (rough on purpose)."""
+    if candidate.get("distance_uncertain") is True:
+        return 2.0
+    if str(candidate.get("distance_source") or "") == "conflict":
+        return 2.0
+    if _instance_point(candidate.get("position_flu")) is None:
+        return 2.5
+    source = str(candidate.get("position_source") or "")
+    return 0.5 if source in (POSITION_DEPTH, POSITION_TRIANGULATED, "depth") else 1.2
+
+
+def _attrs_compatible(first: Mapping | None, second: Mapping | None) -> bool:
+    """No shared attribute key carries two different values."""
+    if not isinstance(first, Mapping) or not isinstance(second, Mapping):
+        return True
+    for key in set(first) & set(second):
+        value_a = str(first.get(key) or "").strip().lower()
+        value_b = str(second.get(key) or "").strip().lower()
+        if value_a and value_b and value_a != value_b:
+            return False
+    return True
+
+
+def _merge_attrs(target: dict, extra: Mapping | None) -> None:
+    if not isinstance(extra, Mapping):
+        return
+    for key, value in extra.items():
+        text = str(value or "").strip()
+        if text and not str(target.get(key) or "").strip():
+            target[str(key)] = text[:120]
+
+
+def _record_value(record: Any, name: str, default: Any = None) -> Any:
+    """One field of a :class:`PerceptionObservation` or of a candidate dict."""
+    if record is None:
+        return default
+    if isinstance(record, Mapping):
+        return record.get(name, default)
+    return getattr(record, name, default)
+
+
+def _instance_observation(candidate: Mapping, record: Any) -> dict:
+    position = _instance_point(candidate.get("position_flu"))
+    pose = _record_value(record, "position_flu")
+    yaw = _record_value(record, "yaw_deg")
+    if yaw is None:
+        yaw_rad = _record_value(record, "yaw_rad")
+        yaw = None if yaw_rad is None else math.degrees(float(yaw_rad))
+    return {
+        "candidate_id": str(candidate.get("id") or ""),
+        "observation_id": str(candidate.get("observation_id") or ""),
+        "position_flu": None if position is None else list(position),
+        "sigma_m": round(_candidate_position_sigma(candidate), 3),
+        "confidence": _as_float(candidate.get("confidence"), None),
+        "pose": (
+            None
+            if pose is None
+            else [round(float(value), 3) for value in list(pose)[:3]]
+        ),
+        "yaw_deg": None if yaw is None else round(float(yaw), 1),
+        "at": _as_float(_record_value(record, "time_s"), None),
+    }
+
+
+def _new_instance(state: dict, candidate: Mapping, instruction: str) -> dict:
+    state["seq"] = int(state.get("seq") or 0) + 1
+    instance_id = f"inst_{state['seq']}"
+    point = _instance_point(candidate.get("position_flu"))
+    instance = {
+        "id": instance_id,
+        "target_key": _candidate_target_key(candidate),
+        "instruction": str(instruction or candidate.get("instruction") or "")[:160],
+        "candidate_ids": [],
+        "observation_ids": [],
+        "observations": [],
+        "attrs": {},
+        "position_flu": None if point is None else list(point),
+        "sigma_m": round(_candidate_position_sigma(candidate), 3),
+        "n_positions": 0 if point is None else 1,
+        "support": 0,
+        "confidence": _as_float(candidate.get("confidence"), 0.0) or 0.0,
+        "status": "hypothesis",
+        "rank": None,
+        "first_seen_at": _as_float(candidate.get("_relation_seen_at"), 0.0) or 0.0,
+        "last_seen_at": _as_float(candidate.get("_relation_seen_at"), 0.0) or 0.0,
+    }
+    state["instances"][instance_id] = instance
+    return instance
+
+
+def _update_instance(instance: dict, candidate: Mapping, record: PerceptionObservation | None) -> None:
+    candidate_id = str(candidate.get("id") or "")
+    if candidate_id and candidate_id not in instance["candidate_ids"]:
+        instance["candidate_ids"].append(candidate_id)
+    observation_id = str(candidate.get("observation_id") or "")
+    if observation_id and observation_id not in instance["observation_ids"]:
+        instance["observation_ids"].append(observation_id)
+    observation = _instance_observation(candidate, record)
+    instance["observations"].append(observation)
+    del instance["observations"][:-MAX_INSTANCE_OBSERVATIONS]
+    point = _instance_point(candidate.get("position_flu"))
+    if point is not None:
+        count = int(instance.get("n_positions") or 0)
+        previous = instance.get("position_flu")
+        if isinstance(previous, (list, tuple)) and len(previous) >= 3 and count > 0:
+            weight = min(count, 8)
+            instance["position_flu"] = [
+                round((float(previous[index]) * weight + point[index]) / (weight + 1), 4)
+                for index in range(3)
+            ]
+        else:
+            instance["position_flu"] = list(point)
+        instance["n_positions"] = count + 1
+        instance["sigma_m"] = round(
+            min(float(instance.get("sigma_m") or 2.5), _candidate_position_sigma(candidate)),
+            3,
+        )
+    _merge_attrs(instance.setdefault("attrs", {}), candidate.get("attrs"))
+    instance["support"] = int(instance.get("support") or 0) + 1
+    instance["confidence"] = max(
+        float(instance.get("confidence") or 0.0),
+        _as_float(candidate.get("confidence"), 0.0) or 0.0,
+    )
+    seen = _as_float(candidate.get("_relation_seen_at"), None)
+    if seen is not None:
+        instance["last_seen_at"] = seen
+
+
+def _associate_instance(
+    state: dict,
+    ctx: ToolContext,
+    candidate: Mapping,
+    instruction: str,
+    record: PerceptionObservation | None,
+) -> dict:
+    """The instance hypothesis a candidate belongs to (new one when none fits).
+
+    Association is deliberately conservative: the target phrase must agree
+    (token overlap plus the CJK head noun, :func:`_same_target_instruction`),
+    the attributes must not contradict, and the positions must agree inside the
+    accumulated uncertainty. Two distinct boxes on the same frame are *never*
+    merged (they are competing hypotheses); a position outside the radius is a
+    second hypothesis, not a correction of the first.
+    """
+    target_key = _candidate_target_key(candidate)
+    point = _instance_point(candidate.get("position_flu"))
+    attrs = candidate.get("attrs") if isinstance(candidate.get("attrs"), Mapping) else {}
+    observation_id = str(candidate.get("observation_id") or "")
+    candidate_id = str(candidate.get("id") or "")
+    best: tuple[float, dict] | None = None
+    for instance in state["instances"].values():
+        if instance.get("status") == "rejected":
+            continue
+        same_target = instance.get("target_key") == target_key
+        if not same_target:
+            same_target = _same_target_instruction(
+                str(instance.get("instruction") or ""), instruction
+            )
+        if not same_target:
+            continue
+        if not _attrs_compatible(instance.get("attrs"), attrs):
+            continue
+        if candidate_id and candidate_id in instance.get("candidate_ids", []):
+            return instance
+        if observation_id and observation_id in instance.get("observation_ids", []):
+            # the same frame grounds the same object only when the boxes overlap;
+            # a second, disjoint box on that frame is another hypothesis
+            continue
+        instance_point = _instance_point(instance.get("position_flu"))
+        if point is not None and instance_point is not None:
+            gap = math.dist(point, instance_point)
+            radius = (
+                RELATION_ASSOCIATION_RADIUS_M
+                + float(instance.get("sigma_m") or 0.0)
+                + _candidate_position_sigma(candidate)
+            )
+            if gap <= radius and (best is None or gap < best[0]):
+                best = (gap, instance)
+        elif point is None and instance_point is None and same_target:
+            best = (0.0, instance)
+    if best is not None:
+        _update_instance(best[1], candidate, record)
+        return best[1]
+    instance = _new_instance(state, candidate, instruction)
+    _update_instance(instance, candidate, record)
+    return instance
+
+
+def _refresh_competitors(state: dict, target_key: str) -> list[str]:
+    """Rank the hypotheses of one target; only the best few stay active."""
+    active = [
+        instance
+        for instance in state["instances"].values()
+        if instance.get("target_key") == target_key
+        and instance.get("status") != "rejected"
+    ]
+    active.sort(
+        key=lambda item: (
+            float(item.get("confidence") or 0.0),
+            int(item.get("support") or 0),
+        ),
+        reverse=True,
+    )
+    for rank, instance in enumerate(active, 1):
+        instance["rank"] = rank if rank <= RELATION_MAX_COMPETING else None
+        instance["competing"] = len(active) > 1
+    selected = [str(instance["id"]) for instance in active[:RELATION_MAX_COMPETING]]
+    state["competitors"][target_key] = selected
+    return selected
+
+
+def update_instance_hypotheses(
+    ctx: ToolContext,
+    record: PerceptionObservation | None,
+    instruction: str,
+    candidates: list[dict],
+) -> dict:
+    """Associate every grounded candidate with an instance hypothesis.
+
+    Returns a compact summary the caller publishes (the candidates themselves
+    carry ``instance_hypothesis``), and records the coordinate for the relation
+    evidence layer. Safe to call on every grounding: a candidate already in an
+    instance keeps it.
+    """
+    if not relation_chain_enabled(ctx) or not candidates:
+        return {"enabled": False, "n_instances": 0}
+    state = relation_state(ctx)
+    now = _relation_now(ctx)
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        candidate.setdefault("_relation_seen_at", now)
+        instance = _associate_instance(state, ctx, candidate, instruction, record)
+        candidate["instance_hypothesis"] = str(instance["id"])
+        candidate["instance_rank"] = instance.get("rank")
+        # an anchor candidate is also an instance: the relation layer matches it
+        # by category later, and a re-localized anchor is judged against the
+        # position the relation was established with
+        category = _anchor_record_category(candidate)
+        if category:
+            candidate.setdefault("instance_category", category)
+            _note_anchor_reobservation(ctx, state, candidate, category, now)
+    target_keys = sorted(
+        {str(candidate.get("subtask_key") or "") or _candidate_target_key(candidate)
+         for candidate in candidates if isinstance(candidate, dict)}
+    )
+    for key in target_keys:
+        _refresh_competitors(state, key)
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        instance = state["instances"].get(str(candidate.get("instance_hypothesis") or ""))
+        if instance is not None:
+            candidate["instance_rank"] = instance.get("rank")
+            candidate["competing_hypothesis"] = bool(instance.get("competing"))
+    return {
+        "enabled": True,
+        "n_instances": len(state["instances"]),
+        "instances": [
+            str(instance.get("id")) for instance in state["instances"].values()
+        ][-8:],
+        "competitors": dict(state.get("competitors") or {}),
+    }
+
+
+def _note_anchor_reobservation(
+    ctx: ToolContext,
+    state: dict,
+    candidate: Mapping,
+    category: str,
+    now: float,
+) -> None:
+    """Check a newly grounded anchor against the located anchor of each relation.
+
+    A re-localized anchor that lands far from the recorded one makes the
+    historical relation *unknown* (it needs re-checking); it never, by itself,
+    proves the candidate wrong. A re-observation inside the tolerance refreshes
+    the anchor position and the confidence.
+    """
+    point = _instance_point(candidate.get("position_flu"))
+    if point is None:
+        return
+    candidate_id = str(candidate.get("id") or "")
+    for relation in state["relations"].values():
+        if str(relation.get("anchor_category") or "") != category:
+            continue
+        if candidate_id and candidate_id in relation.get("anchor_candidates", []):
+            continue
+        anchor_position = _instance_point(relation.get("anchor_position"))
+        if anchor_position is None:
+            continue
+        gap = math.dist(point, anchor_position)
+        relation.setdefault("anchor_candidates", []).append(candidate_id)
+        del relation["anchor_candidates"][:-8]
+        relation["anchor_last_seen_at"] = now
+        if gap > RELATION_ANCHOR_RELOC_TOL_M:
+            relation["anchor_reobservation_conflict"] = {
+                "candidate_id": candidate_id,
+                "gap_m": round(gap, 2),
+                "tolerance_m": RELATION_ANCHOR_RELOC_TOL_M,
+                "at": now,
+            }
+            relation["last_unknown_reason"] = "anchor_relocalized"
+        else:
+            # the anchor is confirmed: refresh the position (running mean) and
+            # clear an older re-localization conflict when this view resolves it
+            count = max(1, int(relation.get("anchor_observations") or 1))
+            relation["anchor_position"] = [
+                round((float(anchor_position[index]) * count + point[index]) / (count + 1), 4)
+                for index in range(3)
+            ]
+            relation["anchor_observations"] = count + 1
+            relation.pop("anchor_reobservation_conflict", None)
+
+
+def _relation_key(instance_id: str, relation: Mapping) -> str:
+    category = _anchor_category(str(relation.get("anchor") or ""))
+    kind = str(relation.get("relation") or "near").strip().lower()
+    return f"{instance_id}|{category or str(relation.get('anchor') or '')}|{kind}"
+
+
+def _relation_record(
+    state: dict,
+    ctx: ToolContext,
+    instance: Mapping,
+    relation: Mapping,
+    *,
+    anchor_position: tuple[float, float, float] | None = None,
+    anchor_candidate: str | None = None,
+    anchor_category: str | None = None,
+) -> dict:
+    key = _relation_key(str(instance.get("id") or ""), relation)
+    record = state["relations"].get(key)
+    if isinstance(record, dict):
+        if anchor_position is not None and record.get("anchor_position") is None:
+            record["anchor_position"] = list(anchor_position)
+        if anchor_candidate and anchor_candidate not in record.setdefault("anchor_candidates", []):
+            record.setdefault("anchor_candidates", []).append(anchor_candidate)
+        return record
+    record = {
+        "id": f"rel_{len(state['relations']) + 1}",
+        "target_instance": str(instance.get("id") or ""),
+        "target_candidates": list(instance.get("candidate_ids") or []),
+        "target_key": str(instance.get("target_key") or ""),
+        "anchor_phrase": str(relation.get("anchor") or "")[:40],
+        "anchor_category": anchor_category or _anchor_category(str(relation.get("anchor") or "")),
+        "relation": str(relation.get("relation") or "")[:24],
+        "limit_m": float(relation.get("limit_m") or INSTANCE_ADJACENT_MAX_M),
+        "anchor_position": None if anchor_position is None else list(anchor_position),
+        "anchor_candidates": [] if not anchor_candidate else [anchor_candidate],
+        "anchor_observations": 1 if anchor_position is not None else 0,
+        "state": RELATION_UNKNOWN,
+        "source": RELATION_SOURCE_NONE,
+        "confidence": 0.0,
+        "created_at": _relation_now(ctx),
+        "last_supported_at": None,
+        "last_checked_at": _relation_now(ctx),
+        "last_unknown_reason": "not_established",
+        "evidence_ids": [],
+        "contradictions": [],
+    }
+    state["relations"][key] = record
+    return record
+
+
+def _write_relation(
+    ctx: ToolContext,
+    state: dict,
+    instance: Mapping,
+    relation: Mapping,
+    *,
+    verdict: str,
+    source: str,
+    reason: str,
+    confidence: float,
+    anchor_position: tuple[float, float, float] | None = None,
+    anchor_candidate: str | None = None,
+    anchor_category: str | None = None,
+    evidence_ids: list[str] | None = None,
+    distance_m: float | None = None,
+) -> dict:
+    record = _relation_record(
+        state, ctx, instance, relation,
+        anchor_position=anchor_position,
+        anchor_candidate=anchor_candidate,
+        anchor_category=anchor_category,
+    )
+    now = _relation_now(ctx)
+    record["last_checked_at"] = now
+    record["confidence"] = round(max(float(record.get("confidence") or 0.0), confidence), 3)
+    for evidence_id in evidence_ids or []:
+        text = str(evidence_id or "")
+        if text and text not in record.setdefault("evidence_ids", []):
+            record["evidence_ids"].append(text)
+    del record["evidence_ids"][:-16]
+    if distance_m is not None:
+        record["distance_m"] = round(float(distance_m), 3)
+    if verdict == RELATION_SUPPORTS:
+        record["state"] = RELATION_SUPPORTS
+        record["source"] = source
+        record["reason"] = reason
+        record["last_supported_at"] = now
+        record["last_unknown_reason"] = ""
+        record["contradictions"] = []
+        if anchor_position is not None:
+            record["anchor_position"] = list(anchor_position)
+        pose = _current_position(ctx.world)
+        if pose is not None:
+            record["established_pose"] = [round(float(value), 3) for value in pose]
+    elif verdict == RELATION_CONTRADICTS:
+        record["state"] = RELATION_CONTRADICTS
+        record["source"] = source
+        record["reason"] = reason
+        record["contradicted_at"] = now
+        record.setdefault("contradictions", []).append(
+            {"reason": reason, "source": source, "at": now,
+             "distance_m": None if distance_m is None else round(float(distance_m), 3)}
+        )
+        del record["contradictions"][:-8]
+    else:
+        record["last_unknown_at"] = now
+        record["last_unknown_reason"] = reason
+        if record.get("state") not in (RELATION_SUPPORTS, RELATION_CONTRADICTS):
+            record["state"] = RELATION_UNKNOWN
+            record["source"] = source
+            record["reason"] = reason
+    return record
+
+
+def _relation_freshness(ctx: ToolContext, record: Mapping) -> dict:
+    """Whether a recorded relation is still usable, and why not (``unknown``)."""
+    now = _relation_now(ctx)
+    last = _as_float(record.get("last_supported_at"), None)
+    age = None if last is None else max(0.0, now - float(last))
+    established = record.get("established_pose")
+    current = _current_position(ctx.world)
+    drift = None
+    if (
+        isinstance(established, (list, tuple))
+        and len(established) >= 3
+        and current is not None
+    ):
+        drift = round(
+            math.dist(
+                [float(value) for value in established[:3]],
+                [float(value) for value in current],
+            ),
+            2,
+        )
+    geometric = _instance_point(record.get("anchor_position")) is not None
+    conflict = record.get("anchor_reobservation_conflict")
+    if isinstance(conflict, Mapping):
+        return {
+            "fresh": False,
+            "reason": "anchor_relocalized",
+            "age_s": age,
+            "pose_drift_m": drift,
+            "anchor_conflict": dict(conflict),
+        }
+    if not geometric:
+        if age is not None and age > RELATION_STALE_AFTER_S:
+            return {"fresh": False, "reason": "stale", "age_s": age, "pose_drift_m": drift}
+        if drift is not None and drift > RELATION_POSE_DRIFT_MAX_M:
+            return {
+                "fresh": False,
+                "reason": "pose_drift",
+                "age_s": age,
+                "pose_drift_m": drift,
+            }
+    return {"fresh": True, "reason": "", "age_s": age, "pose_drift_m": drift}
+
+
+def _relation_public(record: Mapping, freshness: Mapping | None = None) -> dict:
+    """The model-facing subset of one relation record (typed verdicts only)."""
+    state = str(record.get("state") or RELATION_UNKNOWN)
+    reason = (
+        str(record.get("last_unknown_reason") or "")
+        if state == RELATION_UNKNOWN
+        else str(record.get("reason") or record.get("last_unknown_reason") or "")
+    )
+    historical = state == RELATION_SUPPORTS
+    fresh = True if freshness is None else bool(freshness.get("fresh", True))
+    public_state = state
+    if state == RELATION_SUPPORTS and not fresh:
+        public_state = RELATION_UNKNOWN
+        reason = str(freshness.get("reason") or "stale")
+    return {
+        "state": public_state,
+        "historical_state": state,
+        "historical_supports": historical,
+        "current_frame_state": RELATION_UNKNOWN,
+        "source": str(record.get("source") or RELATION_SOURCE_NONE),
+        "reason": reason,
+        "fresh": fresh,
+        "age_s": None if freshness is None else freshness.get("age_s"),
+        "pose_drift_m": None if freshness is None else freshness.get("pose_drift_m"),
+        "anchor": str(record.get("anchor_phrase") or ""),
+        "anchor_category": str(record.get("anchor_category") or ""),
+        "relation": str(record.get("relation") or ""),
+        "limit_m": record.get("limit_m"),
+        "distance_m": record.get("distance_m"),
+        "confidence": record.get("confidence"),
+        "established_at": record.get("last_supported_at"),
+        "anchor_candidate": (
+            (record.get("anchor_candidates") or [None])[0]
+            if record.get("anchor_candidates") else None
+        ),
+        "evidence_ids": list(record.get("evidence_ids") or [])[-4:],
+        "target_instance": record.get("target_instance"),
+        "anchor_conflict": record.get("anchor_reobservation_conflict"),
+        "anchor_ray_only": bool(record.get("anchor_ray_only")),
+        "parallax": record.get("parallax"),
+    }
+
+
+def _relation_instance(
+    ctx: ToolContext,
+    candidate: Mapping,
+    instruction: str,
+    record: PerceptionObservation | None,
+) -> dict:
+    state = relation_state(ctx)
+    instance_id = str(candidate.get("instance_hypothesis") or "")
+    instance = state["instances"].get(instance_id)
+    if instance is None:
+        instance = _associate_instance(state, ctx, candidate, instruction, record)
+        if isinstance(candidate, dict):
+            candidate["instance_hypothesis"] = str(instance["id"])
+    return instance
+
+
+def _view_relation_flags(view: Mapping | None) -> tuple[bool | None, bool | None]:
+    """``(anchor_visible, relation_supported)`` as the model answered them."""
+    if not isinstance(view, Mapping):
+        return None, None
+    visible = view.get("anchor_visible")
+    supported = view.get("relation_supported")
+    visible = visible if isinstance(visible, bool) else None
+    supported = supported if isinstance(supported, bool) else None
+    return visible, supported
+
+
+def relation_evidence_for_candidate(
+    ctx: ToolContext,
+    candidate: Mapping,
+    instruction: str,
+    relation: Mapping | None = None,
+    *,
+    record: PerceptionObservation | None = None,
+    view: Mapping | None = None,
+    visibility: Mapping | None = None,
+    anchors: list[dict] | None = None,
+    matched_anchors: list[dict] | None = None,
+) -> dict | None:
+    """The typed relation evidence of one candidate (supports/contradicts/unknown).
+
+    Precedence:
+
+    1. what *this* view says, but only when it is decided: ``anchor_visible``
+       true with ``relation_supported`` false is an explicit contradiction;
+       true+true is co-visible support; an anchor that is not visible is
+       ``unknown`` for this frame and falls through to the historical record;
+    2. the geometry against a located anchor (a candidate measured outside the
+       relation's bound is an explicit contradiction; inside it is cross-frame
+       support even when the anchor is out of frame);
+    3. the recorded relation, checked for freshness (expiry / pose drift /
+       anchor re-localization). A stale record is ``unknown``, never negative.
+    """
+    if relation is None:
+        relation = _relation_anchor(instruction)
+    if relation is None:
+        return None
+    chain_enabled = relation_chain_enabled(ctx)
+    instance = _relation_instance(ctx, candidate, instruction, record)
+    state = relation_state(ctx)
+    point = _instance_point(candidate.get("position_flu"))
+    subtask_key = str(candidate.get("subtask_key") or "")
+    if anchors is None:
+        anchors = _known_anchors(ctx, subtask_key)
+    if matched_anchors is None:
+        matched_anchors = _matching_anchors(anchors, relation)
+    located_anchors = [
+        anchor for anchor in matched_anchors
+        if _instance_point(anchor.get("position")) is not None
+    ]
+    anchor = None
+    if located_anchors:
+        # a measured anchor always outranks a ray-only sighting
+        if point is not None:
+            anchor = min(
+                located_anchors, key=lambda item: math.dist(point, item["position"])
+            )
+        else:
+            anchor = located_anchors[0]
+    elif matched_anchors:
+        anchor = matched_anchors[0]
+    anchor_position = None if anchor is None else _instance_point(anchor.get("position"))
+    anchor_ray_only = bool(
+        anchor is not None and anchor.get("ray_only") and anchor_position is None
+    )
+    distance = (
+        None
+        if point is None or anchor_position is None
+        else math.dist(point, anchor_position)
+    )
+    limit = float(relation.get("limit_m") or INSTANCE_ADJACENT_MAX_M)
+    anchor_category = str(anchor.get("category") or "") if anchor else _anchor_category(
+        str(relation.get("anchor") or "")
+    )
+    anchor_candidate = None if anchor is None else str(anchor.get("id") or "")
+    evidence_ids = [
+        value
+        for value in (
+            str(candidate.get("observation_id") or ""),
+            None if anchor is None else str(anchor.get("observation_id") or ""),
+        )
+        if value
+    ]
+    visible, supported = _view_relation_flags(view)
+    if visible is True and supported is True:
+        record_state = _write_relation(
+            ctx, state, instance, relation,
+            verdict=RELATION_SUPPORTS,
+            source=RELATION_SOURCE_CO_VISIBLE,
+            reason="anchor_visible_and_relation_supported",
+            confidence=max(RELATION_MIN_CONFIDENCE, _as_float((view or {}).get("confidence"), 0.7) or 0.7),
+            anchor_position=anchor_position,
+            anchor_candidate=anchor_candidate,
+            anchor_category=anchor_category,
+            evidence_ids=evidence_ids,
+            distance_m=distance,
+        )
+        public = _relation_public(record_state, _relation_freshness(ctx, record_state))
+        public["current_frame_state"] = RELATION_SUPPORTS
+        return public
+    if visible is True and supported is False:
+        record_state = _write_relation(
+            ctx, state, instance, relation,
+            verdict=RELATION_CONTRADICTS,
+            source=RELATION_SOURCE_CO_VISIBLE,
+            reason="anchor_visible_but_relation_unsupported",
+            confidence=max(RELATION_MIN_CONFIDENCE, _as_float((view or {}).get("confidence"), 0.7) or 0.7),
+            anchor_position=anchor_position,
+            anchor_candidate=anchor_candidate,
+            anchor_category=anchor_category,
+            evidence_ids=evidence_ids,
+            distance_m=distance,
+        )
+        public = _relation_public(record_state, _relation_freshness(ctx, record_state))
+        public["current_frame_state"] = RELATION_CONTRADICTS
+        return public
+    if anchor_ray_only:
+        # a bearing cannot place the relatum: unknown, with the parallax that
+        # would turn the two sightings into a measured anchor position
+        requirement = _anchor_parallax_requirement(relation, matched_anchors)
+        record_state = _write_relation(
+            ctx, state, instance, relation,
+            verdict=RELATION_UNKNOWN,
+            source=RELATION_SOURCE_CROSS_FRAME,
+            reason="anchor_ray_only",
+            confidence=0.2,
+            anchor_candidate=anchor_candidate,
+            anchor_category=anchor_category,
+            evidence_ids=evidence_ids,
+            distance_m=None,
+        )
+        record_state["anchor_ray_only"] = True
+        record_state["parallax"] = requirement
+        public = _relation_public(record_state, _relation_freshness(ctx, record_state))
+        public["current_frame_state"] = RELATION_UNKNOWN
+        public["anchor_ray_only"] = True
+        public["parallax"] = requirement
+        return public
+    if anchor_position is not None and distance is not None:
+        anchor_trusted = bool(anchor.get("trusted", True)) if anchor else False
+        if distance > limit:
+            if not anchor_trusted:
+                # an estimated anchor position cannot prove the candidate wrong:
+                # this is unknown, not negative (the confirmation view can still
+                # establish the relation by seeing both objects)
+                record_state = _write_relation(
+                    ctx, state, instance, relation,
+                    verdict=RELATION_UNKNOWN,
+                    source=RELATION_SOURCE_CROSS_FRAME,
+                    reason="anchor_distance_uncertain",
+                    confidence=0.3,
+                    anchor_position=anchor_position,
+                    anchor_candidate=anchor_candidate,
+                    anchor_category=anchor_category,
+                    evidence_ids=evidence_ids,
+                    distance_m=distance,
+                )
+                public = _relation_public(record_state, _relation_freshness(ctx, record_state))
+                public["current_frame_state"] = RELATION_UNKNOWN
+                return public
+            record_state = _write_relation(
+                ctx, state, instance, relation,
+                verdict=RELATION_CONTRADICTS,
+                source=RELATION_SOURCE_CROSS_FRAME,
+                reason="anchor_distance",
+                confidence=0.8,
+                anchor_position=anchor_position,
+                anchor_candidate=anchor_candidate,
+                anchor_category=anchor_category,
+                evidence_ids=evidence_ids,
+                distance_m=distance,
+            )
+            public = _relation_public(record_state, _relation_freshness(ctx, record_state))
+            public["current_frame_state"] = (
+                RELATION_UNKNOWN if visible is not True else RELATION_CONTRADICTS
+            )
+            return public
+        record_state = _write_relation(
+            ctx, state, instance, relation,
+            verdict=RELATION_SUPPORTS,
+            source=RELATION_SOURCE_CROSS_FRAME,
+            reason="candidate_inside_anchor_bound",
+            confidence=0.7 if anchor_trusted else 0.5,
+            anchor_position=anchor_position,
+            anchor_candidate=anchor_candidate,
+            anchor_category=anchor_category,
+            evidence_ids=evidence_ids,
+            distance_m=distance,
+        )
+        public = _relation_public(record_state, _relation_freshness(ctx, record_state))
+        public["current_frame_state"] = RELATION_UNKNOWN
+        return public
+    if isinstance(visibility, Mapping):
+        if visibility.get("visible") is True:
+            visibility_source = str(visibility.get("source") or "geometry")
+            record_state = _write_relation(
+                ctx, state, instance, relation,
+                verdict=RELATION_SUPPORTS,
+                source=(
+                    RELATION_SOURCE_MODEL
+                    if visibility_source == "model"
+                    else RELATION_SOURCE_CO_VISIBLE
+                ),
+                reason=str(visibility_source),
+                confidence=0.6,
+                anchor_position=anchor_position,
+                anchor_candidate=anchor_candidate,
+                anchor_category=anchor_category,
+                evidence_ids=evidence_ids,
+                distance_m=distance,
+            )
+            public = _relation_public(record_state, _relation_freshness(ctx, record_state))
+            public["current_frame_state"] = RELATION_SUPPORTS
+            return public
+    stored_relation = state["relations"].get(
+        _relation_key(str(instance.get("id") or ""), relation)
+    )
+    if isinstance(stored_relation, dict):
+        freshness = _relation_freshness(ctx, stored_relation)
+        public = _relation_public(stored_relation, freshness)
+        if public["state"] == RELATION_SUPPORTS and not public.get("reason"):
+            public["reason"] = "cross_frame_relation"
+        return public
+    record_state = _write_relation(
+        ctx, state, instance, relation,
+        verdict=RELATION_UNKNOWN,
+        source=RELATION_SOURCE_NONE,
+        reason=(
+            "anchor_not_in_frame"
+            if visible is False or (isinstance(visibility, Mapping) and visibility.get("visible") is False)
+            else "anchor_not_established"
+        ),
+        confidence=0.0,
+        anchor_position=anchor_position,
+        anchor_candidate=anchor_candidate,
+        anchor_category=anchor_category,
+        evidence_ids=evidence_ids,
+        distance_m=distance,
+    )
+    return _relation_public(record_state, _relation_freshness(ctx, record_state))
+
+
+def relation_state_summary(ctx: ToolContext) -> dict:
+    """Compact, model-facing snapshot of the relation chain (JSON-plain)."""
+    state = _extra(ctx).get(RELATION_CHAIN_KEY)
+    if not isinstance(state, dict):
+        return {"enabled": relation_chain_enabled(ctx), "n_instances": 0, "relations": []}
+    relations = []
+    for record in state.get("relations", {}).values():
+        if isinstance(record, dict):
+            relations.append(_relation_public(record, _relation_freshness(ctx, record)))
+    instances = []
+    for instance in state.get("instances", {}).values():
+        if not isinstance(instance, dict):
+            continue
+        instances.append({
+            "id": instance.get("id"),
+            "status": instance.get("status"),
+            "rank": instance.get("rank"),
+            "candidates": list(instance.get("candidate_ids") or []),
+            "position_flu": instance.get("position_flu"),
+            "sigma_m": instance.get("sigma_m"),
+            "support": instance.get("support"),
+        })
+    observations = list(state.get("observations") or [])
+    return {
+        "enabled": relation_chain_enabled(ctx),
+        "n_instances": len(instances),
+        "instances": instances[-8:],
+        "relations": relations[-8:],
+        "competitors": {
+            key: list(value)
+            for key, value in (state.get("competitors") or {}).items()
+            if isinstance(value, list)
+        },
+        "unknown_counts": {
+            str(name): int(count)
+            for name, count in (state.get("counts") or {}).items()
+            if count
+        },
+        "observation_decisions": {
+            "n": len(observations),
+            "changed": sum(1 for entry in observations if entry.get("changed")),
+        },
+    }
+
+
+def typed_uncertainties(
+    ctx: ToolContext,
+    *,
+    candidate_ids: list[str] | None = None,
+    instruction: str = "",
+    relation: Mapping | None = None,
+    view: Mapping | None = None,
+    path_blocked: bool = False,
+) -> list[dict]:
+    """The five uncertainty types that apply right now, each with its detail.
+
+    ``category`` / ``instance`` / ``distance`` / ``anchor_relation`` /
+    ``reachability`` - the same vocabulary the observation planner maps to
+    evidence actions. Nothing here is a search fallback: a missing anchor maps
+    to an anchor observation, a lost path to a viewpoint change.
+    """
+    state = relation_state(ctx) if relation_chain_enabled(ctx) else {}
+    store = _candidate_store(ctx)
+    ids = [
+        str(value)
+        for value in (candidate_ids or [])
+        if str(value) and str(value) in store
+    ]
+    candidates = [store[value] for value in ids if isinstance(store.get(value), Mapping)]
+    uncertainties: list[dict] = []
+    if relation is None and instruction:
+        relation = _relation_anchor(instruction)
+    target_phrase = _target_phrase(instruction) if instruction else ""
+    if instruction and not _anchor_category(target_phrase):
+        uncertainties.append({
+            "type": UNCERTAINTY_CATEGORY,
+            "detail": "the instruction's object category is not one the parser knows",
+            "target": target_phrase,
+        })
+    competitors = []
+    for candidate in candidates:
+        instance = state.get("instances", {}).get(
+            str(candidate.get("instance_hypothesis") or "")
+        ) if state else None
+        if isinstance(instance, Mapping) and instance.get("competing"):
+            key = str(instance.get("target_key") or "")
+            competitors = list((state.get("competitors") or {}).get(key) or [])
+    if len(competitors) >= 2:
+        uncertainties.append({
+            "type": UNCERTAINTY_INSTANCE,
+            "detail": f"{len(competitors)} competing hypotheses",
+            "hypotheses": competitors[:RELATION_MAX_COMPETING],
+        })
+    for candidate in candidates:
+        if _instance_point(candidate.get("position_flu")) is None or candidate.get(
+            "distance_uncertain"
+        ):
+            uncertainties.append({
+                "type": UNCERTAINTY_DISTANCE,
+                "detail": "the candidate has no trusted range",
+                "candidate_id": candidate.get("id"),
+                "distance_source": candidate.get("distance_source"),
+            })
+            break
+    if relation is not None:
+        evidence = None
+        for candidate in candidates:
+            evidence = relation_evidence_for_candidate(
+                ctx, candidate, instruction, relation, view=view,
+            )
+            if isinstance(evidence, Mapping):
+                break
+        if not isinstance(evidence, Mapping) or evidence.get("state") != RELATION_SUPPORTS:
+            uncertainties.append({
+                "type": UNCERTAINTY_ANCHOR_RELATION,
+                "detail": "the relation anchor is not established or its evidence is stale",
+                "anchor": str(relation.get("anchor") or ""),
+                "relation": str(relation.get("relation") or ""),
+                "evidence_state": (
+                    None if not isinstance(evidence, Mapping) else evidence.get("state")
+                ),
+                "reason": None if not isinstance(evidence, Mapping) else evidence.get("reason"),
+            })
+    if path_blocked:
+        uncertainties.append({
+            "type": UNCERTAINTY_REACHABILITY,
+            "detail": "the route to the candidate is blocked",
+        })
+    return uncertainties
+
+
+def _anchor_ground_instruction(relation: Mapping) -> str:
+    return f"找到并定位{str(relation.get('anchor') or '').strip()}"
+
+
+def _observation_action(
+    tool: str,
+    args: dict,
+    why: str,
+    *,
+    uncertainty: str,
+    expected_excluded: float,
+    cost_s: float,
+    **detail: Any,
+) -> dict:
+    cost = max(0.5, float(cost_s))
+    return {
+        "tool": tool,
+        "args": dict(args),
+        "why": why,
+        "uncertainty": uncertainty,
+        "expected_excluded": round(float(expected_excluded), 3),
+        "cost_s": round(cost, 3),
+        "score": round(float(expected_excluded) / cost, 4),
+        **detail,
+    }
+
+
+def rank_observation_actions(
+    uncertainties: list[dict] | list[str],
+    *,
+    candidate_ids: list[str] | None = None,
+    competitor_ids: list[str] | None = None,
+    instruction: str = "",
+    relation: Mapping | None = None,
+    candidate_position: tuple[float, float, float] | None = None,
+    current_position: tuple[float, float, float] | None = None,
+) -> list[dict]:
+    """Rank supplementary observations by excluded hypotheses per second.
+
+    The planner is deliberately simple and untrained: each uncertainty type has
+    one evidence action, the action's expected exclusion count is divided by its
+    (movement time + inference cost), and the best action is the one to try.
+    ``instance`` compares the competing candidates (no flight); ``distance``
+    re-grounds from a new view (a second bearing); ``anchor_relation`` finds or
+    re-locates the anchor; ``reachability`` proposes another viewpoint - none of
+    them fall back to a generic re-search.
+    """
+    actions: list[dict] = []
+    ids = [str(value) for value in (candidate_ids or []) if str(value)]
+    competitors = [str(value) for value in (competitor_ids or []) if str(value)]
+    relation = relation if isinstance(relation, Mapping) else _relation_anchor(instruction)
+    move_s = 1.0
+    if candidate_position is not None and current_position is not None:
+        try:
+            move_s = math.dist(
+                [float(value) for value in candidate_position[:3]],
+                [float(value) for value in current_position[:3]],
+            ) / 1.0
+        except (TypeError, ValueError):
+            move_s = 1.0
+    search = {
+        UNCERTAINTY_CATEGORY: (
+            _observation_action(
+                "observe",
+                {"mode": "lookaround", "n_views": 4, "spread_deg": 180.0},
+                "the object category itself is unresolved: a wider look plus a "
+                "new grounding is what distinguishes 'not this kind' from 'not here'",
+                uncertainty=UNCERTAINTY_CATEGORY,
+                expected_excluded=1.0,
+                cost_s=2.0,
+            )
+        ),
+        UNCERTAINTY_INSTANCE: (
+            _observation_action(
+                "compare_candidates",
+                {"candidates_a": [competitors[0]], "candidates_b": [competitors[1]]},
+                "two candidate instances match the description: compare them "
+                "directly before flying to either",
+                uncertainty=UNCERTAINTY_INSTANCE,
+                expected_excluded=max(1, len(competitors) - 1),
+                cost_s=0.5,
+                hypotheses=competitors[:RELATION_MAX_COMPETING],
+            )
+            if len(competitors) >= 2
+            else None
+        ),
+        UNCERTAINTY_DISTANCE: (
+            _observation_action(
+                "ground_target",
+                {"instruction": instruction or "<the instructed target>"},
+                "the range is the open question: a second bearing from a new "
+                "view triangulates it (the same frame cannot)",
+                uncertainty=UNCERTAINTY_DISTANCE,
+                expected_excluded=1.0,
+                cost_s=2.0 + move_s,
+            )
+        ),
+        UNCERTAINTY_ANCHOR_RELATION: (
+            _observation_action(
+                "ground_target",
+                {"instruction": _anchor_ground_instruction(relation) if relation else "<the anchor>"},
+                "the anchor is not established: find and locate the anchor "
+                "object itself, then the original target resumes with its "
+                "candidates and budget intact",
+                uncertainty=UNCERTAINTY_ANCHOR_RELATION,
+                expected_excluded=3.0,
+                cost_s=3.0 + move_s,
+                temporary_subtask=True,
+            )
+        ),
+        UNCERTAINTY_REACHABILITY: (
+            _observation_action(
+                "propose_viewpoints",
+                {"count": 3, **({"target_hypothesis": candidate_position}
+                                if candidate_position is not None else {})},
+                "the path is blocked, not the identity: propose another "
+                "viewpoint that still holds the candidate",
+                uncertainty=UNCERTAINTY_REACHABILITY,
+                expected_excluded=1.0,
+                cost_s=2.5,
+            )
+        ),
+    }
+    for item in uncertainties:
+        name = str(item.get("type") if isinstance(item, Mapping) else item)
+        action = search.get(name)
+        if not isinstance(action, Mapping):
+            continue
+        action = dict(action)
+        detail = item if isinstance(item, Mapping) else {}
+        if detail:
+            action["detail"] = {
+                key: value for key, value in detail.items() if key != "type"
+            }
+        actions.append(action)
+    actions.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    return actions
+
+
+def record_observation_decision(
+    ctx: ToolContext,
+    *,
+    uncertainty: str,
+    action: Mapping | None,
+    tried_to_distinguish: str,
+    before: Any,
+    after: Any,
+    changed: bool,
+    note: str = "",
+) -> dict:
+    """Journal one supplementary observation: what it tried to separate, result.
+
+    The claim is the point of the milestone: every extra look must name the
+    hypothesis pair it was meant to distinguish and whether the judgement moved.
+    """
+    state = relation_state(ctx)
+    entry = {
+        "seq": len(state.get("observations") or []) + 1,
+        "at": _relation_now(ctx),
+        "uncertainty": str(uncertainty or ""),
+        "action": (
+            None if not isinstance(action, Mapping)
+            else {"tool": action.get("tool"), "args": dict(action.get("args") or {})}
+        ),
+        "tried_to_distinguish": str(tried_to_distinguish or "")[:200],
+        "before": _json_plain(before),
+        "after": _json_plain(after),
+        "changed": bool(changed),
+        "note": str(note or "")[:200],
+    }
+    state.setdefault("observations", []).append(entry)
+    del state["observations"][:-MAX_RELATION_OBSERVATIONS]
+    name = str(uncertainty or "")
+    counts = state.setdefault("counts", {})
+    if name in counts:
+        counts[name] = int(counts.get(name) or 0) + 1
+    return entry
+
+
+def _json_plain(value: Any) -> Any:
+    """Small JSON-safe copy of a verdict for the decision journal."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Mapping):
+        return {str(key): _json_plain(item) for key, item in list(value.items())[:12]}
+    if isinstance(value, (list, tuple)):
+        return [_json_plain(item) for item in list(value)[:12]]
+    return str(value)[:200]
+
+
+def competing_candidates(ctx: ToolContext, candidate: Mapping) -> list[str]:
+    """Candidate ids of the other active hypotheses of the same target."""
+    state = _extra(ctx).get(RELATION_CHAIN_KEY)
+    if not isinstance(state, dict):
+        return []
+    instance = state.get("instances", {}).get(
+        str(candidate.get("instance_hypothesis") or "")
+    )
+    if not isinstance(instance, Mapping):
+        return []
+    target_key = str(instance.get("target_key") or "")
+    out: list[str] = []
+    for instance_id in (state.get("competitors") or {}).get(target_key) or []:
+        other = state.get("instances", {}).get(str(instance_id))
+        if not isinstance(other, Mapping) or other.get("id") == instance.get("id"):
+            continue
+        for candidate_id in other.get("candidate_ids") or []:
+            text = str(candidate_id or "")
+            if text and text not in out:
+                out.append(text)
+    return out[:RELATION_MAX_COMPETING]
+
+
+def relation_observation_plan(
+    ctx: ToolContext,
+    instruction: str,
+    *,
+    candidate_ids: list[str] | None = None,
+    relation: Mapping | None = None,
+    path_blocked: bool = False,
+) -> dict:
+    """Typed uncertainties + ranked supplementary observations for a tool result."""
+    if not relation_chain_enabled(ctx):
+        return {"enabled": False, "uncertainties": [], "actions": []}
+    if relation is None:
+        relation = _relation_anchor(instruction)
+    candidates = [
+        _candidate_store(ctx).get(str(value)) for value in (candidate_ids or [])
+    ]
+    candidates = [item for item in candidates if isinstance(item, Mapping)]
+    competitor_ids: list[str] = []
+    for candidate in candidates:
+        for candidate_id in competing_candidates(ctx, candidate):
+            if candidate_id not in competitor_ids:
+                competitor_ids.append(candidate_id)
+    uncertainties = typed_uncertainties(
+        ctx,
+        candidate_ids=[
+            str(candidate.get("id") or "") for candidate in candidates if candidate.get("id")
+        ],
+        instruction=instruction,
+        relation=relation,
+        path_blocked=path_blocked,
+    )
+    position = None
+    for candidate in candidates:
+        position = _instance_point(candidate.get("position_flu"))
+        if position is not None:
+            break
+    actions = rank_observation_actions(
+        uncertainties,
+        candidate_ids=[
+            str(candidate.get("id") or "") for candidate in candidates if candidate.get("id")
+        ],
+        competitor_ids=competitor_ids,
+        instruction=instruction,
+        relation=relation,
+        candidate_position=position,
+        current_position=_current_position(ctx.world),
+    )
+    return {
+        "enabled": True,
+        "uncertainties": uncertainties,
+        "actions": actions,
+        "next_action": actions[0] if actions else None,
+    }
+
+
+def mark_candidate_rejected(
+    ctx: ToolContext,
+    candidate_id: str,
+    reason: str = "",
+) -> dict:
+    """Mark the instance a rejected candidate belonged to and switch hypothesis.
+
+    The explored place, the other candidates of the rejected instance and the
+    completed plan steps stay: only the hypothesis is closed, and the best
+    remaining competitor becomes the one to observe next.
+    """
+    state = _extra(ctx).get(RELATION_CHAIN_KEY)
+    if not isinstance(state, dict):
+        return {}
+    candidate_id = str(candidate_id or "")
+    rejected = None
+    for instance in state.get("instances", {}).values():
+        if candidate_id in (instance.get("candidate_ids") or []):
+            rejected = instance
+            break
+    if rejected is None:
+        return {"rejected": candidate_id, "switched_to": None}
+    rejected["status"] = "rejected"
+    rejected["rank"] = None
+    rejected["rejection_reason"] = str(reason or "")[:160]
+    target_key = str(rejected.get("target_key") or "")
+    remaining = [
+        instance
+        for instance in state.get("instances", {}).values()
+        if instance.get("target_key") == target_key
+        and instance.get("status") != "rejected"
+        and instance.get("id") != rejected.get("id")
+    ]
+    remaining.sort(
+        key=lambda item: (
+            float(item.get("confidence") or 0.0),
+            int(item.get("support") or 0),
+        ),
+        reverse=True,
+    )
+    switched = None if not remaining else remaining[0]
+    if switched is not None:
+        switched["rank"] = 1
+        switched["status"] = "hypothesis"
+        state.setdefault("switched", []).append(
+            {
+                "from": rejected.get("id"),
+                "to": switched.get("id"),
+                "at": _relation_now(ctx),
+                "reason": str(reason or "")[:160],
+            }
+        )
+        del state["switched"][:-12]
+    if switched is not None:
+        ordered = [switched] + [
+            instance for instance in remaining if instance is not switched
+        ][: RELATION_MAX_COMPETING - 1]
+    else:
+        ordered = []
+    state["competitors"][target_key] = [
+        str(instance.get("id")) for instance in ordered if instance is not None
+    ]
+    return {
+        "rejected": str(rejected.get("id") or ""),
+        "rejected_candidates": list(rejected.get("candidate_ids") or []),
+        "switched_to": None if switched is None else str(switched.get("id") or ""),
+        "switched_candidates": [] if switched is None else list(switched.get("candidate_ids") or []),
+        "remaining": len(remaining),
+        "reason": str(reason or "")[:160],
+    }
 
 
 def _same_instance(first: Mapping, second: Mapping) -> bool:
@@ -4842,6 +6378,12 @@ def _instance_consistency(
     anchors = _known_anchors(ctx, subtask_key)
     relation = _relation_anchor(instruction)
     matched_anchors = _matching_anchors(anchors, relation)
+    chain_enabled = relation_chain_enabled(ctx)
+    instance_summary = (
+        update_instance_hypotheses(ctx, record, instruction, candidates)
+        if chain_enabled and candidates else {"enabled": False, "n_instances": 0}
+    )
+    relation_unknowns: dict[str, int] = {}
     reasons: dict[str, int] = {}
     model_match = {"true": 0, "false": 0, "missing": 0}
     for candidate in candidates:
@@ -4886,19 +6428,46 @@ def _instance_consistency(
             visibility_anchor = None
             if matched_anchors:
                 point = _instance_point(candidate.get("position_flu"))
+                located = [
+                    anchor for anchor in matched_anchors
+                    if _instance_point(anchor.get("position")) is not None
+                ]
+                pool = located or matched_anchors
                 visibility_anchor = (
-                    min(
-                        matched_anchors,
-                        key=lambda item: math.dist(point, item["position"]),
-                    )
-                    if point is not None
-                    else matched_anchors[0]
+                    min(pool, key=lambda item: math.dist(point, item["position"]))
+                    if point is not None and located
+                    else pool[0]
                 )
             visibility = _anchor_visibility(
                 ctx, record, candidate, visibility_anchor
             )
             candidate["instance_anchor_visibility"] = visibility
-            if visibility["visible"] is not True:
+            if chain_enabled:
+                evidence = relation_evidence_for_candidate(
+                    ctx, candidate, instruction, relation,
+                    record=record, visibility=visibility,
+                    anchors=anchors, matched_anchors=matched_anchors,
+                )
+                if isinstance(evidence, Mapping):
+                    candidate["relation_evidence"] = evidence
+                    if evidence.get("state") == RELATION_CONTRADICTS:
+                        # explicit opposite evidence (seen anchor without the
+                        # relation, or a measured distance outside the bound)
+                        found.append(
+                            "relation_conflict:"
+                            + str(evidence.get("reason") or "contradicted")
+                        )
+                    elif evidence.get("state") == RELATION_UNKNOWN:
+                        # not seeing the anchor is *unknown*, not negative: keep
+                        # the candidate and name the observation that settles it
+                        reason = str(evidence.get("reason") or "anchor_not_in_frame")
+                        candidate["relation_unknown"] = {
+                            "reason": reason,
+                            "anchor": evidence.get("anchor"),
+                            "evidence": evidence,
+                        }
+                        relation_unknowns[reason] = relation_unknowns.get(reason, 0) + 1
+            elif visibility["visible"] is not True:
                 # no model answer and no projection that places the anchor in
                 # this frame: the relation is unverified, not approved
                 found.append("anchor_not_visible")
@@ -4942,11 +6511,22 @@ def _instance_consistency(
     for rank, candidate in enumerate(survivors, 1):
         candidate["instance_rank"] = rank
     if len(survivors) >= 2 and not _same_instance(survivors[0], survivors[1]):
-        for candidate in survivors[1:]:
-            candidate["instance_suspect"] = True
-            candidate["instance_suspect_reason"] = "not_best_match"
-            candidate["instance_rank"] = None
-            reasons["not_best_match"] = reasons.get("not_best_match", 0) + 1
+        if chain_enabled:
+            # competing hypotheses stay inspectable: a small set of alternatives
+            # is what makes a confirmation's rejection switch to the next
+            # candidate instead of re-searching from scratch. Only the rank
+            # marks the preference; the instance gate does not condemn them.
+            for candidate in survivors:
+                candidate["competing_hypothesis"] = True
+        else:
+            for candidate in survivors[1:]:
+                candidate["instance_suspect"] = True
+                candidate["instance_suspect_reason"] = "not_best_match"
+                candidate["instance_rank"] = None
+                reasons["not_best_match"] = reasons.get("not_best_match", 0) + 1
+    temporary_anchor = None
+    if chain_enabled and relation is not None and relation_unknowns and not matched_anchors:
+        temporary_anchor = _ensure_anchor_subtask(ctx, relation)
     return {
         "filter": "instance_consistency",
         "n_candidates": len(candidates),
@@ -4964,7 +6544,30 @@ def _instance_consistency(
         "anchors": [anchor["id"] for anchor in anchors],
         "anchor_relation": relation,
         "anchor_candidates": [anchor["id"] for anchor in matched_anchors],
+        "relation_chain": (
+            {
+                "enabled": True,
+                "instances": instance_summary,
+                "unknown": relation_unknowns,
+                "temporary_anchor_subtask": temporary_anchor,
+            }
+            if chain_enabled else {"enabled": False}
+        ),
     }
+
+
+def _ensure_anchor_subtask(ctx: ToolContext, relation: Mapping) -> dict:
+    """Create the dependent "find and locate the anchor" sub-task (best effort).
+
+    Imported lazily so the perception module stays independent of the plan
+    module; a context without a plan simply reports ``no_plan``.
+    """
+    try:
+        from .tool_impl_task import ensure_anchor_subtask
+
+        return ensure_anchor_subtask(ctx, relation=relation)
+    except Exception as exc:  # noqa: BLE001 - the anchor task is advisory
+        return {"created": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
 # --------------------------------------------------------------------------
@@ -6075,6 +7678,40 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
         "instance_filter": instance_filter,
         "detector": detector_result,
     }
+    if relation_chain_enabled(ctx):
+        chain_plan = relation_observation_plan(
+            ctx, instruction,
+            candidate_ids=[str(item.get("id") or "") for item in candidates],
+            relation=relation,
+        )
+        data["relation_chain"] = relation_state_summary(ctx)
+        data["observation_plan"] = chain_plan
+        anchor_task = (
+            instance_filter.get("relation_chain", {}).get("temporary_anchor_subtask")
+            if isinstance(instance_filter.get("relation_chain"), Mapping)
+            else None
+        )
+        if isinstance(anchor_task, Mapping) and anchor_task.get("created"):
+            data["temporary_anchor_subtask"] = dict(anchor_task)
+            data["observation_decision"] = record_observation_decision(
+                ctx,
+                uncertainty=UNCERTAINTY_ANCHOR_RELATION,
+                action=chain_plan.get("next_action"),
+                tried_to_distinguish=(
+                    "whether the relation anchor exists/located vs only its "
+                    "phrase in the instruction"
+                ),
+                before={"anchor_established": False},
+                after={
+                    "anchor_established": False,
+                    "anchor_subtask": anchor_task.get("anchor_subtask"),
+                },
+                changed=True,
+                note="dependent anchor sub-task created; target candidates and "
+                     "budget preserved",
+            )
+        if isinstance(chain_plan.get("next_action"), Mapping):
+            data.setdefault("next_action", dict(chain_plan["next_action"]))
     suspect_ids = [
         str(item.get("id")) for item in candidates if item.get("instance_suspect")
     ]

@@ -65,6 +65,12 @@ continuation is only followed after a productive turn (the reported
 self-repeating ``search_target`` loop).
 ``subtask_executor=False``, ``plan_resume=False`` and
 ``executor_auto_steps=False`` are the P4 ablation switches.
+``relation_chain`` (constructor; ``VLM_NAV_RELATION_CHAIN=on|off`` when it is
+not passed) publishes ``ctx.extra["relation_chain"]``: on, the perception and
+confirmation tools maintain instance/relation state instead of requiring the
+relation anchor in the current frame, and the STATE block's identity/open-
+question lines carry the typed relation verdicts. Off keeps the co-visibility
+gate of every earlier experiment.
 
 Model side (both paths share the same tools, context and ``EpisodeLog``):
 - ``vlm.decide_with_tools(frames, system_prompt, user_prompt, tools_text,
@@ -138,6 +144,7 @@ import hashlib
 import inspect
 import json
 import math
+import os
 from pathlib import Path
 import re
 import threading
@@ -1228,6 +1235,18 @@ class EpisodeLog:
         return "\n".join(lines)
 
 
+def relation_chain_default() -> bool:
+    """The relation-chain switch for a runtime built without an explicit one.
+
+    Off by default keeps every existing experiment and unit test on the
+    co-visibility gate; ``VLM_NAV_RELATION_CHAIN=on`` enables the maintained
+    object/relation state (the relation-chain arm). The runtime publishes the
+    resolved switch into ``ctx.extra["relation_chain"]`` for the tools.
+    """
+    value = os.environ.get("VLM_NAV_RELATION_CHAIN", "off")
+    return str(value or "").strip().lower() in ("on", "true", "1", "yes")
+
+
 class AgentRuntime:
     """Tool-calling episode loop over a world, a tool registry and a VLM.
 
@@ -1291,6 +1310,7 @@ class AgentRuntime:
         plan_resume: bool = True,
         plan_mode: str = PLAN_MODE_GIVEN,
         plan_max_new_tokens: int = PLAN_MAX_NEW_TOKENS,
+        relation_chain: bool | None = None,
         executor_auto_steps: bool = True,
         max_executor_auto_steps: int = MAX_EXECUTOR_AUTO_STEPS,
         max_memory_items: int = 4,
@@ -1345,6 +1365,11 @@ class AgentRuntime:
         mode = str(plan_mode or PLAN_MODE_GIVEN).strip().lower()
         self.plan_mode = mode if mode in PLAN_MODES else PLAN_MODE_GIVEN
         self.plan_max_new_tokens = max(1, int(plan_max_new_tokens))
+        #: relation-chain switch: maintained instance/relation state instead of
+        #: the current-frame co-visibility gate (env default, explicit wins)
+        self.relation_chain = (
+            relation_chain_default() if relation_chain is None else bool(relation_chain)
+        )
         self.executor_auto_steps = bool(executor_auto_steps)
         self.max_executor_auto_steps = max(0, int(max_executor_auto_steps))
         #: What the last system prompt held (read by the runner's summary).
@@ -1495,6 +1520,7 @@ class AgentRuntime:
             ctx.extra = {}
         ctx.extra["instruction"] = self.instruction
         ctx.extra["runtime"] = self
+        ctx.extra.setdefault("relation_chain", bool(self.relation_chain))
         ctx.extra.setdefault("images", {})
         ctx.extra.setdefault("events", [])
         self._begin_observation_store(ctx, episode_id)
@@ -2730,6 +2756,46 @@ class AgentRuntime:
             return _truncate(steps[current - 1], MAX_STATE_CHARS)
         return "n/a"
 
+    def _relation_state_text(self) -> str:
+        """A compact typed relation line for the STATE block ("" when absent).
+
+        Only the agent's own maintained state is rendered: how many hypotheses
+        exist for the target, and the verdict of each relation (supports /
+        contradicts / unknown + source). A relation that left the frame is shown
+        as ``unknown``, never as a negative - which is the decision the model
+        has to see to stop re-searching for an object it already located.
+        """
+        extra = self._ctx_extra()
+        if not isinstance(extra.get("relation_chain.state"), dict):
+            return ""
+        try:
+            from .tool_impl_perception import relation_state_summary
+
+            summary = relation_state_summary(self.ctx)
+        except Exception:  # noqa: BLE001 - the state line is advisory
+            return ""
+        parts: list[str] = []
+        for relation in (summary.get("relations") or [])[:2]:
+            if not isinstance(relation, dict):
+                continue
+            detail = (
+                f"rel={relation.get('anchor')}[{relation.get('state')}"
+                f"/{relation.get('source')}]"
+            )
+            if relation.get("reason"):
+                detail += f" ({relation['reason']})"
+            parts.append(detail)
+        instances = summary.get("instances") or []
+        if len(instances) > 1:
+            parts.append(f"{len(instances)} instance hypotheses")
+        observations = summary.get("observation_decisions") or {}
+        if observations.get("n"):
+            parts.append(
+                f"{observations['n']} observation decisions "
+                f"({observations.get('changed', 0)} changed judgement)"
+            )
+        return _truncate(" | ".join(parts), MAX_STATE_CHARS) if parts else ""
+
     def _identity_anchor_text(self) -> str:
         """The confirmed instance and its relation anchor, before anything else.
 
@@ -2739,10 +2805,11 @@ class AgentRuntime:
         delayed revisit has to re-identify the instance before it can move.
         Only the agent's own records are read - no scene truth.
         """
+        relation_line = self._relation_state_text()
         memory = getattr(self.ctx, "memory", None)
         identities = getattr(memory, "identities", None) if memory is not None else None
         if identities is None:
-            return "n/a"
+            return relation_line or "n/a"
         parts: list[str] = []
         try:
             entries = identities.all(limit=3)
@@ -2771,6 +2838,8 @@ class AgentRuntime:
         for anchor in anchors:
             if anchor and not any(anchor in part for part in parts):
                 parts.append(f"anchor={anchor}")
+        if relation_line and not any("rel=" in part for part in parts):
+            parts.append(relation_line)
         if not parts:
             return "n/a"
         return _truncate(" | ".join(parts), MAX_STATE_CHARS)
@@ -2807,6 +2876,8 @@ class AgentRuntime:
         declared = self._ctx_extra().get("open_questions")
         if declared:
             return _truncate(str(declared), MAX_STATE_CHARS)
+        relation_line = self._relation_state_text()
+        suffix = f" | {relation_line}" if relation_line else ""
         last = self._last_turn_record()
         data = last.data if last is not None and isinstance(last.data, dict) else {}
         fruitless = (
@@ -2819,15 +2890,21 @@ class AgentRuntime:
             where = str(data.get("observation_id") or "the last view")
             return _truncate(
                 f"no candidate matched in {where} yet - that is not evidence of "
-                "absence: which viewpoint or heading still needs a look?",
+                "absence: which viewpoint or heading still needs a look?"
+                + suffix,
                 MAX_STATE_CHARS,
             )
         if not self._has_candidate():
-            return (
+            return _truncate(
                 "no grounded candidate yet (the target may be outside every view "
-                "taken so far)"
+                "taken so far)" + suffix,
+                MAX_STATE_CHARS,
             )
-        return "is the confirmed candidate the instructed one? (verify before finish)"
+        return _truncate(
+            "is the confirmed candidate the instructed one? (verify before finish)"
+            + suffix,
+            MAX_STATE_CHARS,
+        )
 
     def _has_candidate(self) -> bool:
         store = self._ctx_extra().get(CANDIDATE_STORE_KEY)

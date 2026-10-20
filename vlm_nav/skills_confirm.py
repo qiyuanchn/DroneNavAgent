@@ -22,25 +22,34 @@ turns a reached candidate into an *accepted identity*:
    0.0/low-confidence or opposing view blocks acceptance, an undecided
    ``confidence: null`` view neither supports nor vetoes.
 4. **location consistency** - the model names the target object's box on each
-   fresh frame, and *that box* is measured at the frame's own heading and the
-   current position; the observed point is compared with the candidate
-   estimate. The delta is therefore the difference between two independent
-   measurements (grounding vs. the fresh view), not a depth read at the
-   candidate's own projected pixel - that returned the candidate point by
-   construction (holdout v2 accepted all five wrong instances with delta 0.0).
-   No box or no depth means no acceptance: appearance alone keeps the verdict
-   at ``uncertain``. A candidate grounded under an unresolved depth/model
-   distance conflict is refused *before* any view or model call: the range is
-   the open question, not the identity, and the same frame would repeat the
-   same conflict. The refusal names a viewpoint change and a re-grounding; a
-   second confirmation of the same candidate is ``confirm_stalled`` and marks
-   it unusable until re-grounded.
+   fresh frame, and the object's **support contact** inside that box is
+   measured at the frame's own heading and the current position. The measured
+   point is a coherent bottom-edge cluster (or the bottom of a SAM3 mask when a
+   detector is configured), not the box centre: a chair's centre frequently
+   falls on the wall behind it, which produced the v1 2-4.8 m
+   ``position_inconsistent`` false rejections. The centre is only a
+   cross-check. A reading that disagrees with the candidate's range by more
+   than 1.5 m, or two fresh views that measure different surfaces, is
+   ``unknown`` - it never rejects. The delta is therefore the difference
+   between two independent measurements (grounding vs. the fresh view), not a
+   depth read at the candidate's own projected pixel - that returned the
+   candidate point by construction (holdout v2 accepted all five wrong
+   instances with delta 0.0). No box or no depth means no acceptance:
+   appearance alone keeps the verdict at ``uncertain``. A candidate grounded
+   under an unresolved depth/model distance conflict is refused *before* any
+   view or model call: the range is the open question, not the identity, and
+   the same frame would repeat the same conflict. The refusal names a viewpoint
+   change and a re-grounding; a second confirmation of the same candidate is
+   ``confirm_stalled`` and marks it unusable until re-grounded.
 5. **verdict** - ``accepted`` only when at least one view supports, no decided
    view vetoes, *and* the fresh measurement agrees; otherwise ``uncertain``
    (with a directed ``missing``:
-   ``distance`` / ``identity`` / ``relation`` / ``path`` / ``localization``) or
-   ``rejected`` (explicit different-instance evidence, or a position beyond the
-   reject tolerance). A candidate with repeated confirmations but no new
+   ``distance`` / ``identity`` / ``relation`` / ``path`` / ``localization``).
+   A terminal rejection needs both an explicit visual contradiction
+   (different instance / attribute conflict) **and** a position that disagrees
+   with the candidate; a model ``different_instance`` at a matching position is
+   a disputed identity (``uncertain``), and a position-only gap is
+   ``uncertain(distance)``. A candidate with repeated confirmations but no new
    accepted one is stopped with ``blocked(confirm_stalled)`` and a different
    ``next_action`` instead of confirming the same candidate forever.
 
@@ -64,15 +73,31 @@ import numpy as np
 from . import skills_approach
 from .observations import CANDIDATE_STORE_KEY
 from .tool_impl_perception import (
+    INSTANCE_ADJACENT_MAX_M,
+    RELATION_CONTRADICTS,
+    RELATION_SUPPORTS,
+    RELATION_UNKNOWN,
+    UNCERTAINTY_ANCHOR_RELATION,
+    UNCERTAINTY_INSTANCE,
     _as_frame,
     _crop_frame,
     _depth_point,
+    _detector_from_ctx,
     _draw_hint_box,
     _map_box_from_region,
+    _relation_anchor as _instruction_relation,
     _remember_rejected_triangulation,
     _vlm_from_ctx,
+    competing_candidates,
+    mark_candidate_rejected,
     parse_box,
+    rank_observation_actions,
+    record_observation_decision,
+    relation_chain_enabled,
+    relation_evidence_for_candidate,
+    relation_state_summary,
     resolve_observation,
+    typed_uncertainties,
 )
 from .tools import (
     CONFIRMATION_ACCEPTED,
@@ -110,6 +135,24 @@ MAX_TURN_DEG = 80.0
 CONFIRM_POSITION_TOL_M = 1.0
 #: A deviation this large is a different surface, not measurement noise.
 CONFIRM_POSITION_REJECT_M = 2.0
+#: The bottom-edge support contact of the object, sampled at several columns
+#: just above the box bottom. A cluster whose depths agree is one surface; the
+#: same pixels spread over metres are the floor/wall behind the object.
+SUPPORT_CLUSTER_MIN_SAMPLES = 2
+SUPPORT_CLUSTER_SPREAD_M = 0.75
+SUPPORT_CLUSTER_SPREAD_RATIO = 0.35
+#: A box-centre depth this far from the support cluster reads the surface
+#: behind the object, not the object.
+CENTRE_SUPPORT_MAX_GAP_M = 0.75
+#: A measured support point farther than this from the candidate's own range
+#: cannot tell "the candidate is elsewhere" from "this sample is the background
+#: behind it". It is unknown evidence, never a rejection.
+MEASUREMENT_CANDIDATE_MAX_GAP_M = 1.5
+#: Two fresh views whose support points disagree by more than this did not
+#: measure one surface: the position is unknown, not contradicted.
+MULTI_VIEW_DISAGREEMENT_M = 1.0
+#: Minimum IoU between the model's box and a detector mask proposal.
+MASK_BOX_MIN_IOU = 0.25
 #: Slack on the relation between a candidate and the anchor stage's own
 #: recorded place when the sub-task does not declare ``within_m``.
 CONFIRM_ANCHOR_RELATION_M = 3.5
@@ -355,6 +398,9 @@ def _instruction(ctx: ToolContext, args: Mapping) -> str:
 CHINESE_RELATION_WORDS = (
     "旁边", "左侧", "右侧", "左边", "右边", "附近", "前面", "后面",
     "上方", "下方", "之间", "对面",
+    # the bare forms stage goals use ("在卧室窗边找到木椅", "木门旁的柜子").
+    # They are searched longest-first, so "旁边" still wins over "边".
+    "边上", "边", "旁",
 )
 
 
@@ -599,6 +645,7 @@ def _parse_reply(reply: Any) -> dict | None:
         ("same_instance", ("same_instance", "same", "identical", "same_object")),
         ("attributes_match", ("attributes_match", "attrs_match", "attributes")),
         ("relation_supported", ("relation_supported", "relation", "anchor_supported")),
+        ("anchor_visible", ("anchor_visible", "anchor_in_frame", "anchor_seen")),
     )
     parsed: dict[str, Any] = {}
     for name, keys in fields:
@@ -608,6 +655,9 @@ def _parse_reply(reply: Any) -> dict | None:
                 value = payload[key]
                 break
         parsed[name] = _as_flag(value)
+    anchor_in_view = payload.get("anchor_in_view", payload.get("anchor_visibility"))
+    if parsed["anchor_visible"] is None and anchor_in_view is not None:
+        parsed["anchor_visible"] = _as_flag(anchor_in_view)
     confidence = payload.get("confidence", payload.get("score"))
     parsed["confidence"] = _as_float(confidence, None)
     parsed["confidence_state"] = _confidence_state(parsed["confidence"])
@@ -657,8 +707,11 @@ def _ask_view(
             "be judged from the candidate attributes and relation)."
         )
     relation_rule = (
-        "relation_supported is false unless the frame shows both the candidate "
-        f"and '{relation_text}' in that relation. "
+        "relation_supported is false only when the frame shows the anchor object "
+        f"'{relation_text}' AND it is not in that relation to the candidate. If "
+        "the anchor object is not visible in this frame, set anchor_visible=false "
+        "and relation_supported=null: that is unknown for this view, never a "
+        "negative, and the harness combines it with earlier relation evidence. "
         if relation
         else "No relation anchor is named: relation_supported is not part of this check. "
     )
@@ -674,7 +727,13 @@ def _ask_view(
         "Does the fresh view show the instructed target, is it the SAME instance as "
         "the candidate (compare the two images when both are attached), do its "
         "attributes match, and is the relation anchor supported? "
-        f"{relation_rule}Use null for a property this evidence "
+        f"{relation_rule}"
+        + (
+            "Also answer anchor_visible=true/false: whether the anchor object "
+            "itself is visible in this frame. "
+            if relation else ""
+        )
+        + "Use null for a property this evidence "
         "cannot decide. Name the missing property and which other view would "
         "distinguish the hypotheses."
     )
@@ -707,6 +766,7 @@ def _ask_view(
                 "observation_id": view.get("obs_id"),
                 "instruction": instruction,
                 "relation": relation or None,
+                "relation_chain": relation_chain_enabled(ctx),
                 "source_observation_id": source,
                 "source_frame_attached": source_frame is not None,
                 "pose": view.get("pose_flu"),
@@ -891,6 +951,98 @@ def _relation_action(
         "the relation anchor was not visible: look from an angle that holds both "
         "the candidate and the anchor object",
     )
+
+
+def _relation_info(instruction: str, relation: str) -> dict | None:
+    """The typed relation dict the perception layer uses, from the same text.
+
+    The sub-task's own relation phrase wins: the global instruction of a
+    multi-stage task names several relations, and only the current stage's
+    anchor is the one its confirmation has to judge.
+    """
+    phrase = str(relation or "").strip()
+    if phrase:
+        info = _instruction_relation(phrase)
+        if isinstance(info, Mapping):
+            return dict(info)
+    info = _instruction_relation(instruction)
+    if isinstance(info, Mapping):
+        return dict(info)
+    if not phrase:
+        return None
+    return {"anchor": phrase, "relation": "", "limit_m": INSTANCE_ADJACENT_MAX_M}
+
+
+def _anchor_evidence_action(
+    ctx: ToolContext, relation: str, instruction: str,
+    evidence: Mapping | None = None,
+) -> dict:
+    """A directed observation of the anchor itself (never a generic re-search).
+
+    When the relation was never established, "find the anchor" is the missing
+    evidence; the auto-created dependent sub-task is reported in the result so
+    the caller sees the plan switch and the work it preserves. A ray-only
+    anchor (a bearing with no range) carries a parallax requirement: the next
+    bearing has to come from a different pose, or the two rays never meet.
+    """
+    info = _relation_info(instruction, relation)
+    phrase = "" if info is None else str(info.get("anchor") or "")
+    if not phrase:
+        phrase = str(relation or "").strip()
+    action = _next_action(
+        "ground_target",
+        {"instruction": f"找到并定位{phrase}"},
+        "the relation anchor has no evidence yet: locate the anchor object "
+        "itself (a dependent sub-task), then the original target resumes with "
+        "its candidates and budget",
+    )
+    temporary = None
+    anchor_blocked = False
+    try:
+        from .tool_impl_task import ensure_anchor_subtask, plan_subtasks
+
+        temporary = ensure_anchor_subtask(ctx, relation=info)
+        for subtask in plan_subtasks(ctx) or []:
+            if (
+                str(subtask.get("_relation_chain_role") or "") == "anchor"
+                and phrase
+                and phrase in str(subtask.get("_anchor_phrase") or subtask.get("goal") or "")
+                and str(subtask.get("status") or "") in ("blocked", "failed")
+            ):
+                anchor_blocked = True
+    except Exception as exc:  # noqa: BLE001 - the anchor task is advisory
+        temporary = {"created": False, "reason": f"{type(exc).__name__}: {exc}"}
+    if anchor_blocked:
+        # the anchor could not be grounded; do not grind it again - look for a
+        # view that holds both objects, where the relation becomes co-visible
+        action = _next_action(
+            "observe",
+            {"mode": "lookaround", "n_views": 6, "spread_deg": 240.0},
+            "the anchor could not be located by grounding: take a wide view "
+            "that may hold both the candidate and the anchor; a co-visible "
+            "frame establishes the relation without a located anchor",
+        )
+    parallax = (
+        evidence.get("parallax")
+        if isinstance(evidence, Mapping) and isinstance(evidence.get("parallax"), Mapping)
+        else None
+    )
+    if parallax is not None and parallax.get("required"):
+        # one bearing cannot locate the anchor: the next grounding must be
+        # taken from a pose with a real baseline, not only a new heading
+        action["parallax"] = dict(parallax)
+        action["why"] = str(parallax.get("why") or action.get("why") or "")
+        action["sequence"] = [
+            {"tool": "propose_viewpoints", "args": {"count": 2}},
+            {
+                "tool": "ground_target",
+                "args": dict(
+                    (parallax.get("action") or {}).get("args") or {}
+                ),
+            },
+        ]
+    action["temporary_anchor_subtask"] = temporary
+    return action
 
 
 def _path_action(result: Any, candidate_id: str) -> dict:
@@ -1204,21 +1356,177 @@ def _restore_yaw(world: Any, old: float | None) -> None:
             pass
 
 
+def _box_iou_1k(left: Any, right: Any) -> float:
+    """IoU of two normalized 0-1000 boxes (detector proposal vs model box)."""
+    try:
+        ax1, ay1, ax2, ay2 = (float(value) for value in list(left)[:4])
+        bx1, by1, bx2, by2 = (float(value) for value in list(right)[:4])
+    except (TypeError, ValueError):
+        return 0.0
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    intersection = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if intersection <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    union = area_a + area_b - intersection
+    return intersection / union if union > 0.0 else 0.0
+
+
+def _mask_support_pixels(
+    ctx: ToolContext, view_record: Any, box: Any, instruction: str,
+) -> dict | None:
+    """Bottom-edge pixels of the detector mask that matches the model's box.
+
+    SAM3 (when configured) supplies an instance mask on the same frame. The
+    lowest mask pixel of each column is the object's visible support contact -
+    the same point the box-bottom samples approximate, but bounded to the
+    instance silhouette instead of the whole box. ``None`` when no detector,
+    no mask, or no proposal overlaps the box.
+    """
+    detector = _detector_from_ctx(ctx)
+    if detector is None:
+        return None
+    try:
+        if hasattr(detector, "available") and not bool(detector.available()):
+            return None
+        detections = detector.detect(
+            getattr(view_record, "frame", None), str(instruction or ""),
+            context={"purpose": "confirmation_support_point"},
+        )
+    except Exception:  # noqa: BLE001 - a detector is optional evidence
+        return None
+    best: tuple[float, Any, Any] | None = None
+    for detection in detections or []:
+        proposal = getattr(detection, "box", None)
+        mask = getattr(detection, "mask", None)
+        if proposal is None or mask is None:
+            continue
+        iou = _box_iou_1k(box, proposal)
+        if iou < MASK_BOX_MIN_IOU:
+            continue
+        if best is None or iou > best[0]:
+            best = (iou, proposal, mask)
+    if best is None:
+        return None
+    iou, proposal, mask = best
+    try:
+        array = np.asarray(mask)
+    except (TypeError, ValueError):
+        return None
+    if array.ndim != 2 or not array.any():
+        return None
+    height, width = int(array.shape[0]), int(array.shape[1])
+    if width <= 0 or height <= 0:
+        return None
+    mask_xs = np.nonzero(array)[1]
+    x1, x2 = int(mask_xs.min()), int(mask_xs.max())
+    span = max(0, x2 - x1)
+    pixels: list[tuple[str, tuple[float, float]]] = []
+    for index in range(5):
+        column = x1 + int(round((index + 0.5) / 5.0 * span))
+        column = min(width - 1, max(0, column))
+        rows = np.nonzero(array[:, column])[0]
+        if rows.size == 0:
+            continue
+        # stay one pixel inside the silhouette: the border pixel mixes the
+        # object with the surface behind it
+        row = max(0, int(rows.max()) - 1)
+        pixels.append(
+            (
+                f"mask_{index}",
+                (
+                    (column + 0.5) / width * 1000.0,
+                    (row + 0.5) / height * 1000.0,
+                ),
+            )
+        )
+    if len(pixels) < SUPPORT_CLUSTER_MIN_SAMPLES:
+        return None
+    return {
+        "pixels": pixels,
+        "iou": round(float(iou), 3),
+        "box": [round(float(value), 1) for value in list(proposal)[:4]],
+        "mask_area_frac": round(float(array.mean()), 3),
+    }
+
+
+def _coherent_support_cluster(
+    samples: list[dict], names: set[str],
+) -> dict | None:
+    """The largest coherent depth run among the support samples.
+
+    A run of at least two samples whose depths agree within
+    ``SUPPORT_CLUSTER_SPREAD_M`` (and a relative ratio) is one surface. One
+    outlier (a gap between chair legs, the floor behind a leg) is dropped, not
+    averaged into the measurement.
+    """
+    usable = [
+        sample for sample in samples
+        if str(sample.get("sample") or "") in names
+        and sample.get("depth_m") is not None
+    ]
+    if len(usable) < SUPPORT_CLUSTER_MIN_SAMPLES:
+        return None
+    ordered = sorted(usable, key=lambda item: float(item["depth_m"]))
+    best: list[dict] | None = None
+    for start in range(len(ordered)):
+        for stop in range(start + SUPPORT_CLUSTER_MIN_SAMPLES, len(ordered) + 1):
+            window = ordered[start:stop]
+            depths = [float(item["depth_m"]) for item in window]
+            median = float(np.median(depths))
+            spread = max(depths) - min(depths)
+            if median <= 0.0:
+                continue
+            if spread > SUPPORT_CLUSTER_SPREAD_M:
+                continue
+            if spread / median > SUPPORT_CLUSTER_SPREAD_RATIO:
+                continue
+            if best is None or len(window) > len(best):
+                best = window
+    if best is None:
+        return None
+    depths = sorted(float(item["depth_m"]) for item in best)
+    median = depths[len(depths) // 2]
+    nearest = min(best, key=lambda item: abs(float(item["depth_m"]) - median))
+    points = np.asarray(
+        [np.asarray(item["position_flu"], dtype=np.float64) for item in best],
+        dtype=np.float64,
+    )
+    point = np.median(points, axis=0)
+    return {
+        "samples": len(best),
+        "median_m": round(float(np.median(depths)), 3),
+        "spread_m": round(max(depths) - min(depths), 3),
+        "source": "box",
+        "names": [str(item.get("sample") or "") for item in best],
+        "pixel": nearest.get("pixel"),
+        "position_flu": [round(float(value), 3) for value in point],
+        "point": point,
+    }
+
+
 def _measure_box_from_view(
     ctx: ToolContext, target: Any, view_record: Any, observation_id: str,
-    box: Any,
+    box: Any, instruction: str = "",
 ) -> dict:
     """Measure the object the model points at on one fresh frame.
 
     ``delta_m`` is the distance between two *independent* estimates: the
-    candidate's own place (grounding) and the world point of the box the model
-    drew on this view. Reading depth at the candidate's projected pixel is not
-    an independent check - it returns the candidate point by construction (the
-    v2 ``delta_m=0.0`` that accepted every wrong candidate). The model's box is
-    measured at its centre; the bottom-edge samples are only a fallback when the
-    centre depth is unusable. A box covering half the frame or more is refused:
-    it does not localise the object, and its samples are dominated by the floor
-    or wall in front of the drone.
+    candidate's own place (grounding) and the world point of the model's box on
+    this view. Reading depth at the candidate's projected pixel is not an
+    independent check - it returns the candidate point by construction (the v2
+    ``delta_m=0.0`` that accepted every wrong candidate).
+
+    The measured point is the object's **support contact**: a coherent
+    multi-point cluster on the box bottom (or on the bottom of a SAM3 mask when
+    a detector is configured), not the box centre. A chair's centre frequently
+    falls on the wall behind it, which produced the v1 2-4.8 m
+    ``position_inconsistent`` false rejections. The centre is a cross-check:
+    when it disagrees with the support cluster or with the candidate's own
+    range by more than ``MEASUREMENT_CANDIDATE_MAX_GAP_M`` it is not used, and
+    the whole measurement is ``unknown`` (never a rejection by itself).
 
     ``observe(mode="forward", yaw_deg=...)`` renders the view at a heading and
     then restores the drone's yaw; ``world.depth_at_pixel`` reads the current
@@ -1228,6 +1536,8 @@ def _measure_box_from_view(
     world = getattr(ctx, "world", None)
     result: dict[str, Any] = {
         "available": False,
+        "trusted": False,
+        "inconsistent": False,
         "reason": "no_depth_measurement",
         "observation_id": observation_id,
         "method": "observed_box",
@@ -1280,8 +1590,11 @@ def _measure_box_from_view(
     if getattr(target, "position", None) is None:
         result["reason"] = "candidate_has_no_position"
         return result
-    estimate = [float(v) for v in target.position]
-    result["candidate_estimate_flu"] = estimate
+    estimate = np.asarray([float(v) for v in target.position], dtype=np.float64)
+    result["candidate_estimate_flu"] = [float(v) for v in estimate]
+    origin = np.asarray(view_position, dtype=np.float64) if view_position is not None else here
+    candidate_range = float(np.linalg.norm(estimate - origin))
+    result["candidate_range_m"] = round(candidate_range, 3)
 
     centre = parsed.center
     ground_y = min(
@@ -1293,6 +1606,14 @@ def _measure_box_from_view(
         ("bottom_centre", (parsed.x1 + 0.50 * parsed.width, ground_y)),
         ("bottom_75", (parsed.x1 + 0.75 * parsed.width, ground_y)),
     ]
+    mask = _mask_support_pixels(ctx, view_record, parsed.to_list(), instruction)
+    if mask is not None:
+        points.extend(mask["pixels"])
+        result["mask_proposal"] = {
+            "iou": mask["iou"],
+            "box": mask["box"],
+            "mask_area_frac": mask["mask_area_frac"],
+        }
     old_yaw = _override_yaw(world, heading_rad)
     try:
         refresh = getattr(world, "refresh_sensing", None)
@@ -1311,34 +1632,229 @@ def _measure_box_from_view(
     if not samples:
         result["reason"] = "no_depth_measurement"
         return result
-    # the box centre is the object's own point; the support samples are only a
-    # fallback when the centre depth is unusable. Taking the nearest sample
-    # instead let a large box match the floor in front of the drone to any
-    # candidate (the v3 seed37/41 false accepts).
-    chosen = next(
-        (item for item in samples if item["sample"] == "centre"),
-        min(samples, key=lambda item: item["depth_m"]),
+    result["samples"] = samples
+    centre_sample = next(
+        (item for item in samples if item["sample"] == "centre"), None
     )
+    if centre_sample is not None:
+        result["centre_depth_m"] = centre_sample["depth_m"]
+        result["centre_gap_to_candidate_m"] = round(
+            abs(float(centre_sample["depth_m"]) - candidate_range), 3
+        )
+
+    mask_names = {name for name, _ in (mask or {}).get("pixels", [])}
+    box_names = {"bottom_25", "bottom_centre", "bottom_75"}
+    clusters: list[dict] = []
+    mask_cluster = _coherent_support_cluster(samples, mask_names)
+    if mask_cluster is not None:
+        mask_cluster["source"] = "mask"
+        clusters.append(mask_cluster)
+    box_cluster = _coherent_support_cluster(samples, box_names)
+    if box_cluster is not None:
+        clusters.append(box_cluster)
+    result["support_clusters"] = [
+        {
+            key: cluster[key]
+            for key in ("source", "samples", "median_m", "spread_m")
+        }
+        for cluster in clusters
+    ]
+    trusted = [
+        cluster
+        for cluster in clusters
+        if abs(float(cluster["median_m"]) - candidate_range)
+        <= MEASUREMENT_CANDIDATE_MAX_GAP_M
+    ]
+    cluster = trusted[0] if trusted else (clusters[0] if clusters else None)
+    if cluster is not None:
+        result["support_cluster"] = {
+            key: cluster[key]
+            for key in (
+                "source", "samples", "median_m", "spread_m", "names",
+                "position_flu",
+            )
+        }
+        cluster_gap = abs(float(cluster["median_m"]) - candidate_range)
+        result["support_gap_to_candidate_m"] = round(cluster_gap, 3)
+    else:
+        cluster_gap = None
+
+    if centre_sample is not None and cluster is not None:
+        result["centre_vs_support_m"] = round(
+            abs(float(centre_sample["depth_m"]) - float(cluster["median_m"])), 3
+        )
+
+    chosen: dict | None = None
+    method = "support_cluster"
+    if cluster is not None and trusted:
+        chosen = cluster
+        method = (
+            "sam3_support_cluster"
+            if str(cluster.get("source") or "") == "mask"
+            else "support_cluster"
+        )
+        # the centre is a cross-check, not the measurement; a background centre
+        # is recorded but cannot drag the measured point onto the wall
+        if centre_sample is not None and (
+            result.get("centre_vs_support_m", 0.0) > CENTRE_SUPPORT_MAX_GAP_M
+            or result.get("centre_gap_to_candidate_m", 0.0)
+            > MEASUREMENT_CANDIDATE_MAX_GAP_M
+        ):
+            result["centre_rejected"] = True
+            result["centre_reject_reason"] = "centre_reads_the_surface_behind"
+        elif centre_sample is not None:
+            result["centre_rejected"] = False
+    elif centre_sample is not None and cluster is None:
+        centre_gap = abs(float(centre_sample["depth_m"]) - candidate_range)
+        if centre_gap <= MEASUREMENT_CANDIDATE_MAX_GAP_M:
+            chosen = {
+                "median_m": float(centre_sample["depth_m"]),
+                "position_flu": centre_sample["position_flu"],
+                "pixel": centre_sample["pixel"],
+                "samples": 1,
+                "source": "centre",
+            }
+            method = "centre"
+            result["centre_rejected"] = False
+        else:
+            result.update(
+                available=False,
+                trusted=False,
+                inconsistent=True,
+                reason="centre_depth_matches_background",
+                unknown_reason="centre_depth_matches_background",
+                untrusted_delta_m=round(
+                    float(
+                        np.linalg.norm(
+                            np.asarray(centre_sample["position_flu"], dtype=np.float64)
+                            - estimate
+                        )
+                    ),
+                    2,
+                ),
+            )
+            return result
+    else:
+        # a cluster was found but none agrees with the candidate's own range,
+        # and the centre cannot resolve it either: the sample is the floor/wall
+        # behind the object, so this view measured the background
+        reason = (
+            "support_point_matches_background"
+            if cluster is not None
+            else "no_coherent_support_cluster"
+        )
+        untrusted_point = (
+            cluster["point"] if cluster is not None
+            else (
+                np.asarray(centre_sample["position_flu"], dtype=np.float64)
+                if centre_sample is not None else None
+            )
+        )
+        result.update(
+            available=False,
+            trusted=False,
+            inconsistent=True,
+            reason=reason,
+            unknown_reason=reason,
+        )
+        if cluster is not None:
+            result["untrusted_delta_m"] = round(
+                float(np.linalg.norm(np.asarray(cluster["point"]) - estimate)), 2
+            )
+        elif untrusted_point is not None:
+            result["untrusted_delta_m"] = round(
+                float(np.linalg.norm(untrusted_point - estimate)), 2
+            )
+        return result
+
     measured = np.asarray(chosen["position_flu"], dtype=np.float64)
-    delta = float(np.linalg.norm(measured - np.asarray(estimate, dtype=np.float64)))
+    delta = float(np.linalg.norm(measured - estimate))
     depths = [float(item["depth_m"]) for item in samples]
     result.update(
         available=True,
+        trusted=True,
+        inconsistent=False,
         delta_m=round(delta, 2),
         tolerance_m=CONFIRM_POSITION_TOL_M,
         reject_m=CONFIRM_POSITION_REJECT_M,
         reason="observed_box_depth",
-        measured_position_flu=chosen["position_flu"],
-        measured_pixel=chosen["pixel"],
-        depth_m=round(float(chosen["depth_m"]), 3),
-        chosen_sample=chosen["sample"],
+        measurement_method=method,
+        measured_position_flu=[round(float(value), 3) for value in measured],
+        measured_pixel=chosen.get("pixel"),
+        depth_m=round(float(chosen["median_m"]), 3),
+        chosen_sample=(
+            "support_cluster" if cluster is not None else "centre"
+        ),
         depth_spread_m=round(max(depths) - min(depths), 3),
-        samples=samples,
     )
     return result
 
 
-def _view_supports(view: Mapping, relation: str) -> bool:
+def _fuse_position_attempts(attempts: list[dict]) -> dict:
+    """One position check from the fresh views' measurements.
+
+    A usable measurement is a trusted support point. Two usable measurements
+    farther apart than ``MULTI_VIEW_DISAGREEMENT_M`` did not measure the same
+    surface: the check becomes ``unknown`` (``inconsistent``) instead of picking
+    one and rejecting on it. With no usable measurement the first untrusted
+    attempt is kept (its ``unknown_reason`` is the answer); nothing here rejects
+    a candidate.
+    """
+    if not attempts:
+        return {"available": False, "reason": "no_depth_measurement"}
+    merged = [dict(attempt) for attempt in attempts]
+    attempts_summary = [
+        {
+            "observation_id": attempt.get("observation_id"),
+            "reason": attempt.get("reason"),
+            "available": bool(attempt.get("available")),
+            "delta_m": attempt.get("delta_m"),
+            "measurement_method": attempt.get("measurement_method"),
+            "unknown_reason": attempt.get("unknown_reason"),
+        }
+        for attempt in merged
+    ]
+    usable = [attempt for attempt in merged if attempt.get("available")]
+    if usable:
+        chosen = dict(usable[0])
+        chosen["attempts"] = attempts_summary
+        if len(usable) >= 2:
+            points = [
+                np.asarray(attempt["measured_position_flu"], dtype=np.float64)
+                for attempt in usable
+                if attempt.get("measured_position_flu") is not None
+            ]
+            spread = 0.0
+            for first in range(len(points)):
+                for second in range(first + 1, len(points)):
+                    spread = max(
+                        spread,
+                        float(np.linalg.norm(points[first] - points[second])),
+                    )
+            chosen["view_deltas_m"] = [attempt.get("delta_m") for attempt in usable]
+            chosen["multi_view_spread_m"] = round(spread, 2)
+            if spread > MULTI_VIEW_DISAGREEMENT_M:
+                chosen.update(
+                    available=False,
+                    trusted=False,
+                    inconsistent=True,
+                    reason="multi_view_disagreement",
+                    unknown_reason="multi_view_disagreement",
+                )
+        return chosen
+    untrusted = [
+        attempt
+        for attempt in merged
+        if attempt.get("inconsistent") or attempt.get("unknown_reason")
+    ]
+    chosen = dict(untrusted[0] if untrusted else merged[0])
+    chosen["attempts"] = attempts_summary
+    return chosen
+
+
+def _view_supports(
+    view: Mapping, relation: str, *, relation_required: bool = True
+) -> bool:
     """One independent view's positive identity evidence.
 
     A view supports only when it says target **and** same instance, does not
@@ -1347,6 +1863,11 @@ def _view_supports(view: Mapping, relation: str) -> bool:
     ``MIN_CONFIRM_CONFIDENCE``. An explicit low/0.0 view is not support and
     vetoes acceptance (seed 17/19 accepted with one 0.9 and one 0.0 view); an
     undecided (``null``) view is not support either, though it does not veto.
+
+    ``relation_required=False`` is the cross-frame relation case: the anchor is
+    not in this frame, so the view cannot judge the relation, and the harness
+    already holds evidence that it holds. The view then carries identity and
+    attributes only - it still cannot *support* a relation it does not see.
     """
     if view.get("error"):
         return False
@@ -1356,13 +1877,18 @@ def _view_supports(view: Mapping, relation: str) -> bool:
         return False
     if view.get("attributes_match") is False:
         return False
-    if relation and view.get("relation_supported") is not True:
+    if relation and relation_required and view.get("relation_supported") is not True:
         return False
     state = str(view.get("confidence_state") or _confidence_state(view.get("confidence")))
     return state == "ok"
 
 
-def _view_blocks(view: Mapping, relation: str) -> bool:
+def _view_blocks(
+    view: Mapping,
+    relation: str,
+    *,
+    relation_unknown_ok: bool = False,
+) -> bool:
     """Whether one view vetoes an acceptance the other views support.
 
     Only *decided* evidence vetoes: an explicit ``0.0``/low confidence, a
@@ -1370,6 +1896,11 @@ def _view_blocks(view: Mapping, relation: str) -> bool:
     (different instance / attributes / absent target). An undecided view
     (``confidence: null``) neither supports nor vetoes - it cannot carry an
     acceptance on its own, but it must not close the door on the views that do.
+
+    ``relation_unknown_ok`` applies the unknown/negative split: a view that says
+    ``anchor_visible=false`` with ``relation_supported=false`` is not seeing the
+    anchor, which is *unknown* about the relation, not evidence against it. A
+    view that sees the anchor and still denies the relation blocks.
     """
     if view.get("error"):
         return True
@@ -1380,16 +1911,83 @@ def _view_blocks(view: Mapping, relation: str) -> bool:
     if view.get("target") is False:
         return True
     if relation and view.get("relation_supported") is False:
-        return True
+        if not (relation_unknown_ok and view.get("anchor_visible") is not True):
+            return True
     state = str(view.get("confidence_state") or _confidence_state(view.get("confidence")))
     if state == "low":
         return True
-    return state == "ok" and not _view_supports(view, relation)
+    return state == "ok" and not _view_supports(
+        view, relation, relation_required=not relation_unknown_ok
+    )
 
 
 # ---------------------------------------------------------------------------
 # the routine
 # ---------------------------------------------------------------------------
+
+
+def _augment_relation_result(
+    ctx: ToolContext,
+    outcome: ToolResult,
+    *,
+    candidate_id: str,
+    instruction: str,
+    relation: str,
+    before_verdict: str,
+) -> ToolResult:
+    """Publish the relation chain's typed gaps and journal one observation.
+
+    Every confirmation is one supplementary observation: the entry says which
+    hypotheses it was meant to separate (this instance vs. its competitors, or
+    the anchor relation established vs. unknown) and whether the verdict moved.
+    """
+    if not relation_chain_enabled(ctx) or not isinstance(outcome.data, dict):
+        return outcome
+    info = _relation_info(instruction, relation) if relation else None
+    plan = rank_observation_actions(
+        typed_uncertainties(
+            ctx,
+            candidate_ids=[candidate_id],
+            instruction=instruction,
+            relation=info,
+        ),
+        candidate_ids=[candidate_id],
+        competitor_ids=competing_candidates(
+            ctx, _candidate_store(ctx).get(candidate_id) or {}
+        ),
+        instruction=instruction,
+        relation=info,
+    )
+    data = outcome.data
+    data["relation_chain"] = relation_state_summary(ctx)
+    data["observation_plan"] = {"actions": plan}
+    if data.get("next_action") is None and plan:
+        data["next_action"] = dict(plan[0])
+    data["uncertainty"] = sorted(
+        {str(action.get("uncertainty")) for action in plan if action.get("uncertainty")}
+    )
+    verdict = str(data.get("verdict") or "")
+    changed = bool(verdict) and verdict != str(before_verdict or "")
+    tried = (
+        f"whether {candidate_id} is the instructed instance under the relation "
+        f"{info.get('anchor') if info else ''!r} (anchor established vs unknown)"
+        if info is not None
+        else f"whether {candidate_id} is the instructed instance (same object vs other)"
+    )
+    data["observation_decision"] = record_observation_decision(
+        ctx,
+        uncertainty=(
+            UNCERTAINTY_ANCHOR_RELATION
+            if "anchor_relation" in data["uncertainty"]
+            else UNCERTAINTY_INSTANCE
+        ),
+        action=(plan[0] if plan else data.get("next_action")),
+        tried_to_distinguish=tried,
+        before={"verdict": before_verdict or "unknown"},
+        after={"verdict": verdict, "missing": data.get("missing")},
+        changed=changed,
+    )
+    return outcome
 
 
 def confirm_candidate(
@@ -1499,17 +2097,24 @@ def confirm_candidate(
         _as_float(args.get("turn_deg"), DEFAULT_TURN_DEG) or DEFAULT_TURN_DEG,
         10.0, MAX_TURN_DEG,
     )
+    before_verdict = str(
+        record.get("confirmation_status") or record.get("status") or ""
+    )
+    relation, relation_source = _relation_anchor(ctx, args, instruction)
     if _distance_unresolved(record):
         # The candidate's range came from a depth/model conflict. A viewpoint
         # check cannot settle which range is the object's, and the v4 holdout
         # showed the loop: confirm -> propose_viewpoints -> go_to -> confirm on
         # the same stale candidate. Refuse before flying/taking views and hand
         # back a forced re-ground from a different viewpoint.
-        return _distance_uncertain_confirmation(
+        outcome = _distance_uncertain_confirmation(
             ctx, record, candidate_id, instruction, turn_deg
         )
+        return _augment_relation_result(
+            ctx, outcome, candidate_id=candidate_id, instruction=instruction,
+            relation=relation, before_verdict=before_verdict,
+        )
     select_scope_candidate(ctx, candidate_id)
-    relation, relation_source = _relation_anchor(ctx, args, instruction)
     max_views = int(min(max(_as_int(args.get("max_views"), DEFAULT_CONFIRM_VIEWS), 1), MAX_CONFIRM_VIEWS))
     max_steps = int(min(max(_as_int(args.get("max_steps"), DEFAULT_CONFIRM_STEPS), 1), MAX_CONFIRM_STEPS))
     standoff = _as_float(args.get("standoff_m"), CONFIRM_STANDOFF_M)
@@ -1532,10 +2137,16 @@ def confirm_candidate(
             backend=backend, caller=caller,
         )
 
+    def execute() -> ToolResult:
+        return _augment_relation_result(
+            ctx, run(), candidate_id=candidate_id, instruction=instruction,
+            relation=relation, before_verdict=before_verdict,
+        )
+
     if _RoutineBudget is None:  # pragma: no cover - defensive
-        return run()
+        return execute()
     with _RoutineBudget(ctx, inner_steps=max_steps, outer_cost=1):
-        return run()
+        return execute()
 
 
 def _run_confirmation(
@@ -1558,6 +2169,11 @@ def _run_confirmation(
 
     steps: list[dict] = []
     vlm_calls = 0
+    chain_enabled = relation_chain_enabled(ctx)
+    info = _relation_info(instruction, relation) if relation else None
+    relation_evidence: dict | None = None
+    relation_state: str | None = None
+    cross_frame_relation = False
     entry = _ledger_entry(ctx, candidate_id)
     scope = task_scope(ctx)
     revision = int(scope.get("evidence_revision", 0))
@@ -1618,6 +2234,9 @@ def _run_confirmation(
             "stalled": bool(stalled),
             "attempts_since_accept": int(entry.get("attempts_since_accept", 0)),
             "evidence_revision": revision,
+            "relation_chain": (
+                relation_state_summary(ctx) if chain_enabled else {"enabled": False}
+            ),
             "steps": steps,
             "vlm_calls": vlm_calls,
             "outer_tool_calls": 1,
@@ -1632,6 +2251,8 @@ def _run_confirmation(
                 "inner_steps": max_steps,
             },
         }
+        if chain_enabled and isinstance(relation_evidence, Mapping):
+            data["relation_evidence"] = dict(relation_evidence)
         if verdict == CONFIRMATION_ACCEPTED:
             data.update(
                 progress_kind=PROGRESS_TASK,
@@ -1836,9 +2457,7 @@ def _run_confirmation(
     # -- 2/3. new views + one model judgement per independent view -----------
     offsets = _offsets_for(target, ctx.world, turn_deg)
     views: list[dict] = []
-    position_check: dict = {"available": False}
     position_attempts: list[dict] = []
-    measured = False
     attempted_keys: set[str] = set()
     for index, offset in enumerate(offsets):
         if len(views) >= max_views or not steps_left():
@@ -1898,27 +2517,22 @@ def _run_confirmation(
         # fresh frame, and that box - not the candidate's own projected pixel -
         # is measured. Reading depth at the candidate's pixel returned the
         # candidate point by construction (delta 0.0 for any candidate), which
-        # accepted all five wrong instances in holdout v2. A failed reading is
-        # retried from the next view; the first genuine measurement wins.
-        if not measured and not getattr(view_record, "pitched", False):
+        # accepted all five wrong instances in holdout v2. Every non-pitched
+        # view contributes a support-cluster measurement; the per-view results
+        # are fused after the loop, because two views that disagree measure
+        # different surfaces and neither may reject the candidate.
+        if not getattr(view_record, "pitched", False):
             measurement = _measure_box_from_view(
                 ctx, target, view_record, obs_id,
                 verdict.get("box") if verdict.get("target") is not False else None,
+                instruction=instruction,
             )
             position_attempts.append(dict(measurement))
-            if measurement.get("available"):
-                measured = True
-                position_check = dict(measurement)
-            elif (
-                not position_check.get("available")
-                and not position_check.get("inconsistent")
-            ):
-                position_check = dict(measurement)
             _record(
                 steps,
                 "relocalize",
-                "measure the box the model points at on this fresh frame and "
-                "compare that observed point with the candidate estimate",
+                "measure the support contact of the box the model points at on "
+                "this fresh frame and compare it with the candidate estimate",
                 [obs_id],
                 dict(measurement),
             )
@@ -1932,6 +2546,7 @@ def _run_confirmation(
             "same_instance": verdict.get("same_instance"),
             "attributes_match": verdict.get("attributes_match"),
             "relation_supported": verdict.get("relation_supported"),
+            "anchor_visible": verdict.get("anchor_visible"),
             "confidence": verdict.get("confidence"),
             "confidence_state": verdict.get("confidence_state")
             or _confidence_state(verdict.get("confidence")),
@@ -1948,8 +2563,20 @@ def _run_confirmation(
         }
         if verdict.get("error"):
             view_entry["error"] = str(verdict["error"])
-        if position_check.get("observation_id") == obs_id:
-            view_entry["position_delta_m"] = position_check.get("delta_m")
+        attempt = next(
+            (
+                item for item in position_attempts
+                if item.get("observation_id") == obs_id
+            ),
+            None,
+        )
+        if attempt is not None:
+            view_entry["position_delta_m"] = attempt.get("delta_m")
+            view_entry["position_measurement"] = (
+                attempt.get("measurement_method")
+                or attempt.get("unknown_reason")
+                or attempt.get("reason")
+            )
         views.append(view_entry)
         evidence.append(EvidenceRef("observation", obs_id, "confirmation view"))
 
@@ -1972,17 +2599,7 @@ def _run_confirmation(
             _change_view_action(missing, turn_deg),
         )
 
-    if position_attempts:
-        position_check = dict(position_check)
-        position_check["attempts"] = [
-            {
-                "observation_id": attempt.get("observation_id"),
-                "reason": attempt.get("reason"),
-                "available": bool(attempt.get("available")),
-                "delta_m": attempt.get("delta_m"),
-            }
-            for attempt in position_attempts
-        ]
+    position_check = _fuse_position_attempts(position_attempts)
     anchor_check = _subtask_anchor_check(ctx, record)
     position_check = dict(position_check)
     position_check["subtask_anchor"] = anchor_check
@@ -1993,17 +2610,90 @@ def _run_confirmation(
         view for view in views
         if view.get("same_instance") is False or view.get("attributes_match") is False
     ]
+    # -- relation evidence: current-frame co-visibility vs. maintained state --
+    relation_evidence = None
+    relation_state = None
+    cross_frame_relation = False
+    if chain_enabled and relation and info is not None:
+        explicit_negative = any(
+            view.get("relation_supported") is False
+            and view.get("anchor_visible") is True
+            for view in views
+        )
+        co_visible = any(
+            view.get("relation_supported") is True
+            and view.get("anchor_visible") is not False
+            for view in views
+        )
+        anchor_seen = any(view.get("anchor_visible") is True for view in views)
+        anchor_absent = any(view.get("anchor_visible") is False for view in views)
+        confidences = [
+            float(view.get("confidence"))
+            for view in views
+            if isinstance(view.get("confidence"), (int, float))
+        ]
+        if explicit_negative and not co_visible:
+            aggregate = {
+                "anchor_visible": True,
+                "relation_supported": False,
+                "confidence": max(confidences, default=0.7),
+            }
+        elif co_visible:
+            aggregate = {
+                "anchor_visible": True,
+                "relation_supported": True,
+                "confidence": max(confidences, default=0.7),
+            }
+        else:
+            aggregate = {
+                "anchor_visible": True if anchor_seen else (False if anchor_absent else None),
+                "relation_supported": None,
+                "confidence": max(confidences, default=0.0),
+            }
+        relation_evidence = relation_evidence_for_candidate(
+            ctx, record, instruction, info, view=aggregate,
+        )
+        if isinstance(relation_evidence, Mapping):
+            relation_state = str(relation_evidence.get("state") or RELATION_UNKNOWN)
+            cross_frame_relation = (
+                relation_state == RELATION_SUPPORTS and not co_visible
+            )
+    relation_required = not cross_frame_relation
+    relation_unknown_ok = cross_frame_relation
+    relation_ok = (
+        not relation
+        or not chain_enabled
+        or (isinstance(relation_evidence, Mapping)
+            and relation_state == RELATION_SUPPORTS)
+    )
+    relation_conflict = bool(
+        chain_enabled
+        and isinstance(relation_evidence, Mapping)
+        and relation_state == RELATION_CONTRADICTS
+    )
+    relation_unknown = bool(
+        chain_enabled and relation and not relation_ok and not relation_conflict
+    )
     relation_bad = [
         view for view in views
-        if relation and view.get("relation_supported") is False
+        if relation
+        and view.get("relation_supported") is False
+        and (view.get("anchor_visible") is True or not chain_enabled)
     ]
-    support = [view for view in views if _view_supports(view, relation)]
-    blockers = [view for view in views if _view_blocks(view, relation)]
+    support = [
+        view for view in views
+        if _view_supports(view, relation, relation_required=relation_required)
+    ]
+    blockers = [
+        view for view in views
+        if _view_blocks(view, relation, relation_unknown_ok=relation_unknown_ok)
+    ]
     # at least one decided-supporting view and no decided veto: undecided
     # (null-confidence) views are neutral, explicit low/0.0 views are not
     appearance_ok = bool(support) and not blockers
-    delta = position_check.get("delta_m") if position_check.get("available") else None
-    position_available = bool(position_check.get("available"))
+    position_inconsistent = bool(position_check.get("inconsistent"))
+    position_available = bool(position_check.get("available")) and not position_inconsistent
+    delta = position_check.get("delta_m") if position_available else None
     position_ok = position_available and delta is not None and delta <= CONFIRM_POSITION_TOL_M
 
     def reject(reason: str) -> ToolResult:
@@ -2022,7 +2712,7 @@ def _run_confirmation(
             missing=["identity"], reason=reason, checks=position_check,
             evidence=evidence,
         )
-        return result(
+        outcome = result(
             CONFIRMATION_REJECTED, ["identity"], reason,
             _next_action(
                 "ground_target",
@@ -2032,6 +2722,16 @@ def _run_confirmation(
             ),
             views=views, position_check=position_check,
         )
+        switched = mark_candidate_rejected(ctx, candidate_id, reason)
+        if switched:
+            outcome.data["hypothesis_switch"] = switched
+            if switched.get("switched_to"):
+                outcome.data["hint"] = (
+                    f"switched hypothesis to {switched['switched_to']} "
+                    f"(candidates {switched.get('switched_candidates')}): the "
+                    "explored place and the plan stay, only this instance is closed"
+                )
+        return outcome
 
     def accept() -> ToolResult:
         entry["accepted"] = int(entry.get("accepted", 0)) + 1
@@ -2060,12 +2760,31 @@ def _run_confirmation(
         )
 
     # -- 4. verdict ---------------------------------------------------------
+    # A terminal rejection needs both halves: an explicit visual contradiction
+    # (different instance / attribute conflict) *and* a position that does not
+    # agree with the candidate. A model ``different_instance`` at a matching
+    # position (v1 seed31: delta 0.38 m) is a disputed identity, not a proven
+    # wrong instance, and a position-only gap is at most ``uncertain(distance)``.
     if strong_bad:
+        if position_available and delta is not None:
+            if delta > CONFIRM_POSITION_TOL_M:
+                return reject("different_instance")
+            return uncertain(
+                ["identity"], "identity_disputed_position_consistent",
+                _identity_action(candidate_id, instruction, -turn_deg, relation),
+                views=views, position_check=position_check,
+            )
+        # the visual contradiction stands on its own when the fresh view could
+        # not measure the place at all
         return reject("different_instance")
-    if position_check.get("inconsistent") and not position_available:
-        return reject("position_inconsistent")
-    if delta is not None and delta > CONFIRM_POSITION_REJECT_M:
-        return reject("position_inconsistent")
+    if chain_enabled and relation_conflict:
+        # only explicit opposite evidence reaches here: the anchor was seen in
+        # this frame and the relation did not hold, or the candidate was
+        # measured outside the anchor's relation bound
+        outcome = reject("relation_conflicted")
+        outcome.data["relation_evidence"] = relation_evidence
+        outcome.data["missing"] = ["relation"]
+        return outcome
     conflict_info = record.get("distance_conflict") if isinstance(record, Mapping) else None
     distance_conflicted = bool(
         str(record.get("distance_source") or "") == "conflict"
@@ -2096,8 +2815,48 @@ def _run_confirmation(
             ),
             views=views, position_check=checks,
         )
-    if appearance_ok and position_ok and anchor_ok:
+    if position_inconsistent:
+        # the measurement itself is unknown (the box centre read the wall
+        # behind the object, or two views measured different surfaces): this
+        # says nothing about the candidate's identity
+        reason = str(
+            position_check.get("unknown_reason")
+            or position_check.get("reason")
+            or "position_measurement_unknown"
+        )
+        return uncertain(
+            ["distance", "localization"], reason,
+            _change_view_action(["distance", "localization"], turn_deg),
+            views=views, position_check=position_check,
+        )
+    if appearance_ok and position_ok and anchor_ok and relation_ok:
         return accept()
+    if relation_unknown and not strong_bad:
+        # the candidate is plausible but the relation was never established (or
+        # went stale): preserve it and observe the anchor - do not reject it
+        action = _anchor_evidence_action(
+            ctx, relation, instruction, evidence=relation_evidence,
+        )
+        missing = ["relation"] + ([] if position_ok else ["localization"])
+        outcome = uncertain(
+            missing, "relation_unknown",
+            action,
+            views=views, position_check=position_check,
+        )
+        outcome.data["relation_evidence"] = relation_evidence
+        outcome.data["temporary_anchor_subtask"] = action.get(
+            "temporary_anchor_subtask"
+        )
+        return outcome
+    if delta is not None and delta > CONFIRM_POSITION_TOL_M:
+        # a trustworthy support point disagrees with the candidate: the place
+        # question stays open (distance), the candidate is not rejected - only
+        # a visual contradiction can close an identity
+        return uncertain(
+            ["distance"], "position_too_far_from_candidate",
+            _distance_action(candidate_id, instruction, target, turn_deg),
+            views=views, position_check=position_check,
+        )
     if appearance_ok and position_ok and not anchor_ok:
         # the instance and the fresh measurement agree, but the candidate sits
         # outside the place the sub-task's own anchor records: at most open,
@@ -2120,12 +2879,6 @@ def _run_confirmation(
         return uncertain(
             missing, "localization_not_available",
             _change_view_action(missing, turn_deg),
-            views=views, position_check=position_check,
-        )
-    if delta is not None and delta > CONFIRM_POSITION_TOL_M:
-        return uncertain(
-            ["identity", "distance", "localization"], "position_too_far_from_candidate",
-            _identity_action(candidate_id, instruction, -turn_deg, relation),
             views=views, position_check=position_check,
         )
     if relation_bad:
