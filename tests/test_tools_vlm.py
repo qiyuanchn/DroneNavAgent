@@ -29,6 +29,7 @@ from vlm_nav.tools import (
     ToolResult,
     ToolSpec,
     parse_tool_call,
+    reply_looks_truncated,
 )
 from vlm_nav.vlm import (
     HFLocalVLM,
@@ -87,6 +88,45 @@ def _registry() -> ToolRegistry:
         )
     )
     return registry
+
+
+class ToolCallParsingTest(unittest.TestCase):
+    """Template wrappers and generation-cap truncation of the call JSON."""
+
+    def test_tool_call_tag_and_fence_are_stripped(self):
+        raw = (
+            "```json\n<tool_call>\n"
+            '{"name": "update_plan", "arguments": {"steps": ['
+            '{"id": "st_1", "goal": "find the door", '
+            '"done_when": {"type": "sighted", "description": "the door is seen"}}]}}\n'
+            "</tool_call>\n```"
+        )
+        call = parse_tool_call(raw)
+        self.assertIsNotNone(call)
+        tool, args = call
+        self.assertEqual(tool, "update_plan")
+        self.assertEqual(args["steps"][0]["id"], "st_1")
+        self.assertFalse(reply_looks_truncated(raw))
+
+    def test_missing_closing_delimiters_are_repaired(self):
+        raw = (
+            '{"tool": "update_plan", "args": {"steps": ['
+            '{"id": "st_1", "goal": "find the door", '
+            '"done_when": {"type": "sighted", "description": "the door is seen"}}'
+        )
+        self.assertTrue(reply_looks_truncated(raw))
+        tool, args = parse_tool_call(raw)
+        self.assertEqual(tool, "update_plan")
+        self.assertEqual(len(args["steps"]), 1)
+
+    def test_cut_inside_a_string_stays_undecodable(self):
+        raw = (
+            '<tool_call>\n{"tool": "update_plan", "args": {"steps": ['
+            '{"id": "st_1", "goal": "find the door", '
+            '"done_when": {"type": "sighted", "description": "the do'
+        )
+        self.assertIsNone(parse_tool_call(raw))
+        self.assertTrue(reply_looks_truncated(raw))
 
 
 class ToolSpecsTextTest(unittest.TestCase):
@@ -716,6 +756,21 @@ class HFLocalNativeTest(unittest.TestCase):
         # native path keeps the policy prompt free of the JSON protocol text
         self.assertEqual(decision["messages"][0]["content"], "POLICY")
         self.assertNotIn(TOOL_CALL_DOC, decision["messages"][0]["content"])
+
+    def test_context_raises_the_generation_cap_for_one_call_only(self):
+        processor = _FakeProcessor(reply='{"tool": "observe", "args": {"mode": "forward"}}')
+        backend = _hf_backend(processor)
+        backend.decide_with_tools(FRAME, "POLICY", "USER", SPECS_TEXT)
+        self.assertEqual(32, backend.model.calls[-1]["max_new_tokens"])
+        backend.decide_with_tools(
+            FRAME, "POLICY", "USER", SPECS_TEXT, {"max_new_tokens": 512}
+        )
+        self.assertEqual(512, backend.model.calls[-1]["max_new_tokens"])
+        # the context can raise the configured cap, never lower it
+        backend.decide_with_tools(
+            FRAME, "POLICY", "USER", SPECS_TEXT, {"max_new_tokens": 8}
+        )
+        self.assertEqual(32, backend.model.calls[-1]["max_new_tokens"])
 
     def test_native_path_carries_tool_history(self):
         processor = _FakeProcessor(reply='{"name": "finish", "arguments": {"reason": "seen"}}')

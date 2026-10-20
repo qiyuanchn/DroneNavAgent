@@ -176,6 +176,7 @@ from .tools import (
     ToolResult,
     declared_progress_kind,
     parse_tool_call,
+    reply_looks_truncated,
 )
 
 FINISH_TOOL = "finish"
@@ -208,6 +209,32 @@ PLAN_CALL_HINT = (
     'as ONE concrete call, e.g. {"tool": "go_to_viewpoint", "args": '
     '{"viewpoint_id": "vp_9"}}; the executor runs those without a model turn '
     "(prose is not executed)."
+)
+#: ``plan_mode`` values. ``given``: the driver wrote the structured plan before
+#: the first turn (the P4 execution experiment). ``self``: the model receives
+#: only the natural-language mission and has to write the plan itself.
+PLAN_MODE_GIVEN = "given"
+PLAN_MODE_SELF = "self"
+PLAN_MODES = (PLAN_MODE_GIVEN, PLAN_MODE_SELF)
+#: The first-turn prompt of the self-plan arm. It asks for the same sub-task
+#: schema ``update_plan`` documents, with a typed ``done_when`` so a landmark
+#: that only has to be seen does not turn into an unnecessary flight.
+SELF_PLAN_PROMPT = (
+    "SELF-PLAN (no plan exists yet): the mission above is natural language only. "
+    "Before acting, call update_plan once with one sub-task per semantic stage "
+    "of the mission, in order. Each entry is {id, goal, depends_on, done_when, "
+    "expected_observation, failure_branch}; depends_on names earlier ids and "
+    "done_when is typed: {\"type\": \"sighted\", \"description\": ...} when "
+    "seeing/locating the object is enough (a landmark - do NOT fly to it), "
+    "{\"type\": \"arrived\", \"description\": ...} only when the mission says to "
+    "reach/stop beside the object (arrival + accepted confirmation), or "
+    "{\"type\": \"verified\", \"description\": ...} when an accepted identity "
+    "confirmation is enough. Do not declare coordinates."
+)
+SELF_PLAN_INVALID = (
+    "SELF-PLAN INVALID: {errors}. Fix the plan once with update_plan (same "
+    "schema: id, goal, depends_on, done_when with a type of sighted/located/"
+    "arrived/verified, expected_observation, failure_branch)."
 )
 
 REASON_FINISH = "finish"
@@ -302,6 +329,18 @@ _UNPARSEABLE_NOTE = (
     'ONE JSON object: {"tool": "<name>", "args": {...}} or '
     '{"tool": "finish", "args": {"reason": "<short>"}}.'
 )
+#: Retry note when the generation cap cut the JSON object off. Going straight
+#: to "cannot parse" wastes the call: the payload is usually right, only too
+#: long, so the retry asks for the same call written compactly.
+_TRUNCATED_NOTE = (
+    "Your previous reply was truncated by the generation limit before its JSON "
+    "object closed. Reply with EXACTLY ONE JSON object and make it more "
+    "compact: keep each plan step to id, goal, depends_on, done_when and a "
+    "one-line expected_observation; omit failure_branch unless it matters."
+)
+#: Generation cap for the self-plan turn. The backend default (192 tokens)
+#: cuts a four-stage plan mid-object; this leaves room for the whole call.
+PLAN_MAX_NEW_TOKENS = 512
 
 FINAL_FINISH_NOTE = (
     "RECOVERY EXHAUSTED: the last turns repeated a call that cannot produce "
@@ -1215,6 +1254,14 @@ class AgentRuntime:
     fruitless result, or a sub-task goal written as a tool call) executes that
     step through the registry instead of spending a model turn, capped at
     :data:`MAX_EXECUTOR_AUTO_STEPS` consecutive steps.
+
+    ``plan_mode`` separates the two section-4 experiments: ``given`` assumes the
+    caller wrote the plan (the P4 execution arm); ``self`` starts with only the
+    natural-language instruction, asks the model to write the sub-task plan on
+    the first turn (:data:`SELF_PLAN_PROMPT`), validates it through
+    ``tool_impl_task.plan_structure_errors`` and asks for one correction
+    (:data:`SELF_PLAN_INVALID`) before executing it. The plan record, executor
+    and evidence rules after that are identical in both arms.
     """
 
     def __init__(
@@ -1241,6 +1288,8 @@ class AgentRuntime:
         state_block: bool = True,
         subtask_executor: bool = True,
         plan_resume: bool = True,
+        plan_mode: str = PLAN_MODE_GIVEN,
+        plan_max_new_tokens: int = PLAN_MAX_NEW_TOKENS,
         executor_auto_steps: bool = True,
         max_executor_auto_steps: int = MAX_EXECUTOR_AUTO_STEPS,
         max_memory_items: int = 4,
@@ -1292,6 +1341,9 @@ class AgentRuntime:
         #: a routine turn's deterministic step runs without a model call.
         self.subtask_executor = bool(subtask_executor)
         self.plan_resume = bool(plan_resume)
+        mode = str(plan_mode or PLAN_MODE_GIVEN).strip().lower()
+        self.plan_mode = mode if mode in PLAN_MODES else PLAN_MODE_GIVEN
+        self.plan_max_new_tokens = max(1, int(plan_max_new_tokens))
         self.executor_auto_steps = bool(executor_auto_steps)
         self.max_executor_auto_steps = max(0, int(max_executor_auto_steps))
         #: What the last system prompt held (read by the runner's summary).
@@ -1342,6 +1394,11 @@ class AgentRuntime:
         self._plan_revision_note = ""
         self._revision_node = ""
         self._revision_subtask = ""
+        #: self-plan gate: the plan the model still owes, whether the one
+        #: correction prompt was already sent, and the last structure errors
+        self._self_plan_fix_sent = False
+        self._self_plan_invalid = ""
+        self._self_plan_accepted = False
         self._executor_notes: list[str] = []
         self._candidate_ids: tuple[str, ...] = ()
 
@@ -1464,7 +1521,10 @@ class AgentRuntime:
             call, reply, images_sent = self._ask(turn, events)
             log.vlm_calls += 1
             if call is None:  # one re-prompt, per the parse_tool_call contract
-                call, reply, images_sent = self._ask(turn, events, retry_note=_UNPARSEABLE_NOTE)
+                # a cut-off JSON object needs a different correction from prose:
+                # name the generation cap and ask for a compact call
+                note = _TRUNCATED_NOTE if reply_looks_truncated(reply) else _UNPARSEABLE_NOTE
+                call, reply, images_sent = self._ask(turn, events, retry_note=note)
                 log.vlm_calls += 1
             if call is None:
                 log.turns.append(
@@ -1517,6 +1577,7 @@ class AgentRuntime:
             # executed here, so the chain costs no model turn (P4); a decision
             # node stops the chain and the model sees it next turn
             record = self._run_executor_auto_steps(turn, log, record)
+            self._validate_self_plan(log, record)
             if self._after_stall(turn, log, record) == RECOVERY_STOP:
                 reason = REASON_NO_NEW_EVIDENCE
                 break
@@ -1563,6 +1624,9 @@ class AgentRuntime:
         self._plan_revision_note = ""
         self._revision_node = ""
         self._revision_subtask = ""
+        self._self_plan_fix_sent = False
+        self._self_plan_invalid = ""
+        self._self_plan_accepted = False
         self._executor_notes = []
         self._candidate_ids = ()
         self.prompt_budget = {}
@@ -1576,6 +1640,11 @@ class AgentRuntime:
         """One model call: returns ``(normalized_call, reply_text, n_images)``."""
         frames, user = self._build_context(turn, events, retry_note)
         context = self._vlm_context(turn)
+        if self._plan_turn_pending():
+            # the plan is one large JSON object; other turns keep the backend's
+            # configured cap. A backend may never be lowered through this key.
+            configured = int(getattr(self.vlm, "max_new_tokens", 0) or 0)
+            context["max_new_tokens"] = max(self.plan_max_new_tokens, configured)
         tools_text = self.tools_text()
         decide_with_tools = getattr(self.vlm, "decide_with_tools", None)
         if callable(decide_with_tools):
@@ -1889,6 +1958,18 @@ class AgentRuntime:
         if self.state_block:
             sections.append(f"STATE (fixed labels):\n{agent_state}")
         sections.append(f"Structured state:\n{state_block}")
+        if self.plan_mode == PLAN_MODE_SELF:
+            # the first decision turn (and any turn before a plan exists) asks
+            # for the plan; an invalid attempt is answered with one correction
+            if self._self_plan_invalid:
+                sections.append(self._self_plan_invalid)
+                self._self_plan_invalid = ""  # the correction is shown once
+            elif (
+                self._plan_record() is None
+                and not self._self_plan_accepted
+                and not self._self_plan_fix_sent
+            ):
+                sections.append(SELF_PLAN_PROMPT)
         if (
             self.subtask_executor
             and not self._plan_revision_note
@@ -2093,6 +2174,18 @@ class AgentRuntime:
             return None
         return record if isinstance(record, dict) else None
 
+    def _plan_turn_pending(self) -> bool:
+        """True while a self-plan episode still owes its first accepted plan.
+
+        Only these turns get :data:`PLAN_MAX_NEW_TOKENS`; once the plan exists
+        (or the given-plan arm runs) the backend's configured cap applies.
+        """
+        return (
+            self.plan_mode == PLAN_MODE_SELF
+            and not self._self_plan_accepted
+            and self._plan_record() is None
+        )
+
     def _plan_progress_text(self) -> str:
         """``plan_1 rev=2 step 2/4 (1 done): ... | done_when: ...`` or ``no plan``."""
         try:
@@ -2175,6 +2268,55 @@ class AgentRuntime:
         if not isinstance(store, dict):
             return ()
         return tuple(str(key) for key in store)
+
+    def _validate_self_plan(self, log: EpisodeLog, record: TurnRecord) -> None:
+        """Judge the plan a self-plan episode wrote (one correction, then move on).
+
+        The structure check is the task module's own
+        (:func:`vlm_nav.tool_impl_task.plan_structure_errors`, built on the
+        ``update_plan`` schema), so the runtime does not invent a second
+        contract. A plan that fails the check is reported to the model in the
+        *next* prompt; only the first failure is corrected, after which the
+        loop proceeds with whatever plan exists (an experiment must not hang on
+        a model that cannot write one).
+        """
+        if self.plan_mode != PLAN_MODE_SELF or record.tool != "update_plan":
+            return
+        try:
+            from .tool_impl_task import plan_structure_errors
+        except Exception:  # pragma: no cover - the module is part of this package
+            return
+        plan = self._plan_record()
+        if record.status != STATUS_OK:
+            data = record.data if isinstance(record.data, dict) else {}
+            errors = [str(data.get("error") or "update_plan failed")]
+        else:
+            errors = plan_structure_errors(plan)
+        event = {
+            "seq": 0,
+            "name": "self_plan_accepted" if not errors else "self_plan_invalid",
+            "data": {
+                "turn": record.turn,
+                "errors": list(errors),
+                "subtasks": len((plan or {}).get("subtasks") or []),
+                "correction_sent": bool(self._self_plan_fix_sent),
+            },
+        }
+        log.events.append(event)
+        if not errors:
+            self._self_plan_fix_sent = False
+            self._self_plan_invalid = ""
+            self._self_plan_accepted = True
+            return
+        if self._self_plan_fix_sent:
+            # the one correction was already offered: keep the plan (if any) and
+            # let the episode run; the audit reports the unresolved structure
+            self._self_plan_invalid = ""
+            return
+        self._self_plan_fix_sent = True
+        self._self_plan_invalid = SELF_PLAN_INVALID.format(
+            errors="; ".join(errors) or "invalid plan"
+        )
 
     def _executor_step(
         self,

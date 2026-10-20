@@ -134,6 +134,20 @@ state; ``--resume off`` runs the same second leg *without* the inherited state
 what the carry is worth. Both legs of one episode share the model, scene, seeds
 and budgets; only the carry differs.
 
+``--plan-mode given|self`` separates *executing a plan* from *making one*
+(goal.md section 4). ``given`` (default) is the P4 behavior above: the driver
+writes one sub-task per stage through ``update_plan`` before the first turn.
+``self`` writes no plan at all; the runtime gives the model the natural-language
+instruction, asks for a plan on the first decision turn, validates its structure
+(``tool_impl_task.plan_structure_errors``), asks for one correction when invalid
+and then executes the accepted plan. Stage ``done_when`` criteria are typed
+(``sighted``/``located``/``arrived``/``verified``): a landmark that only has to
+be found is judged on a located sighting, not on a flight; an ``arrived``
+destination keeps the reach + accepted-confirmation contract. The report's
+``plan_quality`` block is an offline audit of the plan the model wrote against
+the truth stages (count, order, coverage, type accuracy) and never enters a
+prompt; ``reach_attempts_by_type`` prices the semantic criterion in motion.
+
 Mock run on a tiny CPU scene (no weights, no GPU - what the tests drive):
 
     python scripts/verify_long_horizon.py --task-file task.json \
@@ -225,6 +239,33 @@ ACTION_TOOLS = (
 
 DEFAULT_STAGE_REACH_M = 1.5
 DEFAULT_STAGE_LOCATE_M = 2.0
+#: Typed completion criteria of a stage (goal.md section 4): a landmark is
+#: ``sighted`` when a located tool result is enough, a destination is
+#: ``arrived`` when the drone has to fly there (reach + accepted confirmation),
+#: and ``verified`` asks for the accepted confirmation alone.
+DONE_WHEN_SIGHTED = "sighted"
+DONE_WHEN_LOCATED = "located"
+DONE_WHEN_ARRIVED = "arrived"
+DONE_WHEN_VERIFIED = "verified"
+DONE_WHEN_TYPES = (
+    DONE_WHEN_SIGHTED,
+    DONE_WHEN_LOCATED,
+    DONE_WHEN_ARRIVED,
+    DONE_WHEN_VERIFIED,
+)
+#: The task files' own reach wording (evaluation-side inference only).
+REACH_WORDS = (
+    "reach",
+    "arriv",
+    "fly",
+    "approach",
+    "go to",
+    "到达",
+    "抵达",
+    "飞到",
+    "接近",
+    "停在",
+)
 #: An arrival on the candidate's standoff shell is a reach even when the stage
 #: centre is farther than ``reach_m`` (the two geometries are alternatives).
 DEFAULT_APPROACH_STANDOFF_M = 1.2
@@ -288,8 +329,42 @@ class StageSpec:
     target: bool = False
     source: str = ""
     done_when: str = ""
+    #: the typed completion criterion (goal.md section 4): ``sighted`` /
+    #: ``located`` / ``arrived`` / ``verified``. A task file may declare it;
+    #: otherwise ``arrived`` when the done_when says reach, ``sighted`` for a
+    #: landmark/object stage and ``arrived`` for the target stage.
+    done_when_type: str = ""
+    #: whether the task file itself declared ``reach_m`` (a pre-typed file's
+    #: reach declaration is a movement condition unless a type says otherwise)
+    reach_declared: bool = False
     expected_observation: str = ""
     failure_branch: tuple[str, ...] = ()
+    #: evaluation-side words a self-written plan goal may use for this stage
+    #: (the model rarely repeats the full label); never enters the prompt.
+    keywords: tuple[str, ...] = ()
+
+    def effective_done_when_type(self) -> str:
+        """The criterion the offline stage check uses.
+
+        An explicit ``done_when_type`` wins. Otherwise the stage file's own
+        wording decides: a reach phrase means the stage has to be flown to;
+        a landmark/object that only has to be found is ``sighted``; the target
+        is ``arrived``. This keeps every pre-typed task file on its historical
+        reach semantics (their ``done_when`` spells "reached") while a task
+        that only says "find the landmark" stops checking a flight it never
+        asked for.
+        """
+        declared = str(self.done_when_type or "").strip().lower()
+        if declared in DONE_WHEN_TYPES:
+            return declared
+        text = str(self.done_when or "").lower()
+        if self.reach_declared:
+            return DONE_WHEN_ARRIVED
+        if any(word in text for word in REACH_WORDS):
+            return DONE_WHEN_ARRIVED
+        if self.target or self.kind == STAGE_TARGET:
+            return DONE_WHEN_ARRIVED
+        return DONE_WHEN_SIGHTED
 
     def to_dict(self) -> dict:
         return {
@@ -306,8 +381,10 @@ class StageSpec:
             "target": self.target,
             "position_source": self.source,
             "done_when": self.done_when,
+            "done_when_type": self.effective_done_when_type(),
             "expected_observation": self.expected_observation,
             "failure_branch": list(self.failure_branch),
+            "keywords": list(self.keywords),
         }
 
 
@@ -460,10 +537,13 @@ def load_task(path: str | Path, *, instruction: str | None = None) -> TaskSpec:
                 target=target,
                 source=source,
                 done_when=str(raw.get("done_when") or ""),
+                done_when_type=str(raw.get("done_when_type") or ""),
+                reach_declared=raw.get("reach_m") is not None,
                 expected_observation=str(raw.get("expected_observation") or ""),
                 failure_branch=tuple(
                     str(item) for item in (raw.get("failure_branch") or [])
                 ),
+                keywords=tuple(str(item) for item in (raw.get("keywords") or []) if str(item)),
             )
         )
     by_id = {stage.stage_id: stage for stage in stages}
@@ -909,6 +989,7 @@ def runner_argv(
         argv += _flag_tokens(flag, value, multi)
     if getattr(args, "no_think", False):
         argv.append("--no-think")
+    argv += _flag_tokens("--plan-mode", getattr(args, "plan_mode", None), False)
     if episode_index is not None:
         setattr(args, "episode_index", int(episode_index))
     return argv
@@ -1187,26 +1268,39 @@ def subtask_specs(
     on the previous stage is what makes the chain a chain (the executor cannot
     activate a sub-task whose dependency is not done).
 
-    Every stage carries its ``reach_m`` (the movement-stage completion
-    tolerance) and one concrete ``next_step`` call - the stage's own label, never
-    its true place - so the executor has a deterministic step source from the
-    first turn. ``include_budget=False`` is the fresh leg's plan: its per-stage
-    budget is left to the episode's own tool budget.
+    Every stage carries its typed ``done_when`` (``done_when_type``) and, for an
+    ``arrived`` stage only, its ``reach_m`` tolerance; a ``sighted`` landmark
+    keeps no reach requirement. One concrete ``next_step`` call - the stage's
+    own label, never its true place - gives the executor a deterministic step
+    source from the first turn. ``include_budget=False`` is the fresh leg's
+    plan: its per-stage budget is left to the episode's own tool budget.
     """
     specs: list[dict] = []
     for stage in task.stages:
         row = (report.get("stages") or {}).get(stage.stage_id) or {}
+        stage_type = stage.effective_done_when_type()
+        if stage.done_when:
+            done_when = stage.done_when
+        elif stage_type in (DONE_WHEN_SIGHTED, DONE_WHEN_LOCATED):
+            done_when = (
+                f"stage {stage.index} ({stage.label}) is sighted and located "
+                f"(a tool result within {stage.locate_m:.1f} m of it; no flight)"
+            )
+        elif stage_type == DONE_WHEN_VERIFIED:
+            done_when = f"stage {stage.index} ({stage.label}) is confirmed (identity verified)"
+        else:
+            done_when = (
+                f"stage {stage.index} ({stage.label}) is reached and located "
+                f"(a tool result within {stage.locate_m:.1f} m of it)"
+            )
         spec: dict[str, Any] = {
             "id": f"st_{stage.index}",
             "goal": stage.step,
-            "done_when": stage.done_when or (
-                f"stage {stage.index} ({stage.label}) is reached and located "
-                f"(a tool result within {stage.locate_m:.1f} m of it)"
-            ),
+            "done_when": done_when,
+            "done_when_type": stage_type,
             "expected_observation": stage.expected_observation or (
                 f"stage {stage.index}: {stage.label}"
             ),
-            "reach_m": float(stage.reach_m),
             "next_step": {
                 "tool": STAGE_NEXT_TOOL,
                 "args": {"instruction": stage.label},
@@ -1216,6 +1310,8 @@ def subtask_specs(
                 "viewpoint, then re-plan this stage with update_plan"
             ],
         }
+        if stage_type == DONE_WHEN_ARRIVED:
+            spec["reach_m"] = float(stage.reach_m)
         if include_budget:
             spec["budget"] = {"tool_calls": max(2, int(row.get("evidence_count") or 0) + 3)}
         if stage.anchor:
@@ -1314,7 +1410,15 @@ def final_scope(entries: Sequence[Mapping]) -> dict | None:
 
 
 def _stage_index_of_text(text: Any, task: TaskSpec) -> int | None:
-    """The stage a free-text goal names (exact first, then containment)."""
+    """The stage a free-text goal names (exact, containment, then keywords).
+
+    The keyword pass is what maps a self-written plan to the truth stages: the
+    model rarely repeats the whole label ("卧室窗边的木椅") but almost always
+    names the object ("木椅"). ``keywords`` is evaluation-side data from the task
+    file and never reaches a prompt. A relation goal names two objects ("木椅
+    旁边的灯"); :func:`map_goals_to_stages` resolves that by order, this
+    single-text lookup returns the best (longest) match.
+    """
     value = str(text or "").strip().casefold()
     if not value:
         return None
@@ -1327,7 +1431,68 @@ def _stage_index_of_text(text: Any, task: TaskSpec) -> int | None:
             needle = str(candidate or "").strip().casefold()
             if needle and needle in value and (best is None or len(needle) > best[0]):
                 best = (len(needle), stage.index)
+    if best is not None:
+        return best[1]
+    for stage in task.stages:
+        for needle in stage.keywords:
+            token = str(needle or "").strip().casefold()
+            if token and token in value and (best is None or len(token) > best[0]):
+                best = (len(token), stage.index)
     return None if best is None else best[1]
+
+
+def _stage_match_score(text: Any, stage: StageSpec) -> int:
+    """How strongly a goal text names one stage (0 = no match).
+
+    The score is the length of the longest label/step substring or declared
+    keyword the goal contains. It only ranks candidate stages; order breaks
+    ties (:func:`map_goals_to_stages`).
+    """
+    value = str(text or "").strip().casefold()
+    if not value:
+        return 0
+    best = 0
+    for candidate in (stage.step, stage.label):
+        needle = str(candidate or "").strip().casefold()
+        if needle and needle in value:
+            best = max(best, len(needle))
+    for needle in stage.keywords:
+        token = str(needle or "").strip().casefold()
+        if token and token in value:
+            best = max(best, len(token))
+    return best
+
+
+def map_goals_to_stages(texts: Sequence[Any], task: TaskSpec) -> list[int | None]:
+    """Map an ordered plan's goals to the truth stages, order-aware.
+
+    A relation goal names its anchor too ("找到木椅旁边的灯"), so a plain
+    longest-keyword match would assign it to the chair stage. The plan is
+    ordered, which disambiguates: each goal is assigned to a not-yet-used stage
+    *after* the previous assignment when one matches. The result is what the
+    audit's coverage/order metrics count.
+    """
+    used: set[int] = set()
+    last = 0
+    out: list[int | None] = []
+    for text in texts:
+        candidates = [
+            stage.index
+            for stage in task.stages
+            if stage.index not in used and _stage_match_score(text, stage) > 0
+        ]
+        forward = [index for index in candidates if index > last]
+        if forward:
+            chosen: int | None = forward[0]
+        elif candidates:
+            chosen = candidates[0]
+        else:
+            chosen = _stage_index_of_text(text, task)
+        out.append(chosen)
+        if chosen is not None:
+            used.add(chosen)
+            last = chosen
+    return out
 
 
 def offline_plan_subtasks(legs: Sequence[LegResult], task: TaskSpec) -> list[dict]:
@@ -1388,18 +1553,159 @@ def stage_subtask_map(task: TaskSpec, legs: Sequence[LegResult] = ()) -> dict[st
     """
     mapping = {f"st_{stage.index}": stage.index for stage in task.stages}
     for leg in legs:
-        for row in leg.plan.carry.get("plan_subtasks") or []:
-            if not isinstance(row, Mapping):
-                continue
-            index = _stage_index_of_text(row.get("goal"), task)
+        rows = [
+            row for row in leg.plan.carry.get("plan_subtasks") or []
+            if isinstance(row, Mapping)
+        ]
+        indices = map_goals_to_stages(
+            [str(row.get("goal") or "") for row in rows], task
+        )
+        for row, index in zip(rows, indices):
             subtask_id = str(row.get("id") or "")
             if subtask_id and index:
                 mapping[subtask_id] = index
-    for subtask in offline_plan_subtasks(legs, task):
-        index = _stage_index_of_text(subtask.get("goal"), task)
+    for leg in legs:
+        plan = leg.final_plan
+        if not isinstance(plan, Mapping) and isinstance(leg.checkpoint, Mapping):
+            plan = leg.checkpoint.get("plan")
+        rows = [
+            row for row in (plan or {}).get("subtasks") or []
+            if isinstance(row, Mapping)
+        ]
+        if not rows:
+            continue
+        indices = map_goals_to_stages(
+            [str(row.get("goal") or "") for row in rows], task
+        )
+        for row, index in zip(rows, indices):
+            subtask_id = str(row.get("id") or "")
+            if subtask_id and index:
+                mapping[subtask_id] = index
+    pending = [
+        subtask for subtask in offline_plan_subtasks(legs, task)
+        if str(subtask.get("id") or "") not in mapping
+        or mapping.get(str(subtask.get("id") or "")) is None
+    ]
+    indices = map_goals_to_stages(
+        [str(subtask.get("goal") or "") for subtask in pending], task
+    )
+    for subtask, index in zip(pending, indices):
         if index:
             mapping[str(subtask.get("id"))] = index
     return mapping
+
+
+def plan_quality_audit(
+    legs: Sequence[LegResult], task: TaskSpec, *, plan_mode: str = "given"
+) -> dict:
+    """Offline audit of the plan the episode *ran* against the truth stages.
+
+    Evaluation only: nothing here reaches a prompt. The audit says whether the
+    plan has the stage count the mission needs, whether its goals map to the
+    stages in the declared order (goal-text coverage via label/keyword
+    matching), and whether each stage's typed ``done_when`` criterion is the
+    semantic one the mission implies (a landmark ``sighted``, the target
+    ``arrived``). ``structure_errors`` comes from the task module's own
+    ``plan_structure_errors`` - the same check the self-plan runtime uses.
+    """
+    record: Mapping | None = None
+    source_leg = ""
+    for leg in legs:
+        candidate = leg.final_plan
+        if not isinstance(candidate, Mapping) and isinstance(leg.checkpoint, Mapping):
+            candidate = leg.checkpoint.get("plan")
+        if isinstance(candidate, Mapping) and candidate.get("subtasks"):
+            record = candidate
+            source_leg = leg.plan.label
+            break
+    if record is None:
+        return {
+            "available": False,
+            "plan_mode": plan_mode,
+            "n_subtasks": 0,
+            "n_stages": len(task.stages),
+            "count_match": False,
+            "coverage": 0,
+            "coverage_rate": 0.0,
+            "order_ok": False,
+        }
+    modules = m1_modules()
+    task_module = modules.get("task")
+    read_type = getattr(task_module, "done_when_type", None) if task_module else None
+    structure_errors = (
+        task_module.plan_structure_errors(record)
+        if task_module is not None and hasattr(task_module, "plan_structure_errors")
+        else []
+    )
+    subtasks = [
+        subtask for subtask in record.get("subtasks") or [] if isinstance(subtask, Mapping)
+    ]
+    rows: list[dict] = []
+    goals = [str(subtask.get("goal") or "") for subtask in subtasks]
+    indices: list[int | None] = map_goals_to_stages(goals, task)
+    covered: set[int] = set()
+    type_hits = 0
+    type_checked = 0
+    done_when_present = 0
+    for position, (subtask, index) in enumerate(zip(subtasks, indices), 1):
+        goal = goals[position - 1]
+        stage = task.stages[index - 1] if index else None
+        got_type = ""
+        if callable(read_type):
+            try:
+                got_type = str(read_type(subtask) or "")
+            except Exception:  # noqa: BLE001 - an audit never breaks the report
+                got_type = ""
+        if not got_type:
+            got_type = str(subtask.get("done_when_type") or "")
+        if str(subtask.get("done_when") or "").strip():
+            done_when_present += 1
+        expected_type = stage.effective_done_when_type() if stage else ""
+        type_ok: bool | None = None
+        if stage is not None and expected_type:
+            type_checked += 1
+            type_ok = got_type == expected_type or (
+                expected_type == DONE_WHEN_SIGHTED and got_type == DONE_WHEN_LOCATED
+            )
+            if type_ok:
+                type_hits += 1
+        if index is not None:
+            covered.add(index)
+        rows.append(
+            {
+                "position": position,
+                "id": str(subtask.get("id") or ""),
+                "goal": goal[:120],
+                "stage": None if stage is None else stage.stage_id,
+                "stage_index": index,
+                "done_when_type": got_type,
+                "expected_type": expected_type,
+                "type_ok": type_ok,
+                "depends_on": [str(dep) for dep in subtask.get("depends_on") or []],
+            }
+        )
+    mapped = [index for index in indices if index is not None]
+    order_ok = bool(mapped) and mapped == sorted(mapped) and len(set(mapped)) == len(mapped)
+    return {
+        "available": True,
+        "plan_mode": plan_mode,
+        "plan_id": str(record.get("plan_id") or ""),
+        "source_leg": source_leg,
+        "n_subtasks": len(subtasks),
+        "n_stages": len(task.stages),
+        "count_match": len(subtasks) == len(task.stages),
+        "order_indices": indices,
+        "order_ok": order_ok,
+        "coverage": len(covered),
+        "coverage_rate": _rate(len(covered), len(task.stages)),
+        "done_when_present": done_when_present,
+        "done_when_type_checked": type_checked,
+        "done_when_type_hits": type_hits,
+        "done_when_type_accuracy": _rate(type_hits, type_checked),
+        "structure_errors": list(structure_errors),
+        "structure_ok": not structure_errors,
+        "rows": rows,
+    }
 
 
 def entry_stage_index(entry: Mapping, mapping: Mapping[str, int]) -> int | None:
@@ -2542,6 +2848,15 @@ def stage_report(
     scoped report. Nothing here reads the model's prose: a plan step, a
     ``finish`` reason or a recovery note cannot complete a stage.
 
+    The typed criterion (:meth:`StageSpec.effective_done_when_type`) decides
+    which halves are required: ``sighted``/``located`` stages complete on the
+    located half alone (a landmark the mission only asks to find must not be
+    charged for a flight), ``verified`` needs the accepted confirmation, and
+    ``arrived`` keeps the reach + locate + identity contract. ``reach_attempts``
+    counts the movement calls the stage's own sub-task made, whether or not the
+    stage needed them - the number that says whether a semantic criterion saved
+    motion.
+
     The v1 scope contract narrows both halves to the sub-task that stage was
     executing: an observation, candidate or arrival produced while another
     sub-task was current does not count for this one. The mode is automatic -
@@ -2572,6 +2887,8 @@ def stage_report(
             "within_m": stage.within_m,
             "target": bool(stage.target),
             "position_source": stage.source,
+            "done_when_type": stage.effective_done_when_type(),
+            "reach_required": stage.effective_done_when_type() == DONE_WHEN_ARRIVED,
             "reach": False,
             "reach_order": None,
             "reach_distance_m": None,
@@ -2604,6 +2921,11 @@ def stage_report(
             stage_entries, excluded = list(entries), 0
         row["scoped_entries"] = len(stage_entries)
         row["scope_excluded_entries"] = excluded
+        movement_entries = [
+            entry for entry in stage_entries if str(entry.get("tool") or "") in ACTION_TOOLS
+        ]
+        row["reach_attempts"] = len(movement_entries)
+        row["reach_tools"] = sorted({str(entry.get("tool") or "") for entry in movement_entries})
         if scoped:
             row.update(_stage_confirmation(stage_entries, stage))
         else:
@@ -2717,7 +3039,16 @@ def stage_report(
                         "evidence_count": len(located["evidence"]),
                     }
                 )
-        if scoped:
+        stage_type = stage.effective_done_when_type()
+        if stage_type in (DONE_WHEN_SIGHTED, DONE_WHEN_LOCATED):
+            # a landmark that only has to be found is complete on a located
+            # sighting: no arrival and no identity confirmation are asked for
+            row["complete"] = bool(row["located"])
+        elif stage_type == DONE_WHEN_VERIFIED:
+            row["complete"] = bool(
+                row["located"] and row["identity_complete"]
+            ) if scoped else bool(row["located"])
+        elif scoped:
             # identity-complete: an arrival at the candidate and a located place
             # are only the version-1 half; the accepted confirmation of the
             # *current* instance is the second half.
@@ -2779,6 +3110,29 @@ def stage_report(
         "complete_count": len(complete),
         "complete_ids": [task.stages[i - 1].stage_id for i in complete],
         "complete_orders": complete_orders,
+        "complete_by_type": {
+            kind: sum(
+                1
+                for row in stages.values()
+                if row.get("done_when_type") == kind and row["complete"]
+            )
+            for kind in DONE_WHEN_TYPES
+        },
+        "stages_by_type": {
+            kind: sum(
+                1 for row in stages.values() if row.get("done_when_type") == kind
+            )
+            for kind in DONE_WHEN_TYPES
+        },
+        "reach_attempts": sum(int(row.get("reach_attempts") or 0) for row in stages.values()),
+        "reach_attempts_by_type": {
+            kind: sum(
+                int(row.get("reach_attempts") or 0)
+                for row in stages.values()
+                if row.get("done_when_type") == kind
+            )
+            for kind in DONE_WHEN_TYPES
+        },
         "order_ok": bool(order_ok),
         "chain_complete": len(complete) == len(task.stages),
         "relation_ok": all(
@@ -3881,6 +4235,10 @@ def episode_metrics(
     verdict["legs"] = leg_rows
     verdict["arms"] = arms
     verdict["n_arms"] = len(arms)
+    verdict["plan_quality"] = plan_quality_audit(
+        list(legs), task,
+        plan_mode=str((legs[0].plan.ctx_extra or {}).get("plan_mode") or "given"),
+    )
     follow_ups = list(primary[1:])
     if follow_ups:
         follow = follow_ups[-1]
@@ -3969,19 +4327,33 @@ def annotations(
     current_leg = legs[0].plan.label if legs else ""
     for stage in task.stages:
         row = stages.get(stage.stage_id) or {}
+        stage_type = str(row.get("done_when_type") or stage.effective_done_when_type())
         if row.get("complete"):
-            lines.append(
-                f"stage {stage.index} ({stage.label}) complete: reached {row.get('reach_distance_m')} m "
-                f"from its place and located it {row.get('locate_distance_m')} m off "
-                f"via {row.get('locate_tool') or 'a tool result'} at call {row.get('located_seq')} "
-                f"with {row.get('evidence_count')} evidence ref(s)"
-            )
+            if stage_type in (DONE_WHEN_SIGHTED, DONE_WHEN_LOCATED):
+                lines.append(
+                    f"stage {stage.index} ({stage.label}) complete as {stage_type}: "
+                    f"located {row.get('locate_distance_m')} m off via "
+                    f"{row.get('locate_tool') or 'a tool result'} at call "
+                    f"{row.get('located_seq')} with {row.get('evidence_count')} "
+                    f"evidence ref(s); no flight required"
+                )
+            else:
+                lines.append(
+                    f"stage {stage.index} ({stage.label}) complete as {stage_type}: "
+                    f"reached {row.get('reach_distance_m')} m from its place and located it "
+                    f"{row.get('locate_distance_m')} m off via "
+                    f"{row.get('locate_tool') or 'a tool result'} at call "
+                    f"{row.get('located_seq')} with {row.get('evidence_count')} evidence ref(s)"
+                )
         else:
-            missing = ", ".join(
-                name for name, flag in (("reach", row.get("reach")), ("locate", row.get("located")))
-                if not flag
+            checks = [("locate", row.get("located"))]
+            if row.get("reach_required"):
+                checks.append(("reach", row.get("reach")))
+            missing = ", ".join(name for name, flag in checks if not flag)
+            lines.append(
+                f"stage {stage.index} ({stage.label}) NOT complete "
+                f"(done_when={stage_type}; missing {missing or 'identification'})"
             )
-            lines.append(f"stage {stage.index} ({stage.label}) NOT complete ({missing or 'unevaluable'})")
         if row.get("relation_ok") is not None:
             lines.append(
                 f"  stage {stage.index} relation to {stage.anchor}: "
@@ -4070,10 +4442,20 @@ def aggregate(episodes: Sequence[Mapping], task: TaskSpec, meta: Mapping) -> dic
                 "id": stage.stage_id,
                 "index": stage.index,
                 "label": stage.label,
+                "done_when_type": stage.effective_done_when_type(),
                 "n": n,
                 "reach": reach,
                 "located": located,
                 "complete": complete,
+                "reach_attempts": sum(
+                    int(
+                        ((row["stages"]["stages"].get(stage.stage_id) or {}).get(
+                            "reach_attempts"
+                        ))
+                        or 0
+                    )
+                    for row in episodes
+                ),
                 "reach_rate": _rate(reach, n),
                 "locate_rate": _rate(located, n),
                 "complete_rate": _rate(complete, n),
@@ -4142,6 +4524,8 @@ def aggregate(episodes: Sequence[Mapping], task: TaskSpec, meta: Mapping) -> dic
         item for row in episodes
         for item in ((row.get("recovery_regrounding") or {}).get("rows") or [])
     ]
+    quality_rows = [row.get("plan_quality") or {} for row in episodes]
+    quality_available = [row for row in quality_rows if row.get("available")]
     return {
         "n_episodes": n,
         "n_legs": len(leg_rows),
@@ -4153,12 +4537,78 @@ def aggregate(episodes: Sequence[Mapping], task: TaskSpec, meta: Mapping) -> dic
         "stage_complete_rate": _rate(
             sum(row["complete"] for row in stage_rows), n * len(task.stages)
         ),
+        "stage_complete_by_type": {
+            kind: {
+                "stages": sum(1 for row in stage_rows if row["done_when_type"] == kind),
+                "complete": sum(
+                    row["complete"] for row in stage_rows if row["done_when_type"] == kind
+                ),
+                "reach_attempts": sum(
+                    row["reach_attempts"]
+                    for row in stage_rows
+                    if row["done_when_type"] == kind
+                ),
+            }
+            for kind in DONE_WHEN_TYPES
+        },
+        "reach_attempts": sum(int(row["reach_attempts"]) for row in stage_rows),
         "chain_complete_rate": _rate(sum(1 for row in episodes if row["stages"]["chain_complete"]), n),
         "order_ok_rate": _rate(sum(1 for row in episodes if row["stages"]["order_ok"]), n),
         # goal.md v1 main metric: the whole chain in the declared stage order
         "ordered_success_rate": _rate(len(ordered), n),
         "complete_ordered_task_success": {
             "count": len(ordered), "n": n, "rate": _rate(len(ordered), n)
+        },
+        "plan_quality": {
+            "plans": len(quality_available),
+            "count_match": sum(1 for row in quality_available if row.get("count_match")),
+            "count_match_rate": _rate(
+                sum(1 for row in quality_available if row.get("count_match")),
+                len(quality_available),
+            ),
+            "order_ok": sum(1 for row in quality_available if row.get("order_ok")),
+            "order_ok_rate": _rate(
+                sum(1 for row in quality_available if row.get("order_ok")),
+                len(quality_available),
+            ),
+            "mean_coverage": (
+                round(
+                    sum(float(row.get("coverage_rate") or 0.0) for row in quality_available)
+                    / len(quality_available),
+                    3,
+                )
+                if quality_available
+                else None
+            ),
+            "done_when_type_checked": sum(
+                int(row.get("done_when_type_checked") or 0) for row in quality_available
+            ),
+            "done_when_type_hits": sum(
+                int(row.get("done_when_type_hits") or 0) for row in quality_available
+            ),
+            "done_when_type_accuracy": _rate(
+                sum(int(row.get("done_when_type_hits") or 0) for row in quality_available),
+                sum(int(row.get("done_when_type_checked") or 0) for row in quality_available),
+            ),
+            "structure_ok": sum(
+                1 for row in quality_available if row.get("structure_ok")
+            ),
+            "by_episode": [
+                {
+                    "label": row.get("label"),
+                    "seed": row.get("seed"),
+                    "plan_mode": row.get("plan_mode"),
+                    **{
+                        key: (quality_rows[index] or {}).get(key)
+                        for key in (
+                            "available", "n_subtasks", "n_stages", "count_match",
+                            "order_ok", "coverage_rate", "done_when_type_accuracy",
+                            "structure_ok",
+                        )
+                    },
+                }
+                for index, row in enumerate(episodes)
+            ],
         },
         "wrong_instance_acceptance": {
             "events": acceptance_events,
@@ -4559,14 +5009,40 @@ def report_markdown(report: Mapping) -> str:
         "",
         "## stages (per episode share)",
         "",
-        "| # | stage | reach | located | complete |",
-        "|---|---|---|---|---|",
+        "| # | stage | done_when | reach | located | complete | reach attempts |",
+        "|---|---|---|---|---|---|---|",
     ]
     for row in agg.get("stages", []):
         lines.append(
-            f"| {row['index']} | {row['label']} | {row['reach']}/{row['n']} "
+            f"| {row['index']} | {row['label']} | {row.get('done_when_type', '')} | "
+            f"{row['reach']}/{row['n']} "
             f"({row['reach_rate']}) | {row['located']}/{row['n']} ({row['locate_rate']}) | "
-            f"{row['complete']}/{row['n']} ({row['complete_rate']}) |"
+            f"{row['complete']}/{row['n']} ({row['complete_rate']}) | "
+            f"{row.get('reach_attempts', 0)} |"
+        )
+    quality = agg.get("plan_quality") or {}
+    lines += [
+        "",
+        "## plan quality (offline audit, not in the prompt)",
+        "",
+        f"- plans audited: {quality.get('plans', 0)}; stage-count match: "
+        f"{quality.get('count_match', 0)} ({quality.get('count_match_rate')}); "
+        f"order ok: {quality.get('order_ok', 0)} ({quality.get('order_ok_rate')})",
+        f"- mean stage coverage: {quality.get('mean_coverage')}; "
+        f"done_when type accuracy: {quality.get('done_when_type_hits', 0)}/"
+        f"{quality.get('done_when_type_checked', 0)} "
+        f"({quality.get('done_when_type_accuracy')}); structurally valid plans: "
+        f"{quality.get('structure_ok', 0)}/{quality.get('plans', 0)}",
+        "",
+        "## semantic completion (reach attempts by stage type)",
+        "",
+        "| done_when type | stages | complete | reach attempts |",
+        "|---|---|---|---|",
+    ]
+    for kind, row in (agg.get("stage_complete_by_type") or {}).items():
+        lines.append(
+            f"| {kind} | {row.get('stages', 0)} | {row.get('complete', 0)} | "
+            f"{row.get('reach_attempts', 0)} |"
         )
     intr = agg.get("interrupt") or {}
     lines += [
@@ -4859,10 +5335,22 @@ def analyze_run(run_dir: Path, *, write: bool = True, gate_m: float | None = Non
         metrics = episode_metrics(task, legs, gate_m=gate)
         metrics["seed"] = int(str(seed_dir.name).replace("seed", "") or 0)
         episodes.append(metrics)
+    source_meta: dict = {}
+    source_report = run_dir / REPORT_JSON
+    if source_report.exists():
+        try:
+            loaded = json.loads(source_report.read_text()).get("meta")
+            source_meta = dict(loaded) if isinstance(loaded, Mapping) else {}
+        except (OSError, ValueError):
+            source_meta = {}
     meta = {
         "task_name": task.name,
         "task_file": str(task_path),
         "instruction": task.instruction,
+        # run-level knobs the raw report carries (the re-analysis must not
+        # silently drop the arm label it is scoring)
+        "plan_mode": source_meta.get("plan_mode"),
+        "seeds": source_meta.get("seeds"),
         "n_episodes": len(episodes),
         "success_gate_m": gate,
         "backend": backend,
@@ -4961,6 +5449,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="SEED:MODE[:VALUE] per seed; MODE=budget|deadline; repeatable")
     parser.add_argument("--resume", type=str, default="on", choices=["on", "off"],
                         help="carry the plan/subgoal/brief into the second leg")
+    parser.add_argument("--plan-mode", type=str, default="given",
+                        dest="plan_mode", choices=["given", "self"],
+                        help="given (default): the driver writes the structured stage "
+                             "plan before the first model turn (the execution arm); "
+                             "self: the driver writes no plan - the model receives "
+                             "only the natural-language instruction and must write "
+                             "the sub-task plan itself, which the runtime validates "
+                             "(one correction) and executes")
     parser.add_argument("--restart-control", action="store_true",
                         help="also run a no-carry leg from the original start pose")
     parser.add_argument("--dry-run", action="store_true",
@@ -5055,27 +5551,42 @@ def plan_legs(
         else:
             first.deadline_s = float(value) if value else 60.0
         first.interrupt_mode = mode
-    fresh_plan, fresh_detail = build_fresh_plan(
-        task,
-        world=world,
-        instruction=first.instruction,
-        episode_id=first.label,
-    )
-    if fresh_plan is not None:
-        first.ctx_extra = {"plan": fresh_plan}
+    plan_mode = str(getattr(args, "plan_mode", "given") or "given")
+    if plan_mode == "self":
+        # the self-plan arm gives the model the natural-language mission only:
+        # no carry plan, no stage list, no next_step bootstrap. The runtime asks
+        # for the plan on the first decision turn and validates it.
+        first.ctx_extra = {"plan_mode": "self"}
         first.carry = {
             "mode": "fresh",
-            "channels": ["plan"],
+            "channels": [],
+            "plan_mode": "self",
             "done": [],
-            "plan_steps": [stage.step for stage in task.stages],
-            "plan_current_step": fresh_plan.get("current_step"),
-            "plan_subtasks": [
-                {"id": item.get("id"), "status": item.get("status")}
-                for item in fresh_plan.get("subtasks") or []
-            ],
-            "plan_carry_backend": fresh_detail.get("plan_backend"),
-            "note": "fresh leg starts with a structured plan (no truth places)",
+            "plan_steps": [],
+            "note": "natural-language instruction only; the model writes the plan",
         }
+    else:
+        fresh_plan, fresh_detail = build_fresh_plan(
+            task,
+            world=world,
+            instruction=first.instruction,
+            episode_id=first.label,
+        )
+        if fresh_plan is not None:
+            first.ctx_extra = {"plan": fresh_plan}
+            first.carry = {
+                "mode": "fresh",
+                "channels": ["plan"],
+                "done": [],
+                "plan_steps": [stage.step for stage in task.stages],
+                "plan_current_step": fresh_plan.get("current_step"),
+                "plan_subtasks": [
+                    {"id": item.get("id"), "status": item.get("status")}
+                    for item in fresh_plan.get("subtasks") or []
+                ],
+                "plan_carry_backend": fresh_detail.get("plan_backend"),
+                "note": "fresh leg starts with a structured plan (no truth places)",
+            }
     plans.append(first)
     if resume_leg is None:
         return plans
@@ -5449,6 +5960,7 @@ def main(argv: list[str] | None = None) -> dict:
         "success_gate_m": gate,
         "interrupts": {str(k): list(v) for k, v in interrupts.items()},
         "resume": args.resume,
+        "plan_mode": str(getattr(args, "plan_mode", "given") or "given"),
         "restart_control": bool(args.restart_control),
         "switches": RUNNER.switch_report(base_args),
         "switches_applied": {

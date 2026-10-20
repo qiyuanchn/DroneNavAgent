@@ -665,14 +665,33 @@ class HFLocalVLM(VLMBackend):
             messages, tokenize=False, add_generation_prompt=True, **kwargs
         )
 
-    def _generate(self, text: str, images: list) -> str:
+    def _token_budget(self, context: dict | None) -> int:
+        """Per-call generation cap: ``context["max_new_tokens"]`` may raise it.
+
+        A self-plan turn needs room for the whole multi-stage JSON object; the
+        backend default (192) cuts a four-stage plan mid-object. The runtime
+        asks for the larger cap only on that turn, and a caller can never
+        lower the configured default through the context.
+        """
+        configured = int(self.max_new_tokens)
+        if not isinstance(context, dict):
+            return configured
+        try:
+            requested = int(context.get("max_new_tokens") or 0)
+        except (TypeError, ValueError):
+            return configured
+        return max(configured, requested)
+
+    def _generate(self, text: str, images: list, max_new_tokens: int | None = None) -> str:
         inputs = self.processor(
             text=[text], images=images, return_tensors="pt"
         ).to(self.device)
         with torch.no_grad():
             output = self.model.generate(
                 **inputs,
-                max_new_tokens=self.max_new_tokens,
+                max_new_tokens=(
+                    self.max_new_tokens if max_new_tokens is None else max_new_tokens
+                ),
                 do_sample=False,
             )
         new_tokens = output[0, inputs["input_ids"].shape[1]:]
@@ -726,7 +745,7 @@ class HFLocalVLM(VLMBackend):
             text = self._render(self._messages(system_prompt, user_prompt, images))
         except Exception:
             text = self._render(self._messages_without_system(system_prompt, user_prompt, images))
-        return self._generate(text, images)
+        return self._generate(text, images, self._token_budget(context))
 
     def decide_with_tools(self, frames, system_prompt, user_prompt, tools_text="", context=None):
         specs = resolve_tool_specs(tools_text, context)
@@ -746,7 +765,7 @@ class HFLocalVLM(VLMBackend):
             return super().decide_with_tools(
                 frames, system_prompt, user_prompt, tools_text, context
             )
-        raw = self._generate(text, images)
+        raw = self._generate(text, images, self._token_budget(context))
         calls = extract_native_tool_calls(raw)
         self._log_tool_call("native", raw, calls, started, context, _frame_count(frames))
         return render_tool_reply(calls) if calls else raw
@@ -815,10 +834,21 @@ class OpenAIVLM(VLMBackend):
         with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
             return json.loads(response.read().decode())
 
+    def _token_budget(self, context: dict | None) -> int:
+        """Per-call cap; ``context["max_new_tokens"]`` may only raise it."""
+        configured = int(self.max_new_tokens)
+        if not isinstance(context, dict):
+            return configured
+        try:
+            requested = int(context.get("max_new_tokens") or 0)
+        except (TypeError, ValueError):
+            return configured
+        return max(configured, requested)
+
     def decide(self, frames, system_prompt, user_prompt, context=None):
         payload = {
             "model": self.model,
-            "max_tokens": self.max_new_tokens,
+            "max_tokens": self._token_budget(context),
             "temperature": 0.0,
             "messages": self._messages(frames, system_prompt, user_prompt),
         }
@@ -837,7 +867,7 @@ class OpenAIVLM(VLMBackend):
         ]
         payload = {
             "model": self.model,
-            "max_tokens": self.max_new_tokens,
+            "max_tokens": self._token_budget(context),
             "temperature": 0.0,
             "messages": messages,
             "tools": to_openai_tools(specs),

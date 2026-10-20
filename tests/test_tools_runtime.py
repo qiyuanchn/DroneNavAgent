@@ -20,10 +20,14 @@ from vlm_nav.runtime import (
     FINISH_TOOL,
     NO_TOOL,
     PLAN_CALL_HINT,
+    PLAN_MODE_GIVEN,
+    PLAN_MODE_SELF,
     RECOVERY_ADVICE,
     RECOVERY_FINAL,
     RECOVERY_HOOK,
     RECOVERY_STOP,
+    SELF_PLAN_INVALID,
+    SELF_PLAN_PROMPT,
     STATE_LABELS,
     REASON_ABORTED,
     REASON_BUDGET_EXHAUSTED,
@@ -3417,6 +3421,170 @@ def example_calls_in(text: str) -> list[dict]:
             args = payload.get("args")
             calls.append({"tool": str(payload["tool"]), "args": dict(args or {})})
     return calls
+
+
+class SelfPlanModeTest(unittest.TestCase):
+    """``--plan-mode self``: only the mission, the model writes and fixes the plan.
+
+    The runtime asks on the first decision turn, validates the record with the
+    task module's own structure check, asks for exactly one correction when the
+    plan is invalid, and executes the accepted plan with the same executor as
+    the given-plan arm.
+    """
+
+    def _registry(self):
+        registry = make_registry("step_ok", "observe", finish_tool=True)
+        register_task_tools(registry)
+        return registry
+
+    def _valid_steps(self):
+        return [
+            {
+                "id": "st_1",
+                "goal": "find the wooden door",
+                "done_when": {"type": "sighted", "description": "the door is seen"},
+            },
+            {
+                "id": "st_2",
+                "goal": "fly to the cardboard box",
+                "depends_on": ["st_1"],
+                "done_when": {"type": "arrived", "description": "the box is reached"},
+            },
+        ]
+
+    def test_the_first_prompt_asks_for_a_plan_and_the_model_plan_is_executed(self):
+        vlm = RecordingScriptedVLM(
+            [
+                tool_call("update_plan", steps=self._valid_steps()),
+                tool_call("observe"),
+                tool_call("finish", reason="ok"),
+            ]
+        )
+        runtime = AgentRuntime(
+            self._registry(), FakeWorld(), None, vlm,
+            budget=8, max_turns=5, plan_mode=PLAN_MODE_SELF,
+        )
+        log = runtime.run("find the door, then fly to the box beside it")
+
+        self.assertIn(SELF_PLAN_PROMPT, vlm.seen[0]["user"])
+        record = plan_state(runtime.ctx)
+        self.assertEqual(len(record["subtasks"]), 2)
+        self.assertEqual(record["subtasks"][0]["done_when_type"], "sighted")
+        self.assertEqual(record["subtasks"][1]["done_when_type"], "arrived")
+        self.assertEqual(record["subtasks"][1]["depends_on"], ["st_1"])
+        self.assertNotIn(SELF_PLAN_PROMPT, vlm.seen[1]["user"])
+        events = [event for event in log.events if event.get("name", "").startswith("self_plan")]
+        self.assertEqual([event["name"] for event in events], ["self_plan_accepted"])
+
+    def test_only_the_pending_plan_turn_gets_the_larger_generation_cap(self):
+        vlm = RecordingScriptedVLM(
+            [
+                tool_call("update_plan", steps=self._valid_steps()),
+                tool_call("observe"),
+                tool_call("finish", reason="ok"),
+            ]
+        )
+        runtime = AgentRuntime(
+            self._registry(), FakeWorld(), None, vlm,
+            budget=8, max_turns=5, plan_mode=PLAN_MODE_SELF,
+        )
+        runtime.run("find the door, then fly to the box beside it")
+
+        self.assertEqual(512, vlm.seen[0]["context"]["max_new_tokens"])
+        self.assertNotIn("max_new_tokens", vlm.seen[1]["context"])
+        self.assertNotIn("max_new_tokens", vlm.seen[2]["context"])
+
+    def test_a_truncated_plan_reply_is_retried_with_a_compact_hint(self):
+        truncated = (
+            '<tool_call>\n{"tool": "update_plan", "args": {"steps": ['
+            '{"id": "st_1", "goal": "find the door", '
+            '"done_when": {"type": "sighted", "description": "the do'
+        )
+        vlm = RecordingScriptedVLM(
+            [
+                truncated,
+                tool_call("update_plan", steps=self._valid_steps()),
+                tool_call("finish", reason="ok"),
+            ]
+        )
+        runtime = AgentRuntime(
+            self._registry(), FakeWorld(), None, vlm,
+            budget=10, max_turns=6, plan_mode=PLAN_MODE_SELF,
+        )
+        log = runtime.run("find the door, then fly to the box beside it")
+
+        self.assertIn("truncated by the generation limit", vlm.seen[1]["user"])
+        self.assertIn("more compact", vlm.seen[1]["user"])
+        record = plan_state(runtime.ctx)
+        self.assertEqual(len(record["subtasks"]), 2)
+        events = [event for event in log.events if event.get("name", "").startswith("self_plan")]
+        self.assertEqual([event["name"] for event in events], ["self_plan_accepted"])
+
+    def test_an_invalid_plan_is_corrected_once_and_then_executed(self):
+        vlm = RecordingScriptedVLM(
+            [
+                # no done_when: structurally invalid for a self-written plan
+                tool_call("update_plan", steps=[{"id": "st_1", "goal": "find the door"}]),
+                tool_call("update_plan", steps=self._valid_steps()),
+                tool_call("finish", reason="ok"),
+            ]
+        )
+        runtime = AgentRuntime(
+            self._registry(), FakeWorld(), None, vlm,
+            budget=10, max_turns=6, plan_mode=PLAN_MODE_SELF,
+        )
+        log = runtime.run("find the door, then fly to the box beside it")
+
+        self.assertIn(SELF_PLAN_PROMPT, vlm.seen[0]["user"])
+        self.assertIn("SELF-PLAN INVALID", vlm.seen[1]["user"])
+        self.assertIn("missing done_when", vlm.seen[1]["user"])
+        self.assertNotIn("SELF-PLAN INVALID", vlm.seen[2]["user"])
+        record = plan_state(runtime.ctx)
+        self.assertEqual(len(record["subtasks"]), 2)
+        events = [event for event in log.events if event.get("name", "").startswith("self_plan")]
+        self.assertEqual(
+            [event["name"] for event in events],
+            ["self_plan_invalid", "self_plan_accepted"],
+        )
+
+    def test_the_correction_is_offered_once(self):
+        invalid = [{"id": "st_1", "goal": "find the door"}]
+        vlm = RecordingScriptedVLM(
+            [
+                tool_call("update_plan", steps=invalid),
+                tool_call("update_plan", steps=invalid),
+                tool_call("observe"),
+                tool_call("finish", reason="ok"),
+            ]
+        )
+        runtime = AgentRuntime(
+            self._registry(), FakeWorld(), None, vlm,
+            budget=10, max_turns=6, plan_mode=PLAN_MODE_SELF,
+        )
+        log = runtime.run("find the door, then fly to the box beside it")
+
+        corrected = [
+            index for index, seen in enumerate(vlm.seen)
+            if "SELF-PLAN INVALID" in seen["user"]
+        ]
+        self.assertEqual(len(corrected), 1)
+        self.assertEqual(corrected[0], 1)
+        invalid_events = [
+            event for event in log.events
+            if event.get("name") == "self_plan_invalid"
+        ]
+        self.assertGreaterEqual(len(invalid_events), 2)
+        self.assertTrue(invalid_events[-1]["data"]["correction_sent"])
+
+    def test_given_mode_never_asks_for_a_plan(self):
+        vlm = RecordingScriptedVLM(
+            [tool_call("observe"), tool_call("finish", reason="ok")]
+        )
+        AgentRuntime(
+            self._registry(), FakeWorld(), None, vlm,
+            budget=6, max_turns=4, plan_mode=PLAN_MODE_GIVEN,
+        ).run("find the red book")
+        self.assertNotIn(SELF_PLAN_PROMPT, vlm.seen[0]["user"])
 
 
 if __name__ == "__main__":

@@ -2379,3 +2379,156 @@ class ScopeContractTest(unittest.TestCase):
         self.assertIn("wrong_instance_acceptance", agg)
         self.assertIn("finish_contract", agg)
         self.assertEqual(agg["finish_contract"]["blocked"], 1)
+
+
+class SemanticCompletionTest(unittest.TestCase):
+    """goal.md section 4: the stage's done_when type decides what proves it.
+
+    A ``sighted`` landmark completes on a located sighting (no reach and no
+    confirmation); an ``arrived`` target keeps the reach + locate (+ identity)
+    contract. The offline verdict and the executor share the same vocabulary.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.directory = Path(self.tmp.name)
+        stages = [dict(stage) for stage in TASK_STAGES]
+        stages[0]["done_when_type"] = "sighted"
+        stages[1]["done_when_type"] = "sighted"
+        stages[2]["done_when_type"] = "arrived"
+        self.task = make_task(self.directory, stages=stages)
+
+    def test_stage_types_are_read_from_the_task_file(self):
+        self.assertEqual(
+            [stage.effective_done_when_type() for stage in self.task.stages],
+            ["sighted", "sighted", "arrived"],
+        )
+
+    def test_an_untyped_stage_that_declares_reach_stays_arrived(self):
+        # the fixture's original stages declare reach_m and no type
+        task = make_task(self.directory)
+        self.assertEqual(
+            [stage.effective_done_when_type() for stage in task.stages],
+            ["arrived", "arrived", "arrived"],
+        )
+
+    def test_a_sighted_stage_is_complete_on_a_located_sighting_alone(self):
+        place = self.task.stages[0].position
+        entries = [entry(
+            1, "ground_target",
+            data={"candidates": [{"position_flu": list(place)}]},
+            pose=[5.0, 5.0, 1.0], evidence=[ref("observation", "obs_1")],
+        )]
+        report = DRIVER.stage_report(entries, self.task)
+        row = report["stages"]["landmark"]
+        self.assertTrue(row["located"])
+        self.assertFalse(row["reach"])
+        self.assertFalse(row["reach_required"])
+        self.assertTrue(row["complete"])
+        # the flight was never attempted: the semantic criterion saved it
+        self.assertEqual(row["reach_attempts"], 0)
+        self.assertEqual(report["complete_count"], 1)
+
+    def test_an_arrived_stage_is_not_complete_on_a_located_sighting(self):
+        place = self.task.stages[2].position
+        entries = [entry(
+            1, "ground_target",
+            data={"candidates": [{"position_flu": list(place)}]},
+            pose=[5.0, 5.0, 1.0], evidence=[ref("observation", "obs_1")],
+        )]
+        report = DRIVER.stage_report(entries, self.task)
+        row = report["stages"]["target"]
+        self.assertTrue(row["located"])
+        self.assertFalse(row["reach"])
+        self.assertTrue(row["reach_required"])
+        self.assertFalse(row["complete"])
+
+    def test_a_flown_arrived_stage_completes_and_counts_its_reach_attempt(self):
+        place = self.task.stages[2].position
+        entries = [entry(
+            1, "approach_candidate",
+            data={"candidates": [{"position_flu": list(place)}],
+                  "outcome": "arrived", "target_position": list(place)},
+            pose=list(place), evidence=[ref("memory", "cand_1")],
+        )]
+        report = DRIVER.stage_report(entries, self.task)
+        row = report["stages"]["target"]
+        self.assertTrue(row["reach"])
+        self.assertTrue(row["complete"])
+        self.assertEqual(row["reach_attempts"], 1)
+
+    def test_self_mode_writes_no_plan_and_records_the_mode(self):
+        args = DRIVER.parse_args([
+            "--task-file", str(self.directory / "task.json"),
+            "--out", str(self.directory / "out"),
+            "--plan-mode", "self",
+        ])
+        plans = DRIVER.plan_legs(
+            7, task=self.task, args=args, prompt_episode_id="ep_007",
+            interrupt=None, base_budget=8, base_turns=8, world=_StubWorld(),
+        )
+        first = plans[0]
+        self.assertNotIn("plan", first.ctx_extra)
+        self.assertEqual(first.ctx_extra.get("plan_mode"), "self")
+        self.assertEqual(first.carry["channels"], [])
+        self.assertEqual(first.carry["plan_steps"], [])
+        self.assertIn("--plan-mode", DRIVER.runner_argv(
+            self.task, args, out_dir=self.directory / "out",
+            instruction="do it", tool_budget=8, max_turns=8, seed=7,
+            episode_index=None,
+        ))
+
+    def test_plan_quality_audit_maps_the_models_own_plan(self):
+        record = {
+            "plan_id": "plan_1",
+            "revision": 1,
+            "steps": [],
+            "subtasks": [
+                {"id": "st_1", "goal": "找到走廊里的门（地标）",
+                 "done_when": {"type": "sighted", "description": "door seen"}},
+                {"id": "st_2", "goal": "找到门旁边的柜子", "depends_on": ["st_1"],
+                 "done_when": {"type": "sighted", "description": "cabinet seen"}},
+                {"id": "st_3", "goal": "确认柜子旁边的目标并飞过去", "depends_on": ["st_2"],
+                 "done_when": {"type": "arrived", "description": "box reached"}},
+            ],
+        }
+        leg = make_leg([], final_plan=record)
+        audit = DRIVER.plan_quality_audit([leg], self.task, plan_mode="self")
+        self.assertTrue(audit["available"])
+        self.assertTrue(audit["count_match"])
+        self.assertTrue(audit["order_ok"])
+        self.assertEqual(audit["coverage_rate"], 1.0)
+        self.assertEqual(audit["done_when_type_accuracy"], 1.0)
+        self.assertTrue(audit["structure_ok"])
+
+    def test_plan_quality_audit_flags_a_missing_stage(self):
+        record = {
+            "plan_id": "plan_1",
+            "subtasks": [
+                {"id": "st_1", "goal": "找到走廊里的门",
+                 "done_when": {"type": "sighted", "description": "door seen"}},
+            ],
+        }
+        audit = DRIVER.plan_quality_audit([make_leg([], final_plan=record)], self.task,
+                                          plan_mode="self")
+        self.assertFalse(audit["count_match"])
+        self.assertEqual(audit["coverage"], 1)
+
+    def test_relation_goals_are_mapped_in_plan_order(self):
+        """A goal that names its anchor too ("木椅旁边的灯") goes to the later
+        stage: order, not the longest keyword, disambiguates."""
+        stages = [dict(stage) for stage in TASK_STAGES]
+        stages[0]["keywords"] = ["木门", "door"]
+        stages[1]["keywords"] = ["柜子", "cabinet"]
+        stages[2]["keywords"] = ["目标", "纸箱", "box"]
+        task = make_task(self.directory, stages=stages)
+        indices = DRIVER.map_goals_to_stages(
+            [
+                "找到走廊里的木门（地标）",
+                "找到木门旁边的柜子",  # names the anchor too
+                "找到柜子旁边的纸箱并飞过去",
+            ],
+            task,
+        )
+        self.assertEqual(indices, [1, 2, 3])

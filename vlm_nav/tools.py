@@ -2056,35 +2056,173 @@ class ToolRegistry:
         }
 
 
+def _strip_reply_wrappers(text: str) -> str:
+    """Drop the chat template's wrappers, keeping the JSON payload.
+
+    Local models spell a call as ``<tool_call>{...}</tool_call>`` or put it in
+    a ```` ```json ```` fence; the payload is the same canonical object. The
+    tags and fence markers carry no JSON, so removing them never changes a
+    string value inside the payload.
+    """
+    cleaned = str(text or "").replace("<tool_call>", " ").replace("</tool_call>", " ")
+    if "```" not in cleaned:
+        return cleaned
+    kept: list[str] = []
+    for index, part in enumerate(cleaned.split("```")):
+        if index % 2 == 0:
+            kept.append(part)
+            continue
+        first, newline, rest = part.partition("\n")
+        tag = first.strip().lower()
+        kept.append(rest if newline and tag in ("json", "") else part)
+    return " ".join(kept)
+
+
+def _iter_json_fragments(text: str):
+    """Yield ``(fragment, complete)`` for each top-level ``{...}`` candidate.
+
+    ``complete`` is False when the object never closes (a reply cut off by the
+    generation cap). Quoted braces do not affect the depth count.
+    """
+    index, length = 0, len(text)
+    while index < length:
+        if text[index] != "{":
+            index += 1
+            continue
+        depth, in_string, escaped, end = 0, False, False, None
+        for j in range(index, length):
+            char = text[j]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    end = j
+                    break
+        yield (text[index:] if end is None else text[index : end + 1], end is not None)
+        if end is None:
+            return
+        index = end + 1
+
+
+def _close_truncated_json(fragment: str) -> str | None:
+    """Close the containers a cut-off object left open, or None.
+
+    Only missing ``]``/``}`` delimiters are repaired. A reply cut inside a
+    string cannot be completed without inventing a value, so that case stays
+    undecodable and the runtime asks for a more compact reply instead.
+    """
+    stack: list[str] = []
+    in_string, escaped = False, False
+    for char in fragment:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char in "}]" and stack:
+            stack.pop()
+    if in_string or not stack:
+        return None
+    closers = "".join("}" if opener == "{" else "]" for opener in reversed(stack))
+    return fragment + closers
+
+
+def _call_from_json(data: Any) -> tuple[str, dict] | None:
+    """``(tool, args)`` from canonical or native (``name``/``arguments``) JSON."""
+    if not isinstance(data, dict):
+        return None
+    if "tool_calls" in data and isinstance(data["tool_calls"], list):
+        for item in data["tool_calls"]:
+            call = _call_from_json(item)
+            if call is not None:
+                return call
+        return None
+    if "tool" in data:
+        tool = str(data.get("tool") or "").strip()
+        args = data.get("args") or {}
+    else:
+        # ``<tool_call>{"name": ..., "arguments": ...}</tool_call>`` and the
+        # OpenAI-shaped ``{"function": {...}}`` spelling
+        function = data.get("function") if isinstance(data.get("function"), dict) else data
+        tool = str(function.get("name") or "").strip()
+        args = function.get("arguments")
+        if args is None and function is not data:
+            args = function.get("parameters")
+        if args is None and "arguments" not in function and "parameters" not in function:
+            return None  # a bare {"name": ...} is not a tool call
+        args = args or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            return None
+    if tool and isinstance(args, dict):
+        return tool, dict(args)
+    return None
+
+
 def parse_tool_call(text: str) -> tuple[str, dict] | None:
-    """Extract one {"tool": ..., "args": {...}} call from a model reply.
+    """Extract one tool call from a model reply.
+
+    Accepts the canonical ``{"tool": ..., "args": {...}}`` object as well as
+    the template/native spellings ``<tool_call>{"name": ..., "arguments":
+    ...}</tool_call>`` and fenced JSON, ignoring prose around them. A JSON
+    object cut off by the generation cap is completed when only its closing
+    ``]``/``}`` delimiters are missing (``_close_truncated_json``); otherwise
+    the reply stays undecodable and :func:`reply_looks_truncated` lets the
+    runtime ask for a compact retry.
 
     Returns None when the reply contains no decodable call (the runtime then
-    re-prompts once). Tolerates prose around the JSON object.
+    re-prompts once).
     """
     if not text:
         return None
-    for i, char in enumerate(text):
-        if char != "{":
-            continue
-        depth = 0
-        for j in range(i, len(text)):
-            if text[j] == "{":
-                depth += 1
-            elif text[j] == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        data = json.loads(text[i : j + 1])
-                    except json.JSONDecodeError:
-                        break
-                    if isinstance(data, dict) and "tool" in data:
-                        tool = str(data.get("tool", "")).strip()
-                        args = data.get("args") or {}
-                        if isinstance(args, dict):
-                            return tool, args
-                    break
+    for fragment, complete in _iter_json_fragments(_strip_reply_wrappers(text)):
+        if not complete:
+            repaired = _close_truncated_json(fragment)
+            if repaired is None:
+                return None
+            fragment = repaired
+        try:
+            data = json.loads(fragment)
+        except json.JSONDecodeError:
+            if complete:
+                continue
+            return None
+        call = _call_from_json(data)
+        if call is not None:
+            return call
+        if not complete:
+            return None
     return None
+
+
+def reply_looks_truncated(text: str) -> bool:
+    """True when a reply holds a JSON object the generation cap cut off."""
+    if not text:
+        return False
+    for _fragment, complete in _iter_json_fragments(_strip_reply_wrappers(text)):
+        if not complete:
+            return True
+    return False
 
 
 TOOL_CALL_DOC = """\

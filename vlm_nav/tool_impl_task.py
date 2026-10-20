@@ -272,8 +272,59 @@ _DONE_WHEN_CONFIRM_WORDS = (
     "证明",
     "通过",
 )
+
+#: Typed completion criteria. A plan says *what kind* of evidence finishes a
+#: sub-task instead of leaving it to the word list above: a landmark that only
+#: has to be seen is ``sighted`` (located evidence, no arrival and no
+#: confirmation), a destination that has to be flown to is ``arrived``
+#: (reach + accepted confirmation), and ``verified`` asks for the accepted
+#: confirmation alone. ``located`` is the strict form of ``sighted`` (a
+#: ``goal_position`` and ``locate_m`` are checked when declared).
+DONE_WHEN_SIGHTED = "sighted"
+DONE_WHEN_LOCATED = "located"
+DONE_WHEN_ARRIVED = "arrived"
+DONE_WHEN_VERIFIED = "verified"
+DONE_WHEN_TYPES = (
+    DONE_WHEN_SIGHTED,
+    DONE_WHEN_LOCATED,
+    DONE_WHEN_ARRIVED,
+    DONE_WHEN_VERIFIED,
+)
+#: The values a ``done_when`` mapping's ``type`` may name, in either language.
+_DONE_WHEN_TYPE_ALIASES = {
+    "sighted": DONE_WHEN_SIGHTED,
+    "sight": DONE_WHEN_SIGHTED,
+    "see": DONE_WHEN_SIGHTED,
+    "seen": DONE_WHEN_SIGHTED,
+    "目击": DONE_WHEN_SIGHTED,
+    "看到": DONE_WHEN_SIGHTED,
+    "看见": DONE_WHEN_SIGHTED,
+    "located": DONE_WHEN_LOCATED,
+    "locate": DONE_WHEN_LOCATED,
+    "located_only": DONE_WHEN_LOCATED,
+    "定位": DONE_WHEN_LOCATED,
+    "arrived": DONE_WHEN_ARRIVED,
+    "arrival": DONE_WHEN_ARRIVED,
+    "reach": DONE_WHEN_ARRIVED,
+    "reached": DONE_WHEN_ARRIVED,
+    "到达": DONE_WHEN_ARRIVED,
+    "抵达": DONE_WHEN_ARRIVED,
+    "verified": DONE_WHEN_VERIFIED,
+    "verify": DONE_WHEN_VERIFIED,
+    "confirmed": DONE_WHEN_VERIFIED,
+    "确认": DONE_WHEN_VERIFIED,
+    "核实": DONE_WHEN_VERIFIED,
+}
+#: ``"arrived: ..."`` / ``"type=sighted: ..."`` prefixes of a string done_when.
+_DONE_WHEN_TYPE_PREFIX_RE = re.compile(
+    r"^\s*(?:type\s*[:=]\s*)?(" + "|".join(sorted(_DONE_WHEN_TYPE_ALIASES, key=len, reverse=True))
+    + r")\s*[:=\-]\s*",
+    re.IGNORECASE,
+)
+#: Aliases of the explicit ``done_when_type`` field of a sub-task.
+_DONE_WHEN_TYPE_KEYS = ("done_when_type", "completion_type", "done_type", "condition_type")
 #: Every field of one sub-task record, in the order it is rendered. The first
-#: thirteen are the model's (the schema ``update_plan`` documents); ``spent``,
+#: fourteen are the model's (the schema ``update_plan`` documents); ``spent``,
 #: ``reason`` and ``updated_turn`` are written by the executor.
 SUBTASK_FIELDS = (
     "id",
@@ -282,6 +333,9 @@ SUBTASK_FIELDS = (
     "depends_on",
     "expected_observation",
     "done_when",
+    # the typed criterion the evidence has to satisfy: sighted / located /
+    # arrived / verified (empty on a legacy, text-only sub-task)
+    "done_when_type",
     # the place the evidence has to point at (``located`` within ``locate_m``)
     "goal_position",
     "locate_m",
@@ -586,6 +640,7 @@ _SUBTASK_SCALAR_KEYS = frozenset(
     )
     + _SUBTASK_POSITION_ALIASES
     + _SUBTASK_NEXT_ALIASES
+    + _DONE_WHEN_TYPE_KEYS
     + tuple(name for aliases in _SUBTASK_LIST_ALIASES.values() for name in aliases)
     + tuple(name for aliases in _SUBTASK_TEXT_ALIASES.values() for name in aliases)
 )
@@ -696,6 +751,45 @@ def _status_of(value: Any) -> str | None:
     return token if token in SUBTASK_STATUSES else None
 
 
+def normalize_done_when_type(value: Any) -> str:
+    """The canonical typed criterion a value names, or ``""``.
+
+    Accepts the English types and the Chinese equivalents the task files use.
+    An unknown value stays ``""`` (the caller can report it as a structure
+    error instead of silently treating it as a legacy text condition).
+    """
+    token = str(value or "").strip().lower()
+    return _DONE_WHEN_TYPE_ALIASES.get(token, "")
+
+
+def _declared_done_when(value: Any) -> tuple[str, str]:
+    """``(type, text)`` of a ``done_when`` value (mapping or typed string).
+
+    ``{"type": "sighted", "description": "..."}`` keeps both halves;
+    ``"arrived: fly to the box"`` names its type in the prefix; a plain string
+    is a legacy text condition with no type.
+    """
+    if isinstance(value, Mapping):
+        declared = ""
+        for key in ("type", "kind") + _DONE_WHEN_TYPE_KEYS:
+            if value.get(key) not in (None, ""):
+                declared = normalize_done_when_type(value.get(key))
+                if declared:
+                    break
+        text = ""
+        for key in ("description", "text", "condition", "done_when", "goal"):
+            if value.get(key) not in (None, ""):
+                text = str(value[key]).strip()
+                break
+        return declared, text[:MAX_NOTE_CHARS]
+    text = str(value or "").strip()
+    match = _DONE_WHEN_TYPE_PREFIX_RE.match(text)
+    if match is None:
+        return "", text[:MAX_NOTE_CHARS]
+    declared = normalize_done_when_type(match.group(1))
+    return declared, text[match.end():].strip()[:MAX_NOTE_CHARS]
+
+
 def _blank_subtask(
     subtask_id: str = "",
     goal: str = "",
@@ -710,6 +804,7 @@ def _blank_subtask(
         "depends_on": [],
         "expected_observation": "",
         "done_when": "",
+        "done_when_type": "",
         "goal_position": [],
         "locate_m": 0.0,
         "reach_m": 0.0,
@@ -799,9 +894,22 @@ def _subtask_spec(entry: Any, *, known_ids: set[str]) -> tuple[dict | None, list
         if value is not None:
             declared[field] = _list_items(value)
     for field, aliases in _SUBTASK_TEXT_ALIASES.items():
+        if field == "done_when":
+            continue  # handled below: the value may be a typed mapping
         value = _pick(data, aliases)
         if value is not None:
             declared[field] = str(value).strip()[:MAX_NOTE_CHARS]
+    done_when = _pick(data, _DONE_WHEN_ALIASES)
+    if done_when is not None:
+        kind, text = _declared_done_when(done_when)
+        declared["done_when"] = text
+        if kind:
+            declared["done_when_type"] = kind
+    explicit_type = _pick(data, _DONE_WHEN_TYPE_KEYS)
+    if explicit_type is not None:
+        declared["done_when_type"] = normalize_done_when_type(explicit_type) or str(
+            explicit_type
+        ).strip()[:MAX_NOTE_CHARS]
     position = _pick(data, _SUBTASK_POSITION_ALIASES)
     if position is not None:
         point = _position_of(position)
@@ -922,6 +1030,85 @@ def normalize_subtasks(
     applies: a spec carries the fields the entry declared (plus ``_patch``).
     """
     return _normalize_step_specs(args, record)
+
+
+def plan_structure_errors(record: Mapping | None) -> list[str]:
+    """The structure problems a plan record still has (self-plan validation).
+
+    Every sub-task must carry a goal and a ``done_when`` condition, its
+    ``depends_on`` must name an existing id, the dependency graph must be
+    acyclic, and an explicit ``done_when_type`` must be one of
+    :data:`DONE_WHEN_TYPES`. The list is empty for a structural plan; the
+    runtime asks the model to fix it once and then proceeds with whatever it
+    has (``update_plan`` itself normalizes the record, so this checks the
+    normalized form the executor will run).
+    """
+    if not isinstance(record, Mapping):
+        return ["no plan: call update_plan first"]
+    subtasks = [
+        subtask for subtask in record.get("subtasks") or [] if isinstance(subtask, Mapping)
+    ]
+    if not subtasks:
+        return ["the plan has no sub-tasks"]
+    errors: list[str] = []
+    if len(subtasks) > MAX_PLAN_STEPS:
+        errors.append(f"{len(subtasks)} sub-tasks (max {MAX_PLAN_STEPS})")
+    ids = [str(subtask.get("id") or "") for subtask in subtasks]
+    if any(not subtask_id for subtask_id in ids):
+        errors.append("every sub-task needs an id")
+    if len(set(ids)) != len(ids):
+        errors.append("sub-task ids are not unique")
+    known = {subtask_id for subtask_id in ids if subtask_id}
+    graph: dict[str, list[str]] = {}
+    for subtask, subtask_id in zip(subtasks, ids):
+        goal = str(subtask.get("goal") or "").strip()
+        if not goal:
+            errors.append(f"{subtask_id or '?'}: missing goal")
+        done_when = subtask.get("done_when")
+        if not (
+            str(done_when or "").strip()
+            if not isinstance(done_when, Mapping)
+            else done_when
+        ):
+            errors.append(f"{subtask_id or '?'}: missing done_when")
+        explicit = subtask.get("done_when_type")
+        if explicit not in (None, "") and not normalize_done_when_type(explicit):
+            errors.append(f"{subtask_id or '?'}: unknown done_when_type {explicit!r}")
+        if isinstance(done_when, Mapping) and done_when.get("type") not in (None, ""):
+            if not normalize_done_when_type(done_when.get("type")):
+                errors.append(
+                    f"{subtask_id or '?'}: unknown done_when type {done_when.get('type')!r}"
+                )
+        deps = [str(dep) for dep in subtask.get("depends_on") or [] if str(dep)]
+        unknown = [dep for dep in deps if dep not in known]
+        if unknown:
+            errors.append(f"{subtask_id or '?'}: depends_on unknown {unknown}")
+        if subtask_id and subtask_id in deps:
+            errors.append(f"{subtask_id or '?'}: depends on itself")
+        graph[subtask_id] = [dep for dep in deps if dep in known]
+    # cycle detection (DFS colours), reported once with the cycle's ids
+    colour: dict[str, int] = {}
+
+    def visit(node: str, trail: list[str]) -> list[str] | None:
+        if colour.get(node) == 1:
+            start = trail.index(node) if node in trail else 0
+            return trail[start:] + [node]
+        if colour.get(node) == 2:
+            return None
+        colour[node] = 1
+        for dep in graph.get(node) or []:
+            found = visit(dep, trail + [node])
+            if found:
+                return found
+        colour[node] = 2
+        return None
+
+    for node in graph:
+        cycle = visit(node, [])
+        if cycle:
+            errors.append("depends_on cycle: " + " -> ".join(cycle))
+            break
+    return errors
 
 
 # ---------------------------------------------------------------------------
@@ -1412,14 +1599,28 @@ _MOVEMENT_TOOLS = (
 )
 
 
-def is_movement_subtask(subtask: Mapping) -> bool:
-    """Whether a sub-task's completion is a *movement* condition.
+def declared_done_when_type(subtask: Mapping) -> str:
+    """The typed criterion the sub-task explicitly declares, or ``""``.
 
-    Declared ``reach_m``, a movement-tool ``next_step`` or a ``done_when``/goal
-    in the reach vocabulary each make it one. A bare legacy step (no
-    ``done_when``) stays a reference-only step: it declares no condition to
-    check, so it gets no reach requirement.
+    The type may live in the sub-task's ``done_when_type`` field, in a
+    ``done_when`` mapping (``{"type": "sighted", ...}``) or in a typed string
+    (``"arrived: fly to the box"``). An unknown spelling returns ``""`` so the
+    caller can report it as a structure error; :func:`done_when_type` then
+    falls back to the legacy word list instead of guessing.
     """
+    explicit = subtask.get("done_when_type")
+    if explicit not in (None, ""):
+        return normalize_done_when_type(explicit)
+    value = subtask.get("done_when")
+    if isinstance(value, Mapping):
+        declared, _text = _declared_done_when(value)
+        return declared
+    kind, _text = _declared_done_when(value)
+    return kind
+
+
+def _legacy_movement_subtask(subtask: Mapping) -> bool:
+    """The pre-typed movement test: ``reach_m``/movement step/reach wording."""
     if _bounded_float(subtask.get("reach_m")) > 0:
         return True
     call = _declared_call(subtask.get("next_step"))
@@ -1432,23 +1633,83 @@ def is_movement_subtask(subtask: Mapping) -> bool:
     return any(word in goal or word in done_when for word in _DONE_WHEN_REACH_WORDS)
 
 
+def done_when_type(subtask: Mapping) -> str:
+    """The typed criterion the sub-task's completion actually uses.
+
+    An explicit type wins. A text-only condition keeps the historical
+    interpretation: reach wording -> ``arrived``, confirmation wording ->
+    ``verified``, location wording -> ``located``; a bare movement step ->
+    ``arrived``; a bare reference step declares no typed criterion (``""``).
+    This keeps every pre-typed plan/task file reading exactly as before while
+    letting a plan say ``sighted`` and stop asking for an arrival.
+    """
+    declared = declared_done_when_type(subtask)
+    if declared:
+        return declared
+    text = str(subtask.get("done_when") or "").strip().lower()
+    movement = _legacy_movement_subtask(subtask)
+    if not text:
+        return DONE_WHEN_ARRIVED if movement else ""
+    if movement:
+        return DONE_WHEN_ARRIVED
+    if any(word in text for word in _DONE_WHEN_CONFIRM_WORDS):
+        return DONE_WHEN_VERIFIED
+    if any(word in text for word in _DONE_WHEN_LOCATE_WORDS):
+        return DONE_WHEN_LOCATED
+    return ""
+
+
+def is_movement_subtask(subtask: Mapping) -> bool:
+    """Whether a sub-task's completion is a *movement* condition.
+
+    An explicit ``sighted``/``located``/``verified`` criterion is not one, even
+    when the task file declares ``reach_m`` for the place itself (the tolerance
+    stays available for evaluation; it is not a completion requirement). An
+    explicit ``arrived`` is one. Without a type the historical test applies:
+    declared ``reach_m``, a movement-tool ``next_step`` or reach wording in the
+    ``done_when``/goal. A bare legacy step (no ``done_when``) stays a
+    reference-only step: it declares no condition to check, so it gets no reach
+    requirement.
+    """
+    declared = declared_done_when_type(subtask)
+    if declared:
+        return declared == DONE_WHEN_ARRIVED
+    return _legacy_movement_subtask(subtask)
+
+
 def evidence_requirements(subtask: Mapping) -> list[str]:
     """What ``done_when`` asks the sub-task's evidence to show.
 
-    Every sub-task needs an EvidenceRef (a claim must point at something); a
-    ``done_when`` that names a placement, a movement or a confirmation adds the
-    corresponding requirement. A movement stage (:func:`is_movement_subtask`)
-    always asks for reach evidence, whether or not its ``done_when`` repeats a
-    reach word: ``located`` alone is not an arrival. Version 2 also requires an
-    *accepted* ``confirm_candidate`` under the current candidate/revision for
-    every movement stage - the arrival proves the place, the confirmation
-    proves the instance. A sub-task without ``done_when`` asks for nothing
-    beyond the reference - there is no condition to check it against. The
-    vocabulary is deliberately small and shared by both languages of the plans
-    (English schema hints, Chinese task files).
+    Every sub-task needs an EvidenceRef (a claim must point at something). The
+    typed criterion (:func:`done_when_type`) then decides the rest:
+
+    - ``sighted`` / ``located``: a located place, and nothing else - no reach
+      and no confirmation. ``located`` is the strict form: a declared
+      ``goal_position``/``locate_m`` (or the distance in ``done_when``) has to
+      contain the result's place;
+    - ``arrived``: reach **and** the accepted ``confirm_candidate`` under the
+      current candidate/revision (the arrival proves the place, the
+      confirmation proves the instance);
+    - ``verified``: the accepted confirmation alone (no arrival).
+
+    A text-only condition keeps the legacy reading (placement/movement/
+    confirmation words, then :func:`is_movement_subtask`). A sub-task without a
+    condition asks for nothing beyond the reference.
     """
     text = str(subtask.get("done_when") or "").strip().lower()
     required = [EVIDENCE_REF]
+    kind = declared_done_when_type(subtask)
+    if kind in (DONE_WHEN_SIGHTED, DONE_WHEN_LOCATED):
+        required.append(EVIDENCE_LOCATED)
+        return required
+    if kind == DONE_WHEN_VERIFIED:
+        required.append(EVIDENCE_CONFIRMATION)
+        return required
+    if kind == DONE_WHEN_ARRIVED:
+        required.append(EVIDENCE_LOCATED)
+        required.append(EVIDENCE_REACHED)
+        required.append(EVIDENCE_CONFIRMATION)
+        return required
     if _position_of(subtask.get("goal_position")):
         # a declared goal place is itself a condition: the evidence has to
         # point at it, whether or not done_when repeats the word "located"
@@ -3229,12 +3490,18 @@ def register_task_tools(registry: ToolRegistry) -> None:
                 "Replace or revise your short conditional plan for this task: one "
                 "step per list entry. A step is a sub-task - {id, goal, "
                 "preconditions, depends_on, expected_observation, done_when, "
-                "goal_position, locate_m, failure_branch, next_step, "
+                "done_when_type, goal_position, locate_m, failure_branch, next_step, "
                 "budget{tool_calls,turns}} - so the runtime's "
                 "executor can track it: it marks the step done when a tool result "
                 "satisfies its done_when, blocks it when an execution fails (and "
                 "then offers its failure_branch as the next step) and fails it when "
-                "its budget runs out. A later step stays claimed until every earlier "
+                "its budget runs out. done_when_type is the completion criterion: "
+                "'sighted' (a located sighting is enough - no flight, no "
+                "confirmation), 'located' (the same, checked against "
+                "goal_position/locate_m), 'arrived' (reach + accepted "
+                "confirmation) or 'verified' (accepted confirmation only). Use "
+                "'sighted' for landmarks and 'arrived' only for a destination the "
+                "mission says to fly to. A later step stays claimed until every earlier "
                 "step and every depends_on is done. A located result only counts "
                 "inside locate_m of goal_position (the distance in done_when is the "
                 "fallback tolerance; without a declared place the verdict is marked "
@@ -3263,8 +3530,11 @@ def register_task_tools(registry: ToolRegistry) -> None:
                         "description": (
                             "ordered conditional steps, each one short line or a "
                             "sub-task object ({id, goal, preconditions, depends_on, "
-                            "expected_observation, done_when, goal_position, "
+                            "expected_observation, done_when, done_when_type, "
+                            "goal_position, "
                             "locate_m, failure_branch, next_step, budget, status}); "
+                            "done_when may be a string or {type, description} with "
+                            "type=sighted|located|arrived|verified; "
                             "next_step/failure_branch entries should be one concrete "
                             "call with JSON args; a single string is split on ';'. "
                             "Required unless the call only advances the progress "
@@ -3352,6 +3622,16 @@ __all__ = [
     "SUBTASK_STATUSES",
     "SUBTASK_OPEN",
     "SUBTASK_FIELDS",
+    "DONE_WHEN_SIGHTED",
+    "DONE_WHEN_LOCATED",
+    "DONE_WHEN_ARRIVED",
+    "DONE_WHEN_VERIFIED",
+    "DONE_WHEN_TYPES",
+    "normalize_done_when_type",
+    "declared_done_when_type",
+    "done_when_type",
+    "is_movement_subtask",
+    "plan_structure_errors",
     "EVIDENCE_MARKS",
     "evidence_requirements",
     "evidence_verdict",

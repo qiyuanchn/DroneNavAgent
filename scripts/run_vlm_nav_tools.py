@@ -984,6 +984,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "deterministic next step executes it without spending a "
                              "model turn (capped at 3 consecutive steps); off: every "
                              "call costs a model decision")
+    parser.add_argument("--plan-mode", type=str, default="given",
+                        dest="plan_mode", choices=["given", "self"],
+                        help="given (default): the caller wrote the structured plan "
+                             "(an experiment driver bootstrap); self: only the "
+                             "natural-language instruction is given and the model "
+                             "must write its own sub-task plan with update_plan "
+                             "(the runtime asks on the first turn and corrects an "
+                             "invalid plan once)")
     parser.add_argument("--memory-spatial", type=str, default=DEFAULT_SWITCH,
                         dest="memory_spatial", choices=list(SWITCH_CHOICES),
                         help="on (default): the memory keeps the spatial store (where "
@@ -2782,6 +2790,7 @@ def run_episode(world: Any, vlm: Any, args: argparse.Namespace, out_dir: Path,
         executor_auto_steps=switch_enabled(
             getattr(args, "executor_auto_steps", DEFAULT_SWITCH)
         ),
+        plan_mode=str(getattr(args, "plan_mode", "given") or "given"),
         tool_context=ctx,
         tools_source=tools_source,
         # upper bound of the runtime's system prompt; the runtime itself budgets
@@ -2987,6 +2996,7 @@ def run_episode(world: Any, vlm: Any, args: argparse.Namespace, out_dir: Path,
         "vlm_turns_saved": len(auto_steps),
         "toolset": toolset,
         "toolset_detail": toolset_report(toolset, registry.names()),
+        "plan_mode": str(getattr(args, "plan_mode", "given") or "given"),
         # the state-aware catalogue the model was shown, and the budget that
         # carries it (``catalog_chars`` is what ``tools_text`` may use)
         "prompt_budget": prompt_budget,

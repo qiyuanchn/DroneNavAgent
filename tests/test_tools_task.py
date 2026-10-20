@@ -36,14 +36,19 @@ from vlm_nav.tool_impl_task import (
     SUBTASK_STATUSES,
     TASK_SIGNAL_KEYS,
     current_subtask,
+    declared_done_when_type,
+    done_when_type,
+    evidence_requirements,
     evidence_verdict,
     executor_step,
     get_plan,
+    normalize_done_when_type,
     normalize_steps,
     normalize_subtasks,
     parse_call_text,
     plan_progress,
     plan_state,
+    plan_structure_errors,
     plan_subtasks,
     plan_text,
     register_task_tools,
@@ -1057,7 +1062,8 @@ class SubtaskSchemaTest(unittest.TestCase):
             tuple(SUBTASK_FIELDS),
             (
                 "id", "goal", "preconditions", "depends_on", "expected_observation",
-                "done_when", "goal_position", "locate_m", "reach_m", "failure_branch",
+                "done_when", "done_when_type", "goal_position", "locate_m", "reach_m",
+                "failure_branch",
                 "next_step", "budget", "status", "evidence", "spent", "reason",
                 "updated_turn",
             ),
@@ -2806,6 +2812,185 @@ class SubtaskGroundInstructionTest(unittest.TestCase):
         from vlm_nav.tool_impl_task import subtask_ground_instruction
 
         self.assertEqual(subtask_ground_instruction(make_context()), "")
+
+
+class TypedDoneWhenTest(unittest.TestCase):
+    """goal.md section 4: a completion criterion is typed, not all reach.
+
+    ``sighted``/``located`` ask for a located sighting (no flight, no
+    confirmation); ``arrived`` keeps reach + accepted confirmation; ``verified``
+    asks for the confirmation alone. The task module reads the type from the
+    field, from a ``{type, description}`` mapping or from a typed string, and
+    the executor's requirements follow it.
+    """
+
+    def test_types_are_normalized_in_both_languages(self):
+        self.assertEqual(normalize_done_when_type("Sighted"), "sighted")
+        self.assertEqual(normalize_done_when_type("定位"), "located")
+        self.assertEqual(normalize_done_when_type("arrived"), "arrived")
+        self.assertEqual(normalize_done_when_type("确认"), "verified")
+        self.assertEqual(normalize_done_when_type("whenever"), "")
+
+    def test_a_typed_mapping_and_string_are_stored_with_their_type(self):
+        registry, ctx = plan_registry(), make_context()
+        plan_with(
+            registry,
+            ctx,
+            [
+                {
+                    "id": "st_1",
+                    "goal": "find the landmark",
+                    "done_when": {"type": "sighted", "description": "the door is seen"},
+                },
+                {
+                    "id": "st_2",
+                    "goal": "fly to the box",
+                    "done_when": "arrived: flown to the cardboard box",
+                    "depends_on": ["st_1"],
+                },
+            ],
+        )
+        first, second = subtasks_of(ctx)
+        self.assertEqual(first["done_when_type"], "sighted")
+        self.assertEqual(first["done_when"], "the door is seen")
+        self.assertEqual(second["done_when_type"], "arrived")
+        self.assertEqual(second["done_when"], "flown to the cardboard box")
+        self.assertEqual(declared_done_when_type(first), "sighted")
+        self.assertEqual(done_when_type(second), "arrived")
+
+    def test_sighted_requires_a_located_sighting_and_nothing_else(self):
+        registry, ctx = plan_registry(), make_context()
+        plan_with(
+            registry,
+            ctx,
+            [{
+                "id": "st_1",
+                "goal": "find the wooden door",
+                "done_when": {"type": "sighted", "description": "door seen"},
+                "reach_m": 2.0,
+            }],
+        )
+        subtask = subtasks_of(ctx)[0]
+        self.assertEqual(evidence_requirements(subtask), ["evidence_ref", "located"])
+        event = step_event(
+            "ground_target",
+            data={
+                "subgoal_complete": True,
+                "candidate_id": "cand_1",
+                "object_position": [2.0, 0.0, 0.0],
+            },
+            evidence=[("observation", "obs_1")],
+        )
+        outcome = executor_step(ctx, event)
+        self.assertEqual(outcome["completed"], "st_1")
+        self.assertEqual(subtasks_of(ctx)[0]["status"], SUBTASK_DONE)
+
+    def test_sighted_is_not_closed_by_a_claim_without_a_place(self):
+        registry, ctx = plan_registry(), make_context()
+        plan_with(
+            registry,
+            ctx,
+            [{
+                "id": "st_1",
+                "goal": "find the wooden door",
+                "done_when": {"type": "sighted", "description": "door seen"},
+            }],
+        )
+        outcome = executor_step(
+            ctx,
+            step_event(
+                "observe",
+                data={"subgoal_complete": True},
+                evidence=[("observation", "obs_1")],
+            ),
+        )
+        self.assertEqual(outcome["claimed"], "st_1")
+        self.assertEqual(outcome["evidence_missing"], ["located"])
+
+    def test_arrived_still_requires_reach_and_accepted_confirmation(self):
+        registry, ctx = plan_registry(), make_context()
+        plan_with(
+            registry,
+            ctx,
+            [{
+                "id": "st_1",
+                "goal": "fly to the cardboard box",
+                "done_when": {"type": "arrived", "description": "box reached"},
+                "reach_m": 1.5,
+            }],
+        )
+        subtask = subtasks_of(ctx)[0]
+        self.assertEqual(
+            evidence_requirements(subtask),
+            ["evidence_ref", "located", "reached", "confirmation"],
+        )
+        # a located sighting alone stays claimed
+        claim = executor_step(
+            ctx,
+            step_event(
+                "ground_target",
+                data={
+                    "subgoal_complete": True,
+                    "candidate_id": "cand_1",
+                    "object_position": [1.0, 0.0, 0.0],
+                },
+                evidence=[("observation", "obs_1")],
+            ),
+        )
+        self.assertEqual(claim["claimed"], "st_1")
+        self.assertEqual(
+            claim["evidence_missing"], ["reached", "confirmation"]
+        )
+
+    def test_verified_accepts_an_accepted_confirmation_without_arrival(self):
+        registry, ctx = plan_registry(), make_context()
+        plan_with(
+            registry,
+            ctx,
+            [{
+                "id": "st_1",
+                "goal": "confirm the box identity",
+                "done_when": {"type": "verified", "description": "accepted"},
+            }],
+        )
+        self.assertEqual(
+            evidence_requirements(subtasks_of(ctx)[0]),
+            ["evidence_ref", "confirmation"],
+        )
+        outcome = executor_step(
+            ctx,
+            accepted_confirmation_event(turn=1, signal=True),
+        )
+        self.assertEqual(outcome["completed"], "st_1")
+
+    def test_structure_errors_flag_missing_done_when_and_cycles(self):
+        self.assertTrue(plan_structure_errors(None))
+        registry, ctx = plan_registry(), make_context()
+        plan_with(
+            registry,
+            ctx,
+            [
+                {"id": "st_1", "goal": "find the door"},
+                {"id": "st_2", "goal": "find the cabinet", "depends_on": ["st_1"]},
+            ],
+        )
+        errors = plan_structure_errors(plan_state(ctx))
+        self.assertTrue(any("missing done_when" in error for error in errors))
+
+    def test_plan_structure_errors_reject_an_unknown_type(self):
+        registry, ctx = plan_registry(), make_context()
+        plan_with(
+            registry,
+            ctx,
+            [{
+                "id": "st_1",
+                "goal": "find the door",
+                "done_when": "door seen",
+                "done_when_type": "whenever",
+            }],
+        )
+        errors = plan_structure_errors(plan_state(ctx))
+        self.assertTrue(any("unknown done_when_type" in error for error in errors))
 
 
 if __name__ == "__main__":
