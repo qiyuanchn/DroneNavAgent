@@ -18,28 +18,34 @@ evidence, never from the model's prose:
                                ``stage_complete_rate`` keep the two apart.
   an interrupt does not lose   a leg that runs out of budget (or hits the
   progress                     ``--interrupt`` deadline at a decision node) ends
-                               mid-task; the resumed leg inherits what the
-                               interrupted leg *established*, through the system
-                               module's own interfaces:
-                                 plan         the record is written by
-                                              ``tool_impl_task.update_plan`` (the
-                                              sub-task schema: goals, done_when,
-                                              failure branches, dependencies,
-                                              budgets) and adopted by the runtime
-                                              through ``resume_plan``, so the
-                                              executor keeps advancing the very
-                                              sub-tasks the interrupted leg had
-                                              open; only stages whose evidence
-                                              chain was complete are marked done,
+                               mid-task; the resumed leg inherits a *runtime
+                               checkpoint* saved verbatim at the interrupt.
+                               Version 3 removes the evaluator from this path:
+                                 checkpoint   the live ``ctx.extra`` state (plan
+                                              record and sub-task statuses,
+                                              confirmation ledger, candidate /
+                                              observation / viewpoint memory
+                                              references, task scope, beliefs,
+                                              open questions, evidence pack) is
+                                              written to ``checkpoint.json`` as
+                                              JSON and loaded as JSON; a wrong
+                                              "done" survives the restart,
+                                 plan         the checkpoint's own record is
+                                              adopted (the module's ``resume_plan``
+                                              logs the adoption) - it is not
+                                              re-written from ``stage_report``,
                                  pose         the world keeps the drone where the
                                               leg ended (teleport + trajectory),
                                  subgoal      ``ctx.extra["subgoal"]`` (the STATE
                                               block's ``subgoal`` label),
-                                 brief        an instruction suffix built *only*
-                                              from the interrupted leg's own
-                                              trace (its candidates, ids, poses,
-                                              end pose) - never from the scene's
+                                 brief        an instruction suffix listing the
+                                              checkpoint's own statuses/evidence
+                                              and places - never the scene's
                                               ground truth, so no leak
+                               The offline score of that checkpoint
+                               (``checkpoint_correctness``) compares the claimed
+                               done/confirmed stages with ``stage_report`` and
+                               counts the beliefs the resumed leg corrected.
                                The runtime's log is read back per leg
                                (``decision_nodes``, ``plan_transitions``,
                                ``plan_resumed``): the report can say *why* a
@@ -150,12 +156,12 @@ applied to the *same* episodes without re-running anything:
 
 Artifacts: ``<out>/report.json``, ``<out>/report.md``, ``<out>/episodes.jsonl``,
 ``<out>/task.json`` and per leg ``<out>/seed<k>/<leg>/{tool_trace.jsonl,
-summary.json,leg_summary.json,run_config.json,ledger.jsonl,episode_log.json}``.
-The ledger is the driver's own record of every tool call (outer and
-routine-inner) with the drone pose and the executor counters before and after it:
-the runner's trace is written at the end of a leg, an interrupted leg has none,
-so the ledger is what the resume state is built from; ``episode_log.json`` is the
-runtime's own log (decision nodes, sub-task transitions, the adopted plan).
+summary.json,leg_summary.json,run_config.json,ledger.jsonl,episode_log.json,
+checkpoint.json}``. The ledger is the driver's own record of every tool call
+(outer and routine-inner) with the drone pose and the executor counters before
+and after it; ``checkpoint.json`` is the runtime's own state at the end of the
+leg (the version-3 resume source); ``episode_log.json`` is the runtime's own log
+(decision nodes, sub-task transitions, the adopted plan).
 
 Two diagnostics keep the verdicts honest: ``closest_place_distance_m`` says how
 close *any* located reference got to a stage's place (a stage the agent never
@@ -169,6 +175,7 @@ without the evidence says so instead of being read as agreement.
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib.util
 import json
 import math
@@ -218,6 +225,13 @@ ACTION_TOOLS = (
 
 DEFAULT_STAGE_REACH_M = 1.5
 DEFAULT_STAGE_LOCATE_M = 2.0
+#: An arrival on the candidate's standoff shell is a reach even when the stage
+#: centre is farther than ``reach_m`` (the two geometries are alternatives).
+DEFAULT_APPROACH_STANDOFF_M = 1.2
+CANDIDATE_REACH_TOLERANCE_M = 0.35
+#: A new candidate this close to the confirmed one in the same sub-task is the
+#: same instance: the accepted confirmation is inherited, not stale.
+CONFIRMATION_INHERIT_RADIUS_M = 1.5
 #: The concrete continuation every stage plan declares (no place, no truth):
 #: the executor can ground the stage's name without a model turn.
 STAGE_NEXT_TOOL = "ground_target"
@@ -965,6 +979,13 @@ class LegResult:
     start_pose: list[float]
     start_yaw_rad: float = 0.0
     log: dict = field(default_factory=dict)
+    #: the runtime state exactly as the interrupted leg left it (version 3).
+    #: Resume consumes this checkpoint verbatim; nothing from ``stage_report``
+    #: is mixed into it.
+    checkpoint: dict = field(default_factory=dict)
+    #: the plan record at the end of the leg (the agent's own claim, used by
+    #: the offline checkpoint-correctness metric to see what it corrected).
+    final_plan: dict | None = None
 
     def to_dict(self) -> dict:
         anatomy = decision_anatomy(self.log, fallback_turns=self.vlm_calls)
@@ -986,6 +1007,8 @@ class LegResult:
             "n_ledger_entries": len(self.entries),
             "start_pose": list(self.start_pose),
             "start_yaw_rad": float(self.start_yaw_rad),
+            "checkpoint": bool(self.checkpoint),
+            "checkpoint_fields": sorted(self.checkpoint),
             "decision_nodes": anatomy["decision_nodes"],
             "decision_node_kinds": anatomy["decision_node_kinds"],
             "plan_transitions": anatomy["plan_transitions"],
@@ -1202,37 +1225,6 @@ def subtask_specs(
     return specs
 
 
-def _mark_done_subtasks(
-    modules: Mapping[str, Any], record: dict, report: Mapping, task: TaskSpec
-) -> list[dict]:
-    """Mark the stages whose evidence chain closed in the interrupted leg.
-
-    The status constant, the evidence list shape and the ``reason`` field are the
-    task module's; the driver only decides *which* sub-tasks are done, from the
-    stage report's own verdicts.
-    """
-    task_module = modules.get("task")
-    done_status = getattr(task_module, "SUBTASK_DONE", "done")
-    marked: list[dict] = []
-    subtasks = record.get("subtasks") or []
-    for position, stage in enumerate(task.stages):
-        row = (report.get("stages") or {}).get(stage.stage_id) or {}
-        if position >= len(subtasks) or not row.get("complete"):
-            continue
-        subtask = subtasks[position]
-        subtask["status"] = done_status
-        tokens = [
-            str(ref.get("ref") or "") for ref in (row.get("evidence_refs") or [])
-            if isinstance(ref, Mapping) and ref.get("ref")
-        ]
-        if tokens:
-            subtask["evidence"] = tokens[:8]
-        subtask["reason"] = "confirmed in the interrupted leg (evidence chain complete)"
-        subtask["updated_turn"] = int(row.get("complete_order") or 0)
-        marked.append({"id": subtask.get("id"), "stage": stage.stage_id, "evidence": tokens[:8]})
-    return marked
-
-
 def build_fresh_plan(
     task: TaskSpec, *, world: Any, instruction: str, episode_id: str
 ) -> tuple[dict | None, dict]:
@@ -1268,75 +1260,6 @@ def build_fresh_plan(
     return record, {
         "plan_backend": "tool_impl_task.update_plan",
         "subtasks": True,
-        "n_subtasks": len(record.get("subtasks") or []),
-        "statuses": [
-            {"id": item.get("id"), "status": item.get("status")}
-            for item in record.get("subtasks") or []
-        ],
-    }
-
-
-def build_carry_plan(
-    task: TaskSpec,
-    report: Mapping,
-    *,
-    world: Any,
-    instruction: str,
-    note: str,
-) -> tuple[dict, dict]:
-    """Build the plan record a resumed leg adopts (the P4 interface when present).
-
-    Returns ``(record, detail)``. With the sub-task schema in place the record is
-    written by the task module's own ``update_plan`` (so the executor reads
-    exactly the schema it writes), the stages whose evidence chain closed are
-    marked done with their evidence tokens, and the record's ``instruction`` is
-    the task module's own truncation of the resumed instruction - the same string
-    ``resume_plan`` compares against. Without the module the driver falls back to
-    the documented ``ctx.extra["plan"]`` record.
-    """
-    modules = m1_modules()
-    task_module = modules.get("task")
-    steps = [stage.step for stage in task.stages]
-    done = [
-        stage.index for stage in task.stages
-        if ((report.get("stages") or {}).get(stage.stage_id) or {}).get("complete")
-    ]
-    total = len(task.stages)
-    current = min([index for index in range(1, total + 1) if index not in done] or [total])
-    spec_support = all(
-        hasattr(task_module, name) for name in ("update_plan", "SUBTASK_DONE")
-    ) and hasattr(modules.get("tools"), "ToolContext")
-    if not spec_support:
-        record = {
-            "plan_id": "plan_1",
-            "revision": 1,
-            "steps": steps,
-            "current_step": int(current),
-            "done": [int(index) for index in done],
-            "done_when": f"all {total} stages are confirmed and the final target is verified",
-            "note": note,
-            "instruction": str(instruction)[:160],
-            "episode_id": "carry_source",
-            "updated_t": round(time.time(), 3),
-        }
-        return record, {"carry_backend": "ctx_extra.plan (legacy record)", "subtasks": False, "done": done}
-    context = _carry_context(modules, world, instruction)
-    args: dict[str, Any] = {"steps": subtask_specs(task, report), "note": note}
-    if done:
-        args["done"] = [int(index) for index in done]
-    args["done_when"] = f"all {total} stages are confirmed and the final target is verified"
-    result = task_module.update_plan(context, args)
-    record = task_module.plan_state(context)
-    if not isinstance(record, dict):
-        raise RuntimeError(f"the plan module refused the carried plan: {result.data}")
-    marked = _mark_done_subtasks(modules, record, report, task)
-    record["note"] = note
-    record["updated_t"] = round(time.time(), 3)
-    return record, {
-        "carry_backend": "tool_impl_task.update_plan+resume_plan",
-        "subtasks": True,
-        "done": done,
-        "marked_done": marked,
         "n_subtasks": len(record.get("subtasks") or []),
         "statuses": [
             {"id": item.get("id"), "status": item.get("status")}
@@ -1620,6 +1543,21 @@ def completion_records(entries: Sequence[Mapping]) -> list[dict]:
                 "evidence": refs,
                 "call": call,
             })
+        elif tool == "confirm_candidate":
+            records.append({
+                "tool": tool,
+                "status": status,
+                "data": {
+                    "verdict": str(data.get("verdict") or ""),
+                    "candidate_id": str(data.get("candidate_id") or ""),
+                    "observation_ids": list(data.get("observation_ids") or []),
+                    "position_delta_m": data.get("position_delta_m"),
+                    "missing": list(data.get("missing") or []),
+                    **fields,
+                },
+                "evidence": refs,
+                "call": call,
+            })
         elif tool in ARRIVAL_TOOLS and (
             str(data.get("outcome") or "") in ARRIVAL_OUTCOMES
             or data.get("arrived") is True
@@ -1863,6 +1801,12 @@ def instance_acceptance(
             kind = "arrival"
         elif tool == "verify_goal" and data.get("verified") is True:
             kind = "confirmation"
+        elif tool == "confirm_candidate" and str(
+            data.get("verdict") or ""
+        ) == "accepted":
+            # version 2: the acceptance event is the new-view confirmation,
+            # not the arrival that shares its place with the grounding
+            kind = "instance_confirmation"
         if not kind:
             continue
         scope = _scope_fields(entry)
@@ -2296,6 +2240,13 @@ def run_leg(
     wall_time = time.monotonic() - started
     executor_after = probe.snapshot()
     log = _episode_log_dict(captured)
+    # the runtime's live context is the checkpoint source: its plan/sub-task
+    # statuses, confirmation ledger, memory references, scope and beliefs are
+    # saved exactly as the leg left them (goal.md version 3)
+    runtime_ctx = getattr(captured[-1], "ctx", None) if captured else None
+    checkpoint = build_runtime_checkpoint(plan, world, ctx=runtime_ctx)
+    with open(out_dir / "checkpoint.json", "w") as handle:
+        json.dump(jsonable(checkpoint), handle, indent=2, default=str)
 
     finish_reason = ""
     if isinstance(summary, dict):
@@ -2332,6 +2283,9 @@ def run_leg(
         start_pose=[float(v) for v in started_pose],
         start_yaw_rad=float(started_yaw or 0.0),
         log=log,
+        checkpoint=checkpoint,
+        final_plan=copy.deepcopy(checkpoint.get("plan"))
+        if isinstance(checkpoint.get("plan"), Mapping) else None,
     )
     partial = {
         **result.to_dict(),
@@ -2342,6 +2296,8 @@ def run_leg(
         "inner_calls": len(ledger.entries) - len(ledger.outer_calls),
         "vlm_calls_wrapper": int(vlm.calls),
         "deadline_elapsed_s": vlm.elapsed_at_stop,
+        "checkpoint_path": str(out_dir / "checkpoint.json"),
+        "checkpoint_fields": sorted(checkpoint),
     }
     with open(out_dir / "leg_summary.json", "w") as handle:
         json.dump(jsonable(partial), handle, indent=2, default=str)
@@ -2475,6 +2431,95 @@ def _entries_for_stage(
     return selected, excluded, unscoped
 
 
+def _stage_confirmation(
+    stage_entries: Sequence[Mapping], stage: StageSpec,
+) -> dict:
+    """The stage's accepted identity, under its current candidate/revision.
+
+    Version 2: reach + locate prove *where* the drone went, not *what* it
+    found. The stage is identity-complete only with an ``accepted``
+    ``confirm_candidate`` for the current scope, and - when the candidate's
+    position is resolvable - that instance within the stage's ``locate_m``.
+    A confirmation of an earlier candidate/revision is stale and does not
+    count, unless the new candidate is within
+    :data:`CONFIRMATION_INHERIT_RADIUS_M` of the confirmed one (the same
+    instance re-grounded under a fresh id; reported in
+    ``confirmation_inherited_from``).
+    """
+    current_candidate = ""
+    current_revision: int | None = None
+    for entry in stage_entries:
+        scope = entry_scope(entry)
+        if scope is None:
+            continue
+        candidate = str(scope.get("candidate_id") or "")
+        if candidate:
+            current_candidate = candidate
+        try:
+            current_revision = int(scope.get("evidence_revision"))
+        except (TypeError, ValueError):
+            current_revision = None
+    accepted: list[Mapping] = []
+    table: dict[str, list[float]] = {}
+    for entry in stage_entries:
+        _collect_candidates(entry.get("data") or {}, table)
+    inherited_from: list[str] = []
+    for entry in stage_entries:
+        data = entry.get("data") if isinstance(entry.get("data"), Mapping) else {}
+        if str(entry.get("tool") or "") != "confirm_candidate":
+            continue
+        if str(data.get("verdict") or "") != "accepted":
+            continue
+        scope = entry_scope(entry) or {}
+        candidate = str(scope.get("candidate_id") or "")
+        inherited = False
+        if current_candidate and candidate and candidate != current_candidate:
+            old_point = table.get(candidate)
+            new_point = table.get(current_candidate)
+            if old_point is not None and new_point is not None:
+                inherited = (
+                    _distance(old_point, new_point) <= CONFIRMATION_INHERIT_RADIUS_M
+                )
+            if not inherited:
+                # an acceptance of another, unrelated instance is stale
+                continue
+            if candidate not in inherited_from:
+                inherited_from.append(candidate)
+        if not inherited:
+            try:
+                revision = int(scope.get("evidence_revision"))
+            except (TypeError, ValueError):
+                revision = None
+            if (
+                current_revision is not None
+                and revision is not None
+                and revision != current_revision
+            ):
+                continue
+        accepted.append(entry)
+    point = table.get(current_candidate) if current_candidate else None
+    distance = None
+    if point is not None and stage.position is not None:
+        distance = _distance(point, stage.position)
+    confirmed = bool(accepted)
+    correct = None
+    if distance is not None:
+        correct = bool(distance <= float(stage.locate_m))
+    latest = accepted[-1] if accepted else None
+    return {
+        "confirmation_required": True,
+        "confirmed": confirmed,
+        "confirmation_correct": correct,
+        "identity_complete": bool(confirmed and correct is True),
+        "confirmation_candidate_id": current_candidate or None,
+        "confirmation_distance_m": None if distance is None else round(distance, 3),
+        "confirmation_inherited_from": inherited_from,
+        "confirmed_seq": None if latest is None else latest.get("seq"),
+        "confirmed_order": None if latest is None else order_of(latest),
+        "confirmation_count": len(accepted),
+    }
+
+
 def stage_report(
     entries: Sequence[dict],
     task: TaskSpec,
@@ -2486,10 +2531,16 @@ def stage_report(
     """Per-stage reach/locate/complete verdicts, from scoped evidence only.
 
     A stage is *reached* when the executor carried the drone inside ``reach_m``
-    of the stage's place and *located* when a tool result carried a place inside
-    ``locate_m`` of it; the stage is complete when both hold. Nothing here reads
-    the model's prose: a plan step, a ``finish`` reason or a recovery note cannot
-    complete a stage.
+    of the stage's place **or** on the current candidate's standoff shell
+    (``standoff_m + CANDIDATE_REACH_TOLERANCE_M``); ``reach_basis`` says which
+    geometry held, and *located* when a tool result carried a place inside
+    ``locate_m`` of it. Version 2 adds the identity half: a scoped stage is
+    complete only when it also carries an ``accepted`` ``confirm_candidate`` for
+    the *current* candidate/revision, and the confirmed candidate resolves
+    inside that stage's ``locate_m`` (``identity_complete``). Reach + locate
+    alone is the version-1 verdict and is reported as ``complete=False`` for a
+    scoped report. Nothing here reads the model's prose: a plan step, a
+    ``finish`` reason or a recovery note cannot complete a stage.
 
     The v1 scope contract narrows both halves to the sub-task that stage was
     executing: an observation, candidate or arrival produced while another
@@ -2524,6 +2575,10 @@ def stage_report(
             "reach": False,
             "reach_order": None,
             "reach_distance_m": None,
+            "reach_basis": None,
+            "reach_candidate_id": None,
+            "reach_standoff_m": None,
+            "reach_candidate_distance_m": None,
             "located": False,
             "located_order": None,
             "located_seq": None,
@@ -2549,12 +2604,27 @@ def stage_report(
             stage_entries, excluded = list(entries), 0
         row["scoped_entries"] = len(stage_entries)
         row["scope_excluded_entries"] = excluded
+        if scoped:
+            row.update(_stage_confirmation(stage_entries, stage))
+        else:
+            row.update(
+                confirmation_required=False,
+                confirmed=None,
+                confirmation_correct=None,
+                identity_complete=None,
+                confirmation_candidate_id=None,
+                confirmation_distance_m=None,
+                confirmation_inherited_from=[],
+                confirmed_seq=None,
+                confirmed_order=None,
+                confirmation_count=0,
+            )
         if stage.position is not None:
-            best_reach: tuple[float, int | None] | None = None
+            best_reach: tuple[float, int | None, str, str, float | None] | None = None
             for point in external_poses:
                 gap = _distance(point, stage.position)
                 if gap <= stage.reach_m and (best_reach is None or gap < best_reach[0]):
-                    best_reach = (gap, None)
+                    best_reach = (gap, None, "center", "", None)
             for entry in stage_entries:
                 # both ends of every call: a leg that carried the drone *through*
                 # the stage's place and on to somewhere else still reached it
@@ -2564,11 +2634,62 @@ def stage_report(
                         continue
                     gap = _distance(pose_here, stage.position)
                     if gap <= stage.reach_m and (best_reach is None or gap < best_reach[0]):
-                        best_reach = (gap, order_of(entry))
+                        best_reach = (gap, order_of(entry), "center", "", None)
+            if scoped:
+                # the second, wider basis: the arrival is on the current
+                # candidate's standoff shell even when the stage centre is
+                # outside reach_m (the approach stops standoff_m short of the
+                # object, not at the stage's declared place)
+                candidate_table: dict[str, list[float]] = {}
+                for entry in stage_entries:
+                    _collect_candidates(entry.get("data") or {}, candidate_table)
+                candidate_reach: (
+                    tuple[float, int, str, str, float] | None
+                ) = None
+                for entry in stage_entries:
+                    scope = entry_scope(entry) or {}
+                    candidate = str(scope.get("candidate_id") or "")
+                    position = candidate_table.get(candidate) if candidate else None
+                    if position is None:
+                        continue
+                    data = entry.get("data") if isinstance(entry.get("data"), Mapping) else {}
+                    standoff = data.get("standoff_m")
+                    if standoff is None and str(entry.get("tool") or "") == "approach_candidate":
+                        standoff = DEFAULT_APPROACH_STANDOFF_M
+                    try:
+                        standoff = float(standoff)
+                    except (TypeError, ValueError):
+                        continue
+                    limit = max(0.0, standoff) + CANDIDATE_REACH_TOLERANCE_M
+                    for value in (entry.get("pose_before"), entry.get("pose_after")):
+                        pose_here = _as_position(value)
+                        if pose_here is None:
+                            continue
+                        gap = _distance(pose_here, position)
+                        if gap <= limit and (
+                            candidate_reach is None or gap < candidate_reach[0]
+                        ):
+                            candidate_reach = (
+                                gap, order_of(entry), candidate, standoff, gap
+                            )
+                if candidate_reach is not None:
+                    # prefer the candidate basis when both hold: it is the
+                    # geometry the approach actually flew to
+                    best_reach = (
+                        candidate_reach[0],
+                        candidate_reach[1],
+                        "candidate",
+                        candidate_reach[2],
+                        candidate_reach[3],
+                    )
+                    row["reach_candidate_distance_m"] = round(candidate_reach[4], 3)
             if best_reach is not None:
                 row["reach"] = True
                 row["reach_distance_m"] = round(best_reach[0], 3)
                 row["reach_order"] = best_reach[1]
+                row["reach_basis"] = best_reach[2]
+                row["reach_candidate_id"] = best_reach[3] or None
+                row["reach_standoff_m"] = best_reach[4]
             # how close *any* located reference got, inside the radius or not: a
             # stage the agent never established still says whether it looked at
             # the right place at all (a candidate 3 m away is a different object)
@@ -2596,10 +2717,24 @@ def stage_report(
                         "evidence_count": len(located["evidence"]),
                     }
                 )
-        row["complete"] = bool(row["reach"] and row["located"])
+        if scoped:
+            # identity-complete: an arrival at the candidate and a located place
+            # are only the version-1 half; the accepted confirmation of the
+            # *current* instance is the second half.
+            row["complete"] = bool(
+                row["reach"] and row["located"] and row["identity_complete"]
+            )
+        else:
+            row["complete"] = bool(row["reach"] and row["located"])
         if row["complete"]:
             row["complete_order"] = max(
-                [value for value in (row["reach_order"], row["located_order"]) if value]
+                [
+                    value for value in (
+                        row["reach_order"], row["located_order"],
+                        row.get("confirmed_order"),
+                    )
+                    if value
+                ]
                 or [0]
             )
         stages[stage.stage_id] = row
@@ -2629,6 +2764,18 @@ def stage_report(
         "n_stages": len(task.stages),
         "reach_count": sum(1 for row in stages.values() if row["reach"]),
         "locate_count": sum(1 for row in stages.values() if row["located"]),
+        "confirmation_required": bool(scoped),
+        "confirmed_count": sum(
+            1 for row in stages.values() if row.get("confirmed") is True
+        ),
+        "identity_complete_count": sum(
+            1 for row in stages.values() if row.get("identity_complete") is True
+        ),
+        "identity_complete_ids": [
+            task.stages[row["index"] - 1].stage_id
+            for row in stages.values()
+            if row.get("identity_complete") is True
+        ],
         "complete_count": len(complete),
         "complete_ids": [task.stages[i - 1].stage_id for i in complete],
         "complete_orders": complete_orders,
@@ -2700,63 +2847,345 @@ def verify_evidence(entries: Sequence[dict], target: StageSpec | None, gate_m: f
 # ---------------------------------------------------------------------------
 
 #: keys of the inherited state (the documented channels; see the module docstring)
-RESUME_CHANNELS = ("pose", "plan", "subgoal", "brief", "stages")
+RESUME_CHANNELS = ("pose", "plan", "subgoal", "brief", "checkpoint")
+
+#: Version of the runtime checkpoint (the agent-side state, saved verbatim).
+CHECKPOINT_VERSION = 3
+#: ``ctx.extra`` keys the checkpoint carries and the resumed leg restores.
+CHECKPOINT_SOURCES = (
+    "confirmation_ledger",
+    "perception.candidates",
+    "observations",
+    "viewpoints_by_id",
+    "hypotheses",
+    "task_scope",
+    "beliefs",
+    "open_questions",
+    "evidence_pack",
+    "last_observation_id",
+)
 
 
-def resume_brief(leg: LegResult, task: TaskSpec, report: Mapping, *, limit: int = 1200) -> dict:
-    """The instruction suffix of a resumed leg, and the places it names.
+def _checkpoint_extra(ctx: Any, plan: LegPlan | None) -> Mapping:
+    """The live ``ctx.extra`` of a finished/interrupted leg (or a safe empty)."""
+    extra = getattr(ctx, "extra", None) if ctx is not None else None
+    if isinstance(extra, Mapping):
+        return extra
+    if plan is not None and isinstance(plan.ctx_extra, Mapping):
+        return plan.ctx_extra
+    return {}
 
-    Every *stage* place named here comes from a tool result the interrupted leg
-    received (a candidate, a relocalized target) - the scene's ground truth is
-    never read, so a resumed episode cannot be handed a place the model did not
-    establish itself. The drone's own pose is carried too (it is the agent's own
-    state, the same number every prompt shows it), but the two are reported
-    separately: ``places`` is what the report audits against the ledger,
-    ``pose`` is where the drone is.
+
+def build_runtime_checkpoint(
+    plan: LegPlan | None,
+    world: Any,
+    *,
+    ctx: Any = None,
+) -> dict:
+    """Save the runtime state **verbatim** (goal.md version 3).
+
+    Only the agent's own state travels: the plan record with its sub-task
+    statuses, the confirmation ledger, candidate/observation/viewpoint memory
+    references, the task scope, beliefs/hypotheses, open questions and the
+    evidence pack. The scene's ground truth is never read here - a wrong belief
+    (a sub-task marked done that the evaluator would not accept) is saved as the
+    agent left it, so the resumed leg has to discover and correct it itself.
     """
-    stages = report.get("stages") or {}
+    extra = _checkpoint_extra(ctx, plan)
+    position, yaw = world_pose(world)
+    raw_plan = extra.get("plan")
+    if not isinstance(raw_plan, Mapping) and plan is not None:
+        candidate_plan = (plan.ctx_extra or {}).get("plan")
+        raw_plan = candidate_plan if isinstance(candidate_plan, Mapping) else None
+    raw_plan = jsonable(copy.deepcopy(dict(raw_plan))) if isinstance(raw_plan, Mapping) else None
+    checkpoint = {
+        "version": CHECKPOINT_VERSION,
+        "source": "runtime.ctx.extra",
+        "source_leg": "" if plan is None else str(plan.label),
+        "source_episode_id": str(
+            getattr(ctx, "episode_id", "") if ctx is not None else ""
+        ),
+        "saved_at_s": round(time.time(), 3),
+        "instruction": str(
+            extra.get("instruction")
+            or ("" if plan is None else plan.instruction)
+            or ""
+        ),
+        "pose": {
+            "position_flu": [float(v) for v in position],
+            "yaw_rad": float(yaw or 0.0),
+        },
+        "plan": raw_plan,
+        "confirmation_ledger": {},
+        "candidates": {},
+        "observations": {},
+        "viewpoints_by_id": {},
+        "hypotheses": {},
+        "task_scope": {},
+        "beliefs": {},
+        "open_questions": None,
+        "evidence_pack": {},
+        "last_observation_id": "",
+    }
+    for key in CHECKPOINT_SOURCES:
+        value = extra.get(key)
+        if value is None:
+            continue
+        checkpoint[key] = copy.deepcopy(jsonable(value))
+    if not checkpoint["beliefs"] and checkpoint["hypotheses"]:
+        checkpoint["beliefs"] = copy.deepcopy(checkpoint["hypotheses"])
+    return jsonable(checkpoint)
+
+
+def _leg_checkpoint(leg: LegResult) -> dict:
+    """The checkpoint the resume path consumes; never a stage verdict.
+
+    A leg that carries a runtime checkpoint uses it verbatim. For an artifact
+    written before version 3 the fallback carries the leg's *starting* plan and
+    pose only - it makes no completion claim and reads no ground truth, so the
+    old artifact degrades to "nothing established" instead of being handed an
+    evaluator-judged resume state.
+    """
+    checkpoint = getattr(leg, "checkpoint", None)
+    if isinstance(checkpoint, Mapping) and checkpoint:
+        return dict(checkpoint)
+    start_plan = (leg.plan.ctx_extra or {}).get("plan")
+    pose = _as_position(leg.entries[-1].get("pose_after")) if leg.entries else None
+    pose = pose or _as_position(leg.start_pose) or [0.0, 0.0, 0.0]
+    yaw = float(leg.entries[-1].get("yaw_after") or 0.0) if leg.entries else 0.0
+    return {
+        "version": CHECKPOINT_VERSION,
+        "source": "leg_metadata",
+        "source_leg": leg.plan.label,
+        "source_episode_id": leg.plan.prompt_episode_id,
+        "instruction": leg.plan.instruction,
+        "pose": {"position_flu": [float(v) for v in pose], "yaw_rad": yaw},
+        "plan": copy.deepcopy(jsonable(start_plan)) if isinstance(start_plan, Mapping) else None,
+        "confirmation_ledger": {},
+        "candidates": {},
+        "observations": {},
+        "viewpoints_by_id": {},
+        "hypotheses": {},
+        "task_scope": {},
+        "beliefs": {},
+        "open_questions": None,
+        "evidence_pack": {},
+        "last_observation_id": "",
+    }
+
+
+def _subtask_number(subtask: Mapping, position: int) -> int:
+    """The stage index a sub-task id names (``st_2`` -> 2), else its position."""
+    text = str(subtask.get("id") or "")
+    match = re.search(r"(\d+)\s*$", text)
+    return int(match.group(1)) if match else int(position)
+
+
+def _plan_belief(plan: Mapping | None) -> tuple[list[int], list[int]]:
+    """``(done, claimed)`` stage indexes the checkpoint's own plan records."""
+    done: list[int] = []
+    claimed: list[int] = []
+    subtasks = (plan or {}).get("subtasks") or []
+    for position, subtask in enumerate(subtasks, 1):
+        if not isinstance(subtask, Mapping):
+            continue
+        index = _subtask_number(subtask, position)
+        status = str(subtask.get("status") or "")
+        if status == "done":
+            done.append(index)
+        elif status in ("claimed_done", "blocked", "failed"):
+            claimed.append(index)
+    if not subtasks:
+        for value in (plan or {}).get("done") or []:
+            try:
+                done.append(int(value))
+            except (TypeError, ValueError):
+                continue
+    return sorted(set(done)), sorted(set(claimed))
+
+
+def _checkpoint_candidates(checkpoint: Mapping) -> dict:
+    """Candidate records the checkpoint itself carries.
+
+    The runtime keeps its candidate table under ``perception.candidates`` (a
+    literal dotted ``ctx.extra`` key) while older fixtures and the fallback
+    checkpoint use ``candidates``. The brief and the checkpoint score read both
+    and prefer the runtime table when an id appears in both.
+    """
+    merged: dict[str, Mapping] = {}
+    for key in ("candidates", "perception.candidates"):
+        table = checkpoint.get(key)
+        if isinstance(table, Mapping):
+            for candidate_id, record in table.items():
+                if isinstance(record, Mapping):
+                    merged[str(candidate_id)] = record
+    perception = checkpoint.get("perception")
+    if isinstance(perception, Mapping) and isinstance(perception.get("candidates"), Mapping):
+        for candidate_id, record in perception["candidates"].items():
+            if isinstance(record, Mapping):
+                merged.setdefault(str(candidate_id), record)
+    return merged
+
+
+def _checkpoint_candidate_table(checkpoint: Mapping, entries: Sequence[Mapping]) -> dict[str, list[float]]:
+    """``candidate_id -> place`` from the whole leg plus the checkpoint.
+
+    Stage-scoped confirmation rows can only resolve candidates proposed while
+    that stage was current. A candidate proposed under another stage (v10
+    seed23 accepted the landmark candidate while executing the object stage)
+    is still the agent's own record, so the checkpoint score resolves it from
+    every entry of the leg - the same table ``instance_acceptance`` builds.
+    """
+    table: dict[str, list[float]] = {}
+    for entry in entries:
+        _collect_candidates(entry.get("data") or {}, table)
+    for candidate_id, record in _checkpoint_candidates(checkpoint).items():
+        point = _as_position(record.get("position_flu"))
+        if point is not None:
+            table.setdefault(candidate_id, [float(v) for v in point])
+    return table
+
+
+def _plan_claimed_done(plan: Mapping | None) -> list[int]:
+    """Stage indexes the plan marks ``claimed_done`` (a completion claim)."""
+    claimed: list[int] = []
+    for position, subtask in enumerate((plan or {}).get("subtasks") or [], 1):
+        if isinstance(subtask, Mapping) and str(subtask.get("status") or "") == "claimed_done":
+            claimed.append(_subtask_number(subtask, position))
+    return sorted(set(claimed))
+
+
+def _checkpoint_payload(checkpoint: Mapping) -> dict:
+    return {
+        key: checkpoint.get(key)
+        for key in (
+            "candidates",
+            "perception.candidates",
+            "observations",
+            "viewpoints_by_id",
+            "hypotheses",
+            "evidence_pack",
+            "plan",
+        )
+        if checkpoint.get(key)
+    }
+
+
+def resume_brief(leg: LegResult, task: TaskSpec | None = None, *, limit: int = 1200) -> dict:
+    """The instruction suffix of a resumed leg, built from its checkpoint only.
+
+    Nothing here compares the agent's records with the scene: the plan statuses,
+    confirmation ledger and places are reproduced exactly as the interrupted leg
+    left them. A wrong "done" therefore survives the restart - the resumed leg is
+    the one that has to notice and correct it (the offline evaluator scores that
+    separately).
+    """
+    checkpoint = _leg_checkpoint(leg)
+    plan = checkpoint.get("plan") if isinstance(checkpoint.get("plan"), Mapping) else {}
+    subtasks = plan.get("subtasks") or []
     lines = [
         "[SESSION RESUME] This episode was interrupted before the task was done "
         f"({leg.plan.interrupt_mode or 'interrupt'}: {leg.interrupt_reason or 'leg ended early'}).",
-        "You already established the following in the interrupted leg, from your own tool results:",
+        "These are YOUR OWN records from the interrupted leg, loaded from its "
+        "checkpoint without any evaluator correction:",
     ]
-    established: list[str] = []
+    if subtasks:
+        for position, subtask in enumerate(subtasks, 1):
+            if not isinstance(subtask, Mapping):
+                continue
+            index = _subtask_number(subtask, position)
+            status = str(subtask.get("status") or "pending")
+            goal = str(subtask.get("goal") or "")
+            detail = f"sub-task {subtask.get('id') or f'st_{index}'} (stage {index}): {status}"
+            if goal:
+                detail += f" — {goal}"
+            evidence = [str(item) for item in subtask.get("evidence") or () if item]
+            if evidence:
+                detail += "; evidence: " + ", ".join(evidence[:4])
+            if status != "done":
+                detail += " (NOT done)"
+            lines.append(f"  - {detail}")
+    elif plan.get("steps"):
+        for index, step in enumerate(plan.get("steps") or [], 1):
+            mark = "done" if index in (plan.get("done") or []) else "open"
+            lines.append(f"  - step {index} (stage {index}): {mark} — {step}")
+    else:
+        lines.append("  - no plan was recorded before the interruption")
+    ledger = checkpoint.get("confirmation_ledger") or {}
+    if isinstance(ledger, Mapping) and ledger:
+        lines.append("Your confirmation ledger at interruption:")
+        for candidate_id, entry in ledger.items():
+            if not isinstance(entry, Mapping):
+                continue
+            status = str(entry.get("last_verdict") or "unconfirmed")
+            revision = entry.get("accepted_revision", entry.get("revision"))
+            detail = f"  - {candidate_id}: {status}"
+            if revision is not None:
+                detail += f" (revision {revision})"
+            missing = [str(item) for item in entry.get("missing") or () if item]
+            if missing:
+                detail += "; missing: " + ", ".join(missing)
+            lines.append(detail)
+    candidates = _checkpoint_candidates(checkpoint)
     places: list[list[float]] = []
-    for stage in task.stages:
-        row = stages.get(stage.stage_id) or {}
-        if row.get("complete"):
-            place = row.get("located_position_flu")
-            refs = [f"{ref.get('kind')}:{ref.get('ref')}" for ref in row.get("evidence_refs") or []]
-            detail = f"stage {row['index']} ({stage.label})"
-            if place:
+    if candidates:
+        lines.append("Candidates you recorded yourself:")
+        for candidate_id, record in candidates.items():
+            place = _as_position(record.get("position_flu"))
+            detail = f"  - {candidate_id}"
+            if place is not None:
                 detail += " at (" + ", ".join(f"{float(v):.2f}" for v in place) + ")"
                 places.append([float(v) for v in place])
-            if refs:
-                detail += " — evidence " + ", ".join(refs[:3])
-            established.append(detail)
-        else:
-            missing = []
-            if not row.get("reach"):
-                missing.append("not reached")
-            if not row.get("located"):
-                missing.append("not located")
-            established.append(
-                f"stage {row.get('index', stage.index)} ({stage.label}) NOT done ({', '.join(missing) or 'unknown'})"
-            )
-    lines.extend(f"  - {item}" for item in established)
-    pose = _as_position(leg.entries[-1].get("pose_after")) if leg.entries else None
+            status = str(record.get("status") or record.get("confirmation_status") or "")
+            if status:
+                detail += f" [{status}]"
+            lines.append(detail)
+    for key in ("observations", "viewpoints_by_id"):
+        table = checkpoint.get(key) or {}
+        if not isinstance(table, Mapping):
+            continue
+        for item_id, record in table.items():
+            if not isinstance(record, Mapping):
+                continue
+            place = _as_position(record.get("position_flu"))
+            if place is not None:
+                places.append([float(place[0]), float(place[1]), float(place[2])])
+    open_questions = checkpoint.get("open_questions")
+    if open_questions:
+        lines.append(f"Your open questions: {open_questions}")
+    pose = _as_position((checkpoint.get("pose") or {}).get("position_flu"))
+    if pose is None:
+        pose = _as_position(leg.entries[-1].get("pose_after")) if leg.entries else None
     pose = pose or _as_position(leg.start_pose)
     pose_out: list[float] | None = None
     if pose is not None:
-        yaw_deg = math.degrees(float(leg.entries[-1].get("yaw_after") or 0.0)) if leg.entries else 0.0
+        yaw_deg = math.degrees(float((checkpoint.get("pose") or {}).get("yaw_rad") or 0.0)) \
+            if checkpoint.get("pose") else 0.0
         pose_out = [float(v) for v in pose]
         lines.append(
             "Your drone is at (" + ", ".join(f"{float(v):.2f}" for v in pose)
-            + f"), heading {yaw_deg:.0f} deg. The plan progress and the STATE block carry "
-            "what is done; continue with the remaining stages from this pose and do not "
-            "redo what is already established."
+            + f"), heading {yaw_deg:.0f} deg. Continue from these records. If you now "
+            "doubt a record (a 'done' you cannot back with evidence, a weak "
+            "confirmation), re-check it yourself with observe / compare_candidates / "
+            "confirm_candidate instead of assuming it was corrected."
         )
+    # every place named in the brief is one the agent itself recorded
+    for item in positions_in(_checkpoint_payload(checkpoint)):
+        place = [float(item[0]), float(item[1]), float(item[2])]
+        if place not in places:
+            places.append(place)
     return {"text": "\n".join(lines)[:limit], "places": places, "pose": pose_out}
+
+
+def _restore_extras(checkpoint: Mapping) -> dict:
+    """``ctx.extra`` entries the resumed leg inherits verbatim."""
+    restore: dict[str, Any] = {}
+    for key in CHECKPOINT_SOURCES:
+        value = checkpoint.get(key)
+        if value in (None, {}, [], ""):
+            continue
+        restore[key] = copy.deepcopy(value)
+    return restore
 
 
 def build_resume_state(
@@ -2766,52 +3195,89 @@ def build_resume_state(
     prompt_episode_id: str,
     world: Any = None,
     base_instruction: str | None = None,
-    report: Mapping | None = None,
 ) -> dict:
-    """The inherited state of a resumed leg (pose, plan record, subgoal, brief).
+    """The inherited state of a resumed leg, consumed from its checkpoint.
 
-    The plan record is built by :func:`build_carry_plan` - through the task
-    module's own ``update_plan`` when its sub-task schema is there, so the resumed
-    leg adopts a plan the executor can keep running rather than a hand-written
-    look-alike. ``base_instruction`` is the instruction without the brief; the
-    record's ``instruction`` is the *resumed* instruction (brief included), which
-    is what ``resume_plan``'s guard compares against.
+    Version 3: the plan record (with its sub-task statuses and evidence), the
+    confirmation ledger, the memory references, the scope and the beliefs are
+    copied **verbatim** from ``leg.checkpoint``. No ``stage_report`` (or any
+    other ground-truth verdict) is consulted, so a wrong belief - a sub-task the
+    checkpoint marks done that the scene would not accept - is restored as the
+    agent's own belief, not silently corrected.
+
+    ``base_instruction`` is the instruction without the brief; the plan record's
+    own ``instruction`` is left untouched (the checkpoint is the authority).
     """
-    report = report or stage_report(
-        leg.entries, task, subtask_map=stage_subtask_map(task, [leg])
-    )
-    stages = report.get("stages") or {}
-    done = [stage.index for stage in task.stages if (stages.get(stage.stage_id) or {}).get("complete")]
-    total = len(task.stages)
-    current = min([index for index in range(1, total + 1) if index not in done] or [total])
-    brief = resume_brief(leg, task, report)
+    checkpoint = _leg_checkpoint(leg)
+    plan = checkpoint.get("plan")
+    plan = copy.deepcopy(dict(plan)) if isinstance(plan, Mapping) else None
+    done, claimed = _plan_belief(plan)
+    total = len(task.stages) if task is not None else len((plan or {}).get("subtasks") or [])
+    current = min([index for index in range(1, total + 1) if index not in done] or [total or 1])
+    brief = resume_brief(leg, task)
     base = str(base_instruction if base_instruction is not None else leg.plan.instruction)
     resumed_instruction = f"{base}\n\n{brief['text']}" if brief["text"] else base
-    note = (
-        f"carried over from the interrupted leg "
-        f"({leg.plan.label}: {leg.interrupt_reason or 'early end'})"
-    )
-    plan, carry_detail = build_carry_plan(
-        task, report, world=world, instruction=resumed_instruction, note=note
-    )
+    # the record the runtime *runs*: identical to the checkpoint except for the
+    # instruction the module's resume guard compares (``state["plan"]`` stays
+    # verbatim; this copy is bookkeeping, not a verdict)
+    run_plan = copy.deepcopy(plan) if isinstance(plan, Mapping) else None
+    if isinstance(run_plan, dict):
+        statuses = [
+            str(item.get("status") or "")
+            for item in run_plan.get("subtasks") or []
+            if isinstance(item, Mapping)
+        ]
+        if not statuses or all(status == "done" for status in statuses):
+            # a legacy plan without sub-tasks, or every stage (wrongly) marked
+            # done: resume_plan would refuse it, so make it the current
+            # episode's record - the belief must survive, and the agent has to
+            # overturn it
+            if prompt_episode_id:
+                run_plan["episode_id"] = str(prompt_episode_id)
+        else:
+            # a partial plan is adopted through the module's own resume_plan
+            # (it logs plan_resumed and keeps the statuses/evidence unchanged)
+            source_leg = str(checkpoint.get("source_leg") or "")
+            if source_leg and prompt_episode_id:
+                run_plan["episode_id"] = source_leg
+        if str(prompt_episode_id or "") and str(
+            run_plan.get("episode_id") or ""
+        ) not in ("", str(prompt_episode_id or "")):
+            run_plan["instruction"] = resumed_instruction[:160]
+    subtasks = (plan or {}).get("subtasks") or []
+    next_goal = ""
+    if 1 <= current <= len(subtasks) and isinstance(subtasks[current - 1], Mapping):
+        next_goal = str(subtasks[current - 1].get("goal") or "")
     subgoal = (
-        f"resumed after an interruption; stages done: {done}; next: stage {current} "
-        f"({task.stages[current - 1].label if 1 <= current <= total else 'done'})"
+        f"resumed from your own checkpoint; done: {done}; next: stage {current}"
+        + (f" ({next_goal})" if next_goal else "")
     )
-    end_pose = _as_position(leg.entries[-1].get("pose_after")) if leg.entries else None
-    yaw = float(leg.entries[-1].get("yaw_after") or 0.0) if leg.entries else 0.0
+    checkpoint_pose = checkpoint.get("pose") if isinstance(checkpoint.get("pose"), Mapping) else {}
+    position = _as_position(checkpoint_pose.get("position_flu"))
+    if position is None:
+        position = _as_position(leg.entries[-1].get("pose_after")) if leg.entries else None
+    position = position or _as_position(leg.start_pose) or [0.0, 0.0, 0.0]
+    yaw = float(checkpoint_pose.get("yaw_rad") or 0.0)
     return {
-        "pose": {"position_flu": list(end_pose or leg.start_pose), "yaw_rad": yaw},
+        "pose": {"position_flu": [float(v) for v in position], "yaw_rad": yaw},
         "plan": plan,
-        "plan_carry_detail": carry_detail,
+        "resume_plan": run_plan,
+        "plan_carry_detail": {
+            "carry_backend": "checkpoint (verbatim)",
+            "subtasks": bool(subtasks),
+            "done": done,
+            "claimed": claimed,
+        },
         "subgoal": subgoal,
         "brief": brief["text"],
         "brief_places": brief["places"],
         "brief_pose": brief["pose"],
         "instruction": resumed_instruction,
-        "stages": report,
+        "checkpoint": copy.deepcopy(checkpoint),
+        "restore": _restore_extras(checkpoint),
         "done": done,
-        "complete_count": int(report.get("complete_count", 0)),
+        "claimed": claimed,
+        "complete_count": len(done),
     }
 
 
@@ -3222,6 +3688,140 @@ def plan_vs_evidence_by_leg(
     }
 
 
+def checkpoint_report(
+    task: TaskSpec,
+    legs: Sequence[LegResult],
+    *,
+    subtask_map: Mapping[str, int] | None = None,
+) -> dict:
+    """Offline score of the checkpoint against the scene's ground truth.
+
+    This is the only place the two channels meet. The checkpoint is what the
+    *agent* believed at the interrupt (its own plan statuses and confirmation
+    ledger); ``stage_report`` is what the scene really accepted. The report
+    counts the agent's wrong beliefs and whether the resumed leg overturned any
+    of them by itself (a sub-task it no longer marks done, or a confirmation it
+    now rejects).
+
+    Two blind spots of the stage-scoped verdict are filled from the checkpoint's
+    own records: a confirmation accepted under a *different* sub-task still has
+    a candidate place in the leg's whole candidate table (v10 seed23 accepted
+    the landmark candidate while executing the object stage), and a plan status
+    ``claimed_done`` is a completion claim even though the runtime has not
+    promoted it to ``done`` yet.
+    """
+    interrupted = next((leg for leg in legs if leg.interrupted), None)
+    checkpoint = interrupted.checkpoint if interrupted is not None else {}
+    if not isinstance(checkpoint, Mapping) or not checkpoint:
+        return {"available": False}
+    mapping = subtask_map or stage_subtask_map(task, [interrupted])
+    truth = stage_report(interrupted.entries, task, subtask_map=mapping)
+    gt_done = {
+        f"st_{stage.index}"
+        for stage in task.stages
+        if stage.stage_id in set(truth.get("complete_ids") or ())
+    }
+    plan = checkpoint.get("plan") if isinstance(checkpoint.get("plan"), Mapping) else None
+    claimed_indexes, claimed_open = _plan_belief(plan)
+    claimed_done = {f"st_{index}" for index in claimed_indexes}
+    wrong_done = sorted(claimed_done - gt_done)
+    missed_done = sorted(gt_done - claimed_done)
+    claimed_claims = {f"st_{index}" for index in _plan_claimed_done(plan)}
+    wrong_claimed = sorted(claimed_claims - gt_done)
+
+    ledger = checkpoint.get("confirmation_ledger") or {}
+    claimed_confirmed = sorted(
+        str(candidate_id)
+        for candidate_id, entry in (ledger.items() if isinstance(ledger, Mapping) else ())
+        if isinstance(entry, Mapping) and str(entry.get("last_verdict") or "") == "accepted"
+    )
+    # identity claims the offline report can adjudicate: a confirmed candidate
+    # whose own place is outside the stage's locate radius is a wrong instance.
+    # The stage-scoped confirmation can only resolve candidates proposed under
+    # that stage; fall back to the whole leg's table (and the checkpoint's own
+    # candidate records) for a candidate proposed under another sub-task.
+    candidate_table = _checkpoint_candidate_table(checkpoint, interrupted.entries)
+    wrong_confirmed: set[str] = set()
+    resolved_confirmations: list[dict] = []
+    for stage in task.stages:
+        row = (truth.get("stages") or {}).get(stage.stage_id) or {}
+        if not row.get("confirmed"):
+            continue
+        candidate_id = str(row.get("confirmation_candidate_id") or "")
+        correct = row.get("confirmation_correct")
+        distance = row.get("confirmation_distance_m")
+        source = "stage_scope"
+        if correct is None and candidate_id:
+            point = candidate_table.get(candidate_id)
+            if point is not None and stage.position is not None:
+                distance = _distance(point, stage.position)
+                correct = bool(distance <= float(stage.locate_m))
+                source = "leg_candidate_table"
+                resolved_confirmations.append(
+                    {
+                        "stage": stage.stage_id,
+                        "candidate_id": candidate_id,
+                        "distance_m": round(float(distance), 3),
+                        "locate_m": float(stage.locate_m),
+                        "correct": correct,
+                        "source": source,
+                    }
+                )
+        if correct is False and candidate_id:
+            wrong_confirmed.add(candidate_id)
+    wrong_confirmed_ids = sorted(wrong_confirmed)
+
+    follow = next(
+        (leg for leg in legs[1:] if leg.plan.role in ("resume", "control")), None
+    )
+    final_plan = follow.final_plan if follow is not None else None
+    final_status: dict[str, str] = {}
+    for position, subtask in enumerate((final_plan or {}).get("subtasks") or [], 1):
+        if isinstance(subtask, Mapping):
+            final_status[f"st_{_subtask_number(subtask, position)}"] = str(
+                subtask.get("status") or ""
+            )
+    corrected = [
+        stage_id for stage_id in wrong_done
+        if final_status and final_status.get(stage_id) != "done"
+    ]
+    corrected_claimed = [
+        stage_id for stage_id in wrong_claimed
+        if final_status and final_status.get(stage_id) not in ("done", "claimed_done")
+    ]
+    final_ledger = (
+        follow.checkpoint.get("confirmation_ledger")
+        if follow is not None and isinstance(follow.checkpoint, Mapping)
+        else {}
+    )
+    corrected_confirmed = [
+        candidate_id for candidate_id in wrong_confirmed_ids
+        if isinstance(final_ledger, Mapping)
+        and str((final_ledger.get(candidate_id) or {}).get("last_verdict") or "")
+        == "rejected"
+    ]
+    corrections = sorted(set(corrected) | set(corrected_claimed) | set(corrected_confirmed))
+    return {
+        "available": True,
+        "source": str(checkpoint.get("source") or ""),
+        "fields": sorted(str(key) for key in checkpoint),
+        "claimed_done": sorted(claimed_done),
+        "claimed_open": [f"st_{index}" for index in claimed_open],
+        "claimed_claimed_done": sorted(claimed_claims),
+        "gt_done": sorted(gt_done),
+        "wrong_done": wrong_done,
+        "wrong_claimed": wrong_claimed,
+        "missed_done": missed_done,
+        "claimed_confirmed": claimed_confirmed,
+        "wrong_confirmed": wrong_confirmed_ids,
+        "resolved_confirmations": resolved_confirmations,
+        "wrong_belief_count": len(wrong_done) + len(wrong_claimed) + len(wrong_confirmed_ids),
+        "resume_corrections": len(corrections),
+        "corrected": corrections,
+        "checkpoint_correct": not wrong_done and not wrong_claimed and not wrong_confirmed_ids,
+    }
+
+
 def episode_metrics(
     task: TaskSpec,
     legs: Sequence[LegResult],
@@ -3293,6 +3893,9 @@ def episode_metrics(
     # the same question for *every* leg, so an uninterrupted leg cannot hide an
     # executor/evidence disagreement behind a report that only checked resumes
     verdict["plan_vs_evidence_by_leg"] = plan_vs_evidence_by_leg(task, legs)
+    # the two channels meet only here: the checkpoint is judged against the
+    # offline stage verdict after it has been restored and acted on
+    verdict["checkpoint"] = checkpoint_report(task, legs)
     return verdict
 
 
@@ -3512,6 +4115,10 @@ def aggregate(episodes: Sequence[Mapping], task: TaskSpec, meta: Mapping) -> dic
     claim_rows = [row.get("completion_claim") or {} for row in episodes]
     episodes_claiming = sum(1 for row in claim_rows if row.get("claimed"))
     wrong_completions = sum(1 for row in claim_rows if row.get("wrong"))
+    checkpoint_rows = [
+        row.get("checkpoint") or {} for row in episodes
+    ]
+    checkpoint_scored = [row for row in checkpoint_rows if row.get("available")]
     unsafe_done = [
         item
         for row in episodes
@@ -3587,6 +4194,54 @@ def aggregate(episodes: Sequence[Mapping], task: TaskSpec, meta: Mapping) -> dic
                     "wrong": bool((row.get("completion_claim") or {}).get("wrong")),
                 }
                 for row in episodes
+            ],
+        },
+        "checkpoint_correctness": {
+            "episodes": len(checkpoint_scored),
+            "checkpoint_correct": sum(
+                1 for row in checkpoint_scored if row.get("checkpoint_correct")
+            ),
+            "checkpoint_correct_rate": _rate(
+                sum(1 for row in checkpoint_scored if row.get("checkpoint_correct")),
+                len(checkpoint_scored),
+            ),
+            "wrong_beliefs": sum(
+                int(row.get("wrong_belief_count") or 0) for row in checkpoint_scored
+            ),
+            "episodes_with_wrong_belief": sum(
+                1 for row in checkpoint_scored if int(row.get("wrong_belief_count") or 0)
+            ),
+            "wrong_done_beliefs": sum(
+                len(row.get("wrong_done") or []) for row in checkpoint_scored
+            ),
+            "wrong_claimed_beliefs": sum(
+                len(row.get("wrong_claimed") or []) for row in checkpoint_scored
+            ),
+            "wrong_confirmation_beliefs": sum(
+                len(row.get("wrong_confirmed") or []) for row in checkpoint_scored
+            ),
+            "resume_corrections": sum(
+                int(row.get("resume_corrections") or 0) for row in checkpoint_scored
+            ),
+            "episodes_with_correction": sum(
+                1 for row in checkpoint_scored if int(row.get("resume_corrections") or 0)
+            ),
+            "by_episode": [
+                {
+                    "label": row.get("label"),
+                    "wrong_done": list((row.get("checkpoint") or {}).get("wrong_done") or []),
+                    "wrong_claimed": list(
+                        (row.get("checkpoint") or {}).get("wrong_claimed") or []
+                    ),
+                    "wrong_confirmed": list(
+                        (row.get("checkpoint") or {}).get("wrong_confirmed") or []
+                    ),
+                    "corrections": int(
+                        (row.get("checkpoint") or {}).get("resume_corrections") or 0
+                    ),
+                }
+                for row in episodes
+                if (row.get("checkpoint") or {}).get("available")
             ],
         },
         "finish_contract": {
@@ -3996,6 +4651,18 @@ def report_markdown(report: Mapping) -> str:
         f"- information calls in the resumed leg from an already-established stage with no new evidence: "
         f"{intr.get('done_stage_recheck_total')}",
         "",
+        "## checkpoint (agent beliefs vs offline ground truth)",
+        "",
+        f"- scored checkpoints: {(agg.get('checkpoint_correctness') or {}).get('episodes', 0)}; "
+        f"correct: {(agg.get('checkpoint_correctness') or {}).get('checkpoint_correct', 0)} "
+        f"({(agg.get('checkpoint_correctness') or {}).get('checkpoint_correct_rate')})",
+        f"- wrong beliefs (done/confirmed the scene did not accept): "
+        f"{(agg.get('checkpoint_correctness') or {}).get('wrong_beliefs', 0)} "
+        f"in {(agg.get('checkpoint_correctness') or {}).get('episodes_with_wrong_belief', 0)} episode(s)",
+        f"- wrong beliefs corrected by the resumed leg itself: "
+        f"{(agg.get('checkpoint_correctness') or {}).get('resume_corrections', 0)} "
+        f"in {(agg.get('checkpoint_correctness') or {}).get('episodes_with_correction', 0)} episode(s)",
+        "",
         "## decision nodes vs executor",
         "",
         "| decision turns | decision nodes | routine turns | sub-task switches | model calls | executor legs | "
@@ -4074,8 +4741,10 @@ def load_leg(out_dir: Path) -> LegResult | None:
 
     Everything the metrics need is in the leg's own files: the ledger (calls,
     poses, executor counters), ``leg_summary.json`` (interrupt/executor/summary),
-    ``run_config.json`` (the leg plan), ``summary.json`` (the runner's verdict)
-    and ``episode_log.json`` (the runtime's decision nodes and plan transitions).
+    ``run_config.json`` (the leg plan), ``summary.json`` (the runner's verdict),
+    ``episode_log.json`` (the runtime's decision nodes and plan transitions) and
+    ``checkpoint.json`` (the runtime state the offline checkpoint score reads -
+    without it a re-analysis reports ``checkpoint_correctness.episodes=0``).
     Re-analysing a finished run therefore needs no world, no model and no GPU.
     """
     out_dir = Path(out_dir)
@@ -4095,6 +4764,12 @@ def load_leg(out_dir: Path) -> LegResult | None:
     leg_summary_path = out_dir / "leg_summary.json"
     if leg_summary_path.exists():
         leg_summary = json.loads(leg_summary_path.read_text())
+    checkpoint: dict = {}
+    checkpoint_path = out_dir / "checkpoint.json"
+    if checkpoint_path.exists():
+        raw_checkpoint = json.loads(checkpoint_path.read_text())
+        if isinstance(raw_checkpoint, Mapping):
+            checkpoint = dict(raw_checkpoint)
     log: dict = {}
     log_path = out_dir / "episode_log.json"
     if log_path.exists():
@@ -4129,6 +4804,9 @@ def load_leg(out_dir: Path) -> LegResult | None:
         wall_time_s=float(leg_summary.get("wall_time_s") or 0.0),
         start_pose=[float(v) for v in (leg_summary.get("start_pose") or [])],
         log=log,
+        checkpoint=checkpoint,
+        final_plan=copy.deepcopy(checkpoint.get("plan"))
+        if isinstance(checkpoint.get("plan"), Mapping) else None,
     )
 
 
@@ -4406,7 +5084,14 @@ def plan_legs(
         base_instruction=first.instruction,
     )
     carry = str(state["brief"])
-    ctx_extra = {"plan": state["plan"], "subgoal": state["subgoal"]}
+    ctx_extra: dict[str, Any] = {"subgoal": state["subgoal"]}
+    run_plan = state.get("resume_plan", state.get("plan"))
+    if run_plan is not None:
+        ctx_extra["plan"] = run_plan
+    # the checkpoint's own stores travel with the plan: confirmation ledger,
+    # candidate/observation/viewpoint references, scope, beliefs and the
+    # evidence pack. This is a verbatim load - no verdict is recomputed here.
+    ctx_extra.update(state.get("restore") or {})
     teleport = (
         [float(v) for v in state["pose"]["position_flu"]],
         float(state["pose"]["yaw_rad"]),
@@ -4477,13 +5162,16 @@ def plan_legs(
                 "mode": "resume",
                 "channels": list(RESUME_CHANNELS),
                 "done": list(state["done"]),
+                "claimed": list(state.get("claimed") or []),
                 "plan_steps": [stage.step for stage in task.stages],
-                "plan_current_step": ctx_extra["plan"].get("current_step"),
+                "plan_current_step": (state.get("plan") or {}).get("current_step"),
                 "plan_subtasks": [
                     {"id": item.get("id"), "status": item.get("status")}
-                    for item in ctx_extra["plan"].get("subtasks") or []
+                    for item in (state.get("plan") or {}).get("subtasks") or []
                 ],
                 "plan_carry_backend": (state.get("plan_carry_detail") or {}).get("carry_backend"),
+                "checkpoint_fields": sorted(state.get("checkpoint") or {}),
+                "checkpoint_source": (state.get("checkpoint") or {}).get("source"),
                 "subgoal": ctx_extra.get("subgoal"),
                 "brief": carry,
                 "brief_places": list(state["brief_places"]),
@@ -4773,12 +5461,20 @@ def main(argv: list[str] | None = None) -> dict:
         "chain_check": chain,
         "probe_installed": probe.installed,
         "resume_channels": list(RESUME_CHANNELS),
-        "resume_backend": "ctx_extra.plan+subgoal+instruction_brief+pose",
+        "resume_backend": (
+            "runtime checkpoint (ctx.extra) saved verbatim to checkpoint.json and "
+            "restored verbatim: plan/sub-task statuses, confirmation ledger, "
+            "perception.candidates, observations, viewpoints, hypotheses, task scope, "
+            "beliefs, open questions, evidence pack; plus instruction brief and pose"
+        ),
         "memory_carry": (
-            "unavailable with the current interface: the memory module is built per "
-            "leg (build_memory(out_dir, episode_id)) and exposes no cross-episode load; "
-            "the resumed leg's knowledge travels through the plan record, the subgoal, "
-            "the brief and the carried pose only"
+            "the memory module itself is built per leg (build_memory(out_dir, "
+            "episode_id)) and exposes no cross-episode load, but the runtime state it "
+            "shares through ctx.extra is saved verbatim as checkpoint.json and restored "
+            "verbatim on resume (including perception.candidates); the resumed leg's "
+            "knowledge therefore travels through the checkpoint, the instruction brief "
+            "and the carried pose - a wrong belief survives the restart and is scored "
+            "offline, not corrected by the driver"
         ),
     }
     report = {

@@ -125,7 +125,15 @@ def _make_world(directory: Path, size: int = 64):
             )
         )
     ply = directory / "scene.ply"
-    _write_test_ply(ply, gaussians)
+    # the renderer reads PLY vertices in the 3DGS frame; rotate the authored FLU
+    # geometry into it so the rendered target and ``world.target`` are one point
+    _write_test_ply(
+        ply,
+        [
+            ((-float(xyz[1]), float(xyz[2]), -float(xyz[0])), *rest)
+            for xyz, *rest in gaussians
+        ],
+    )
     world = SplatWorldCPU(
         ply_path=ply,
         target=TargetSpec(name="target", position_flu=TARGET_FLU, radius_m=0.2),
@@ -135,6 +143,11 @@ def _make_world(directory: Path, size: int = 64):
         height=size,
         hfov_deg=60.0,
     )
+    # CpuGaussianScene puts the FLU origin at the PLY centroid; pin the renderer
+    # to the authored FLU frame instead (the depth/position check compares the
+    # candidate's FLU estimate with the depth rendered from the current pose)
+    world.scene.center = torch.zeros(3, dtype=world.scene.center.dtype)
+    world.scene.radius = float(world.scene.xyz.norm(dim=-1).max())
     return world
 
 
@@ -201,7 +214,7 @@ class FallbackStackTest(unittest.TestCase):
         self.assertEqual(
             ["observe", "inspect_region", "ground_target", "propose_viewpoints",
              "go_to_viewpoint", "query_memory", "observe", "approach_candidate",
-             "verify_goal", "finish"],
+             "confirm_candidate", "verify_goal", "finish"],
             names,
         )
         self.assertNotIn("navigate", names)
@@ -534,11 +547,12 @@ class EpisodeAcceptanceTest(unittest.TestCase):
         self.assertTrue(tools["verify_goal"]["new_evidence"] >= 1)
         self.assertGreaterEqual(summary["evidence_kinds"].get("image", 0), 1)
         self.assertEqual(0, summary["parse_failures"])
-        self.assertEqual(9, summary["tool_calls"])
+        self.assertEqual(10, summary["tool_calls"])
         # the finish call is a registered tool since P4 (it judges the claim on
         # the evidence pack), so it is executed, logged and charged like any
-        # other call: nine tool turns + the finish = ten budget units
-        self.assertEqual(40 - 9 - 1, summary["tool_budget"]["left"])
+        # other call: ten tool turns + the finish = eleven budget units (the
+        # confirmation is one of them since version 2)
+        self.assertEqual(40 - 10 - 1, summary["tool_budget"]["left"])
         self.assertTrue((self.out_dir / "summary.json").exists())
         # the memory module materializes the pixels a record still carries (the
         # crop of the inspection among them), not one file per call
@@ -798,12 +812,12 @@ class CliTest(unittest.TestCase):
         )
         self.assertEqual("finish", summary["finish_reason"])
         self.assertTrue(summary["success"], summary)
-        self.assertEqual(9, summary["tool_calls"])
+        self.assertEqual(10, summary["tool_calls"])
         for name in ("summary.json", "tool_trace.jsonl", "run_config.json"):
             self.assertTrue((self.out_dir / name).exists(), name)
-        # the play is written in the Phase-1 vocabulary: ten turns, the last
-        # one the finish call
-        self.assertEqual(10, len(_read_trace(self.out_dir)))
+        # the play is written in the Phase-1 vocabulary plus the version-2
+        # confirmation: eleven turns, the last one the finish call
+        self.assertEqual(11, len(_read_trace(self.out_dir)))
         on_disk = json.loads((self.out_dir / "summary.json").read_text())
         self.assertEqual(summary["finish_reason"], on_disk["finish_reason"])
         self.assertEqual("modules", on_disk["stack_backend"])
@@ -823,7 +837,8 @@ class ToolsetFilterTest(unittest.TestCase):
         # because it is a dispatch affordance, not extra evidence
         self.assertEqual(
             {"observe", "batch_read", "propose_viewpoints", "approach_candidate",
-             "go_to_viewpoint", "return_to_observation", "verify_goal", "finish"},
+             "go_to_viewpoint", "return_to_observation", "verify_goal",
+             "confirm_candidate", "finish"},
             set(RUNNER.BASIC_TOOL_NAMES),
         )
         self.assertNotIn("navigate", RUNNER.FULL_TOOL_NAMES)
@@ -843,7 +858,7 @@ class ToolsetFilterTest(unittest.TestCase):
             self.assertFalse(RUNNER.toolset_allows("memory", name), name)
         for name in ("observe", "propose_viewpoints", "approach_candidate",
                      "go_to_viewpoint", "return_to_observation", "verify_goal",
-                     "finish"):
+                     "confirm_candidate", "finish"):
             self.assertTrue(RUNNER.toolset_allows("basic", name), name)
             self.assertTrue(RUNNER.toolset_allows("memory", name), name)
         # both sets move the same way: the difference is retrieval, not motion
@@ -1285,8 +1300,9 @@ class ToolsetEpisodeTest(unittest.TestCase):
         # tools (the deprecated navigate is not in the set), observe, verify_goal,
         # and since P4 the dispatch verb ``batch_read`` plus the evidence-backed
         # ``finish``
-        self.assertEqual(["approach_candidate", "batch_read", "finish", "go_to_viewpoint",
-                          "observe", "propose_viewpoints", "return_to_observation",
+        self.assertEqual(["approach_candidate", "batch_read", "confirm_candidate",
+                          "finish", "go_to_viewpoint", "observe",
+                          "propose_viewpoints", "return_to_observation",
                           "verify_goal"],
                          summary["toolset_detail"]["registered"])
         self.assertTrue(summary["toolset_detail"]["restricted"])
@@ -1415,14 +1431,14 @@ class _PromptRecorder:
 
 
 class VerifyGateTest(unittest.TestCase):
-    """The episode hands ``verify_goal`` the gate it is evaluated with.
+    """The episode hands ``verify_goal`` the tolerance it is evaluated with.
 
-    ``--success-dist`` is the standoff from the target *surface*, so the runner's
-    completion gate is ``--success-dist + target radius`` (the ``success_dist_m``
-    of ``summary.json``). That value is what a completion check must use: the
-    decision-loop v3 run claimed four goals at a 1.32 m standoff while the
-    book_near episodes were evaluated against 1.2 m, because ``verify_goal``
-    fell back to its own ``max(1.5, radius + 0.5)`` default.
+    The check itself is version-3 self-state: the distance is dead reckoning
+    over the agent's candidate estimate (no scene read), and the completion
+    gate is still ``--success-dist + target radius`` (the ``success_dist_m`` of
+    ``summary.json``). The decision-loop v3 run claimed four goals at a 1.32 m
+    standoff while the book_near episodes were evaluated against 1.2 m; that
+    standoff must stay outside the gate without the tool asking the scene.
     """
 
     def setUp(self):
@@ -1435,15 +1451,26 @@ class VerifyGateTest(unittest.TestCase):
         """Put the drone ``distance_m`` from the target (target along +x)."""
         self.world.state.position_flu = np.asarray([2.0 - distance_m, 0.5, 0.0])
 
-    def _run(self, out_name: str, success_dist: float) -> tuple[dict, dict]:
+    def _run(
+        self, out_name: str, success_dist: float, *, with_candidate: bool = True
+    ) -> tuple[dict, dict]:
         out_dir = self.tmp / out_name
+        args = {"reason": "confirm"}
+        extra = None
+        if with_candidate:
+            # the agent's own estimate of the object it grounded; the tool is
+            # never given the scene's target position
+            args["candidate_id"] = "cand_1"
+            extra = {"candidate_positions": {"cand_1": list(TARGET_FLU)}}
         script = [
-            {"tool": "verify_goal", "args": {"reason": "confirm"}},
+            {"tool": "verify_goal", "args": args},
             {"tool": "finish", "args": {"reason": "verified", "success": True}},
         ]
-        args = _runner_args(out_dir, success_dist=success_dist,
-                            max_turns=4, tool_budget=8)
-        summary = RUNNER.run_episode(self.world, _scripted_vlm(script), args, out_dir)
+        runner_args = _runner_args(out_dir, success_dist=success_dist,
+                                   max_turns=4, tool_budget=8)
+        summary = RUNNER.run_episode(
+            self.world, _scripted_vlm(script), runner_args, out_dir, ctx_extra=extra
+        )
         verify = next(entry for entry in _read_trace(out_dir)
                       if entry["tool"] == "verify_goal")
         return summary, verify
@@ -1456,10 +1483,12 @@ class VerifyGateTest(unittest.TestCase):
 
         self.assertIs(verify["data"]["verified"], False)
         unmet = next(item for item in verify["data"]["unmet"]
-                     if item["check"] == "distance_to_target_m")
+                     if item["check"] == "measured_distance_m")
         self.assertAlmostEqual(1.2, unmet["max_m"], places=3)
         self.assertAlmostEqual(1.2, verify["data"]["checks"]["distance_limit_m"], places=3)
-        # the model asked to finish as success; the geometry vetoes it
+        self.assertEqual(verify["data"]["checks"]["distance_source"], "dead_reckoning")
+        self.assertNotIn("distance_to_target_m", json.dumps(verify["data"]))
+        # the model asked to finish as success; the self-measured distance vetoes it
         self.assertEqual(1.2, summary["success_dist_m"])
         self.assertEqual(1.2, summary["done_dist_m"])
         self.assertFalse(summary["success"])
@@ -1470,10 +1499,28 @@ class VerifyGateTest(unittest.TestCase):
 
         self.assertIs(verify["data"]["verified"], True)
         self.assertEqual([], verify["data"]["unmet"])
-        self.assertAlmostEqual(1.15, verify["data"]["checks"]["distance_to_target_m"],
+        self.assertAlmostEqual(1.15, verify["data"]["checks"]["measured_distance_m"],
                                places=3)
         self.assertEqual(1.2, summary["success_dist_m"])
         self.assertTrue(summary["success"])
+
+    def test_without_self_evidence_the_runner_is_uncertain_even_near_the_goal(self):
+        """No GT rescue: at 0.2 m from the target, a bare verify_goal is uncertain.
+
+        The old tool read the scene's distance and would have passed here. With
+        the evaluator out of the loop the model has to leave its own measurement
+        (a grounded candidate, a recalled place or a depth read) first.
+        """
+        self._standoff(0.2)
+        summary, verify = self._run("no_evidence", success_dist=1.0,
+                                    with_candidate=False)
+
+        self.assertEqual(verify["data"]["verified"], "uncertain")
+        self.assertEqual(verify["data"]["reason"], "no_evidence")
+        self.assertIsNone(verify["data"]["measured_distance_m"])
+        self.assertNotIn("distance_to_target_m", json.dumps(verify["data"]))
+        # and the success claim it tried to make is not counted
+        self.assertFalse(summary["success"])
 
     def test_the_gate_is_the_same_formula_the_runner_judges_with(self):
         args = _runner_args(self.tmp / "out", success_dist=0.9)

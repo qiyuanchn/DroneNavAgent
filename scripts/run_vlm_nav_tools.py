@@ -248,7 +248,10 @@ NAV_INTENT_TOOL_NAMES = (
 # evidence: every set carries them, so no arm loses the ability to end an episode
 # with an outcome or to spend one turn on two checks.
 MOVEMENT_TOOL_NAMES = ("propose_viewpoints",) + NAV_INTENT_TOOL_NAMES
-BASIC_TOOL_NAMES = ("observe", "batch_read") + MOVEMENT_TOOL_NAMES + ("verify_goal", "finish")
+BASIC_TOOL_NAMES = (
+    ("observe", "batch_read") + MOVEMENT_TOOL_NAMES
+    + ("verify_goal", "confirm_candidate", "finish")
+)
 MEMORY_TOOL_NAMES = BASIC_TOOL_NAMES + (
     "query_memory",
     "inspect_region",
@@ -309,8 +312,9 @@ MEMORY_SWITCHES = ("spatial_memory", "episodic_memory")
 FINISH_CONTRACT = (
     "Finish contract: always state the outcome in the finish call - "
     '{"tool": "finish", "args": {"reason": "<short>", "success": true}} only '
-    "after a verify_goal call of this episode answered verified=true (or after a "
-    "grounded candidate was reached with outcome=arrived); "
+    "after a verify_goal call of this episode answered verified=true, or after a "
+    "grounded candidate was reached with outcome=arrived AND confirm_candidate "
+    "accepted that instance from a new view under the current revision; "
     '{"tool": "finish", "args": {"reason": "<what blocked you>", "success": '
     "false}} when you give up. A finish that carries no success flag claims "
     "nothing: an honest unfinished answer is expected, an undeclared one is "
@@ -378,8 +382,10 @@ ACCEPTANCE_TOOL_SCRIPT: list[dict] = [
     {"tool": "approach_candidate", "args": {"candidate_id": "$candidate_id",
                                             "standoff_m": 0.8,
                                             "reason": "close in on the located object"}},
+    {"tool": "confirm_candidate", "args": {"candidate_id": "$candidate_id",
+                                           "reason": "verify the reached instance from a new view"}},
     {"tool": "verify_goal", "args": {"reason": "confirm the target before finishing"}},
-    {"tool": "finish", "args": {"reason": "target verified by verify_goal"}},
+    {"tool": "finish", "args": {"reason": "target reached, confirmed and verified"}},
 ]
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9]*_\d+$")
@@ -649,16 +655,6 @@ def _pose_fields(world: Any) -> dict:
     return {"position_flu": pos, "yaw_deg": round(math.degrees(yaw), 1)}
 
 
-def _world_in_fov(world: Any) -> bool | None:
-    fn = getattr(world, "target_in_fov", None)
-    if not callable(fn):
-        return None
-    try:
-        return bool(fn())
-    except Exception:
-        return None
-
-
 def _world_distance(world: Any) -> float | None:
     fn = getattr(world, "distance_to_target", None)
     if not callable(fn):
@@ -715,6 +711,12 @@ def neutral_episode_id(seed: Any, index: Any = None) -> str:
     except (TypeError, ValueError):
         return f"ep_{value:03d}"
     return f"ep_{value:03d}_{ordinal:02d}"
+
+
+def _task_text(ctx: ToolContext) -> str:
+    """The instruction the agent was given (never the scene's target identity)."""
+    extra = ctx.extra if isinstance(ctx.extra, dict) else {}
+    return str(extra.get("instruction") or "the instructed task")[:240]
 
 
 def _target_name(world: Any) -> str:
@@ -1663,12 +1665,6 @@ def _tool_observe(ctx: ToolContext, args: dict) -> ToolResult:
         data.update({"mode": "forward"})
         evidence.append(EvidenceRef("image", ref, "forward camera"))
 
-    in_fov = _world_in_fov(world)
-    if in_fov is not None:
-        data["target_in_fov"] = in_fov
-    distance = _world_distance(world)
-    if distance is not None:
-        data["distance_to_target_m"] = round(distance, 2)
     data.update(_pose_fields(world))
     evidence.append(EvidenceRef("observation", obs_id, mode))
 
@@ -1677,7 +1673,7 @@ def _tool_observe(ctx: ToolContext, args: dict) -> ToolResult:
     _cache_frame(ctx, frame)
     _memory_add(
         ctx, obs_id, "observation", ref,
-        note=f"{mode} observation while searching for {_target_name(world)}",
+        note=f"{mode} observation captured while working on: {_task_text(ctx)}",
         data=data,
     )
     return ToolResult(STATUS_OK, data, evidence)
@@ -1738,7 +1734,7 @@ def _tool_inspect_region(ctx: ToolContext, args: dict) -> ToolResult:
     ).contiguous()
     _cache_frame(ctx, cached)
     _memory_add(ctx, f"{obs_id}_crop", "image", ref,
-                note=f"zoom crop of {obs_id} while searching for {_target_name(ctx.world)}",
+                note=f"zoom crop of {obs_id} while working on: {_task_text(ctx)}",
                 data={"source_observation_id": obs_id})
     return ToolResult(
         STATUS_OK,
@@ -1875,7 +1871,7 @@ def _tool_propose_viewpoints(ctx: ToolContext, args: dict) -> ToolResult:
     ref = _save_frame(ctx, bev, f"map_{map_seq:03d}_bev.png")
     _cache_frame(ctx, bev)
     _memory_add(ctx, f"map_{map_seq}", "map", ref,
-                note=f"map snapshot before moving while searching for {_target_name(world)}",
+                note=f"map snapshot before moving while working on: {_task_text(ctx)}",
                 data={"viewpoints": [v["viewpoint_id"] for v in viewpoints]})
 
     if not viewpoints:
@@ -1991,42 +1987,265 @@ def _tool_navigate(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult(status, data, evidence)
 
 
+def _fallback_position(value: Any) -> np.ndarray | None:
+    try:
+        point = np.asarray(value, dtype=np.float64).reshape(-1)[:3]
+    except (TypeError, ValueError):
+        return None
+    if point.shape != (3,) or not np.all(np.isfinite(point)):
+        return None
+    return point
+
+
+def _fallback_candidate_position(ctx: ToolContext, candidate_id: Any) -> np.ndarray | None:
+    """The agent's own candidate estimate (never ``world.target``)."""
+    key = str(candidate_id)
+    table = ctx.extra.get("candidate_positions")
+    if isinstance(table, dict):
+        point = _fallback_position(table.get(key, table.get(candidate_id)))
+        if point is not None:
+            return point
+    store = ctx.extra.get("perception.candidates")
+    if isinstance(store, dict):
+        record = store.get(key)
+        if isinstance(record, dict):
+            point = _fallback_position(record.get("position_flu"))
+            if point is not None:
+                return point
+    for item in ctx.extra.get("candidates") or []:
+        if isinstance(item, dict) and str(item.get("id")) == key:
+            point = _fallback_position(item.get("position_flu"))
+            if point is not None:
+                return point
+    return None
+
+
+def _fallback_observation_position(ctx: ToolContext, observation_id: str) -> np.ndarray | None:
+    record = (ctx.extra.get("observations") or {}).get(observation_id)
+    if isinstance(record, dict):
+        point = _fallback_position(record.get("position_flu"))
+        if point is not None:
+            return point
+    store = ctx.extra.get("observation_store")
+    getter = getattr(store, "get", None)
+    if callable(getter):
+        observation = getter(observation_id)
+        point = _fallback_position(getattr(observation, "pose_flu", None))
+        if point is not None:
+            return point
+    return None
+
+
+def _fallback_identity_status(ctx: ToolContext, candidate_id: str) -> dict:
+    scope = ctx.extra.get("task_scope") or {}
+    revision = int(scope.get("evidence_revision", 0) or 0)
+    ledger = ctx.extra.get("confirmation_ledger")
+    entry = ledger.get(candidate_id) if isinstance(ledger, dict) else {}
+    entry = entry if isinstance(entry, dict) else {}
+    store = ctx.extra.get("perception.candidates")
+    record = store.get(candidate_id) if isinstance(store, dict) else {}
+    record = record if isinstance(record, dict) else {}
+    status = str(entry.get("last_verdict") or record.get("confirmation_status") or "")
+    if not status:
+        status = {"confirmed": "accepted"}.get(str(record.get("status") or ""), "unconfirmed")
+    accepted_revision = entry.get("accepted_revision", record.get("confirmation_revision"))
+    try:
+        accepted_revision = None if accepted_revision is None else int(accepted_revision)
+    except (TypeError, ValueError):
+        accepted_revision = None
+    if status == "accepted" and (
+        accepted_revision is None or accepted_revision != revision
+    ):
+        status = "stale"
+    return {
+        "status": status,
+        "candidate_id": candidate_id,
+        "evidence_revision": revision,
+        "accepted_revision": accepted_revision,
+        "source": "confirm_candidate",
+    }
+
+
 def _tool_verify_goal(ctx: ToolContext, args: dict) -> ToolResult:
+    """Fallback completion check over the agent's own state (no GT reads)."""
     world = ctx.world
-    radius = float(getattr(getattr(world, "target", None), "radius_m", 0.0))
     if args.get("success_dist_m") is not None:
-        # an explicit standoff from the target surface
-        success_dist = float(args["success_dist_m"]) + radius
+        limit = float(args["success_dist_m"])
     elif ctx.extra.get("done_dist") is not None:
-        # the runner's own gate: already ``success_dist + radius``
-        success_dist = float(ctx.extra["done_dist"])
+        limit = float(ctx.extra["done_dist"])
     else:
-        success_dist = float(ctx.extra.get("success_dist_m", 2.0)) + radius
+        limit = float(ctx.extra.get("success_dist_m", 2.0))
     obs_id = ctx.next_obs_id()
     frame = world.render()
     ref = _save_frame(ctx, frame, f"{obs_id}_verify.png")
     _cache_frame(ctx, frame)
 
-    in_fov = _world_in_fov(world)
-    distance = _world_distance(world)
-    distance_ok = distance is not None and distance <= success_dist
-    satisfied = distance_ok and in_fov is not False
+    position = _fallback_position(getattr(world, "position_flu", None))
+    measured_distance = None
+    distance_source = ""
+    checks: dict[str, Any] = {}
+    unmet: list[dict] = []
+
+    pixel = args.get("pixel")
+    if isinstance(pixel, (list, tuple)) and len(pixel) >= 2:
+        depth_fn = getattr(world, "depth_at_pixel", None)
+        depth = None
+        if callable(depth_fn):
+            try:
+                depth = float(depth_fn((float(pixel[0]), float(pixel[1]))))
+            except Exception:  # noqa: BLE001 - no depth is an honest uncertainty
+                depth = None
+        if depth is not None:
+            measured_distance = depth
+            distance_source = "depth"
+            checks["depth_m"] = round(depth, 3)
+        else:
+            unmet.append({"check": "depth", "reason": "no_depth_estimate"})
+
+    candidate_id = str(args.get("candidate_id") or "")
+    identity = {
+        "status": "not_checked",
+        "candidate_id": candidate_id,
+        "evidence_revision": int((ctx.extra.get("task_scope") or {}).get("evidence_revision", 0) or 0),
+        "source": "confirm_candidate",
+    }
+    if candidate_id:
+        candidate_position = _fallback_candidate_position(ctx, candidate_id)
+        if candidate_position is None:
+            unmet.append(
+                {
+                    "check": "candidate_identity",
+                    "reason": "unknown_candidate",
+                    "candidate_id": candidate_id,
+                }
+            )
+        elif measured_distance is None and position is not None:
+            measured_distance = float(np.linalg.norm(candidate_position - position))
+            distance_source = "dead_reckoning"
+        identity = _fallback_identity_status(ctx, candidate_id)
+        checks["identity_status"] = dict(identity)
+        if identity["status"] == "rejected":
+            unmet.append(
+                {"check": "identity_status", "status": "rejected",
+                 "candidate_id": candidate_id}
+            )
+        elif identity["status"] == "stale":
+            unmet.append(
+                {"check": "identity_status", "status": "stale",
+                 "candidate_id": candidate_id}
+            )
+
+    observation_id = str(args.get("observation_id") or "")
+    if observation_id and measured_distance is None:
+        recalled = _fallback_observation_position(ctx, observation_id)
+        if recalled is None:
+            unmet.append(
+                {"check": "observation_pose", "reason": "unknown_observation",
+                 "observation_id": observation_id}
+            )
+        else:
+            checks["recalled_observation_position"] = [float(v) for v in recalled]
+            if position is not None:
+                measured_distance = float(np.linalg.norm(recalled - position))
+                distance_source = "dead_reckoning"
+
+    plan = ctx.extra.get("plan")
+    subtasks = plan.get("subtasks") if isinstance(plan, dict) else None
+    if isinstance(subtasks, list) and subtasks:
+        done = [
+            str(item.get("id")) for item in subtasks
+            if isinstance(item, dict) and str(item.get("status")) == "done"
+        ]
+        plan_completion = {
+            "available": True,
+            "source": "plan",
+            "plan_id": str(plan.get("plan_id") or ""),
+            "revision": int(plan.get("revision", 0) or 0),
+            "complete": len(done) == len(subtasks),
+            "done_subtasks": done,
+            "open_subtasks": [
+                {"subtask_id": str(item.get("id")), "status": str(item.get("status"))}
+                for item in subtasks
+                if isinstance(item, dict) and str(item.get("status")) != "done"
+            ],
+        }
+    else:
+        plan_completion = {"available": False, "source": "plan"}
+
+    arrivals = [
+        item for item in evidence_pack(ctx).get("arrivals") or ()
+        if isinstance(item, dict) and str(item.get("outcome")) == "arrived"
+    ]
+    arrival = (
+        {
+            "available": True,
+            "source": "evidence_pack",
+            "task_id": str(arrivals[-1].get("task_id") or ""),
+            "candidate_id": str(arrivals[-1].get("candidate_id") or ""),
+            "intent": str(arrivals[-1].get("intent") or ""),
+            "outcome": "arrived",
+        }
+        if arrivals
+        else {"available": False, "source": "evidence_pack"}
+    )
+
+    checks["distance_limit_m"] = round(limit, 3)
+    if measured_distance is not None:
+        checks["measured_distance_m"] = round(measured_distance, 3)
+        checks["distance_source"] = distance_source
+        if measured_distance > limit:
+            unmet.append(
+                {
+                    "check": "measured_distance_m",
+                    "value_m": round(measured_distance, 3),
+                    "max_m": round(limit, 3),
+                    "source": distance_source,
+                }
+            )
+    checks["plan_completion"] = plan_completion
+    checks["arrival"] = arrival
+
+    rejected = identity["status"] == "rejected"
+    too_far = any(item.get("check") == "measured_distance_m" for item in unmet)
+    has_self_evidence = bool(
+        measured_distance is not None
+        or identity["status"] == "accepted"
+        or arrival["available"]
+    )
+    if rejected or too_far or (pixel is not None and measured_distance is None
+                               and any(item.get("check") == "depth" for item in unmet)):
+        verified: Any = False
+        reason = "unmet_conditions"
+    elif identity["status"] == "stale":
+        verified = "uncertain"
+        reason = "stale_identity"
+    elif not has_self_evidence:
+        verified = "uncertain"
+        reason = "no_evidence"
+    else:
+        verified = True
+        reason = "verified"
+
     data = {
-        "satisfied": bool(satisfied),
+        "verified": verified,
         "observation_id": obs_id,
-        "distance_m": round(distance, 2) if distance is not None else None,
-        "success_dist_m": round(success_dist, 2),
-        "distance_ok": bool(distance_ok),
-        "target_in_fov": in_fov,
-        "checks": {"distance": bool(distance_ok),
-                   "visibility": None if in_fov is None else bool(in_fov)},
+        "checks": checks,
+        "unmet": unmet,
+        "reason": reason,
+        "measured_distance_m": (
+            None if measured_distance is None else round(measured_distance, 3)
+        ),
+        "distance_source": distance_source,
+        "identity_status": identity,
+        "plan_completion": plan_completion,
+        "arrival": arrival,
         "last_observation_id": obs_id,
     }
     data.update(_pose_fields(world))
     evidence = [EvidenceRef("image", ref, "verification frame"),
                 EvidenceRef("observation", obs_id, "verification observation")]
     _memory_add(ctx, obs_id, "observation", ref,
-                note=f"verification frame while searching for {_target_name(world)}",
+                note=f"verification frame while working on: {_task_text(ctx)}",
                 data=data)
     return ToolResult(STATUS_OK, data, evidence)
 
@@ -2136,11 +2355,17 @@ def register_fallback_tools(registry: ToolRegistry, skip_existing: bool = True,
         ),
         ToolSpec(
             name="verify_goal",
-            description="Independently verify the goal on a fresh frame: distance "
-                        "to the target and visibility, with explicit unmet checks.",
+            description="Verify completion from the agent's own records: a measured "
+                        "distance (pixel depth or its own candidate/observation "
+                        "estimate), confirmation identity_status, plan_completion and "
+                        "arrival evidence - never scene ground truth.",
             input_schema={
                 "type": "object",
                 "properties": {
+                    "pixel": {"type": "array", "items": {"type": "number"},
+                              "minItems": 2, "maxItems": 2},
+                    "candidate_id": {"type": ["string", "integer"]},
+                    "observation_id": {"type": "string"},
                     "success_dist_m": {"type": "number"},
                     "reason": {"type": "string"},
                 },

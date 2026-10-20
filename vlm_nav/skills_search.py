@@ -1114,6 +1114,22 @@ def _expected_information(entry: Mapping, coverage: Mapping) -> dict:
     return info
 
 
+def _grounding_confirmed(candidate: Mapping, confidence: float | None,
+                         min_confidence: float | None) -> bool:
+    """Whether the routine may report its best candidate as confirmed.
+
+    A grounded candidate is only confirmed when its range is also sane:
+    distance-conflicted candidates must be re-grounded from another viewpoint
+    before anything treats them as found.
+    """
+    distance_uncertain = bool(candidate.get("distance_uncertain")) or (
+        str(candidate.get("distance_source") or "") == "conflict"
+    )
+    if distance_uncertain:
+        return False
+    return confidence is None or min_confidence is None or confidence >= min_confidence
+
+
 def _candidate_summary(candidate: Mapping) -> dict:
     return _kept(
         candidate,
@@ -1130,6 +1146,9 @@ def _candidate_summary(candidate: Mapping) -> dict:
             "range_status",
             "range_m",
             "ray",
+            "distance_source",
+            "distance_uncertain",
+            "distance_conflict",
         ),
     )
 
@@ -1432,7 +1451,7 @@ def search_target(
                     "method": compare.data.get("method"),
                 }
             confidence = _as_float(best.get("confidence"), None)
-            confirmed = confidence is None or min_confidence is None or confidence >= min_confidence
+            confirmed = _grounding_confirmed(best, confidence, min_confidence)
             break
 
         # nothing in this round: change place, not words

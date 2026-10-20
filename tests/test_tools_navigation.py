@@ -54,6 +54,7 @@ TOOL_NAMES = [
     "batch_read",
     "cancel_task",
     "check_path",
+    "confirm_candidate",
     "finish",
     "go_to_viewpoint",
     "navigate",
@@ -1061,6 +1062,55 @@ class ApproachCandidateTest(unittest.TestCase):
         self.assertAlmostEqual(ctx.world.applied[0].forward_m, 3.0, places=6)
         json.dumps(result.to_dict())
 
+    def test_a_distance_uncertain_candidate_is_not_approached(self):
+        """A candidate whose depth and model range disagree is not a place to
+        fly to: the bounding box may be background 15-20 m away. The approach
+        refuses it and asks for a re-grounding from another view instead of
+        burning the budget on a wrong point."""
+        ctx = make_context(FakeWorld())
+        store_candidate(ctx, "cand_1", position=[4.0, 0.0, 0.0])
+        record = ctx.extra[CANDIDATE_STORE_KEY]["cand_1"]
+        record["distance_source"] = "conflict"
+        record["distance_uncertain"] = True
+
+        result = registry().call(
+            "approach_candidate", {"candidate_id": "cand_1"}, ctx
+        )
+
+        self.assertEqual(result.status, STATUS_BLOCKED)
+        self.assertEqual(result.data["reason"], "candidate_distance_uncertain")
+        self.assertEqual(result.data["candidate_id"], "cand_1")
+        self.assertEqual(result.data["next_action"]["tool"], "ground_target")
+        # nothing flew and no navigation task was started
+        self.assertEqual(ctx.world.applied, [])
+        self.assertNotIn("nav_tasks", ctx.extra)
+
+    def test_a_depth_consistent_candidate_is_approached_on_the_sampled_range(self):
+        """A converged support-surface range is flyable, not a conflict.
+
+        The model's range may be a short estimate; when the grounding recorded
+        ``distance_source=depth_consistent`` the sampled range is the flight
+        target and the approach must not refuse it.
+        """
+        ctx = make_context(FakeWorld())
+        store_candidate(ctx, "cand_1", position=[4.0, 0.0, 0.0])
+        record = ctx.extra[CANDIDATE_STORE_KEY]["cand_1"]
+        record["distance_source"] = "depth_consistent"
+        record["distance_uncertain"] = False
+        record["distance_conflict"] = {
+            "resolved": True,
+            "resolution": "depth_consensus",
+            "model_underestimate": True,
+        }
+
+        result = registry().call(
+            "approach_candidate", {"candidate_id": "cand_1", "standoff_m": 1.0}, ctx
+        )
+
+        self.assertEqual(result.status, "ok", result.data)
+        self.assertEqual(result.data["outcome"], "arrived")
+        self.assertNotEqual(len(ctx.world.applied), 0)
+
     def test_a_long_approach_is_flown_in_segments(self):
         ctx = make_context(FakeWorld())
         store_candidate(ctx, "cand_1", position=[20.0, 0.0, 0.0])
@@ -1242,7 +1292,10 @@ class ApproachCandidateTest(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.data["status"], "no_progress")
         self.assertEqual(result.data["outcome"], "already_at_pose")
-        self.assertEqual(result.data["next_action"]["tool"], "verify_goal")
+        # version 2: being on the standoff shell is the point where the
+        # *instance* is confirmed from a new view, not where the goal geometry
+        # is verified
+        self.assertEqual(result.data["next_action"]["tool"], "confirm_candidate")
         self.assertEqual(ctx.world.applied, [])
 
 
@@ -1883,25 +1936,27 @@ class TaskEventTest(unittest.TestCase):
         self.assertEqual(ctx.extra["map_version"], 1)
         self.assertEqual(ctx.extra["nav_tasks"]["nav_1"]["map_points"], 80)
 
-    def test_target_rediscovery_reports_the_transition_without_geometry(self):
+    def test_no_target_visibility_event_or_field(self):
+        """Whether the goal is visible is ground truth: it is not an event.
+
+        Version 3 removed ``target_rediscovery``. A turn still gets the honest
+        ``arrived`` event, and the navigation task carries no visibility flag
+        the agent could read.
+        """
         world = FakeWorld(in_fov=False)
         ctx = make_context(world)
         add_viewpoint(ctx, [10.0, 0.0, 0.0])
         reg = registry()
         reg.call("go_to_viewpoint", {"viewpoint_id": "vp_1"}, ctx)
-        self.assertIs(ctx.extra["nav_tasks"]["nav_1"]["target_in_fov"], False)
+        self.assertNotIn("target_in_fov", ctx.extra["nav_tasks"]["nav_1"])
 
         world.in_fov = True
         reg.call("go_to_viewpoint", {"viewpoint_id": "vp_1", "task_id": "nav_1"}, ctx)
         names = [event["event"] for event in ctx.extra["nav_events"]]
-        self.assertEqual(names, ["target_rediscovered", "arrived"])
-        event = ctx.extra["nav_events"][0]
-        self.assertEqual(event["task_id"], "nav_1")
-        self.assertTrue(event["observation_id"])
-        self.assertIn("verify_goal", event["hint"])
-        # ground truth stays behind verify_goal: no target geometry in the event
-        for key in ("target_position", "distance_to_target_m", "target_distance_m"):
-            self.assertNotIn(key, event)
+        self.assertEqual(names, ["arrived"])
+        self.assertNotIn("target_rediscovered", names)
+        for name in names:
+            self.assertNotIn("target_in_fov", json.dumps(name))
 
     def test_runtime_drains_the_events_and_wakes_the_model(self):
         from vlm_nav.runtime import AgentRuntime
@@ -2063,12 +2118,17 @@ class VerifyGoalTest(unittest.TestCase):
         self.assertEqual(data["unmet"], [])
         self.assertEqual(data["pixel"], [500.0, 500.0])
         self.assertAlmostEqual(data["checks"]["depth_m"], 1.4, places=6)
-        self.assertAlmostEqual(data["checks"]["point_to_target_m"], 0.0, places=3)
-        self.assertAlmostEqual(data["checks"]["distance_to_target_m"], 1.4, places=6)
-        self.assertTrue(data["checks"]["target_in_fov"])
+        self.assertAlmostEqual(data["checks"]["point_world"][0], 2.4, places=3)
+        # version 3: the distance is the agent's own measurement, labelled as such
+        self.assertAlmostEqual(data["checks"]["measured_distance_m"], 1.4, places=6)
+        self.assertEqual(data["checks"]["distance_source"], "depth")
+        self.assertNotIn("distance_to_target_m", data["checks"])
+        self.assertNotIn("target_in_fov", data["checks"])
+        self.assertEqual(data["identity_status"]["status"], "not_checked")
+        self.assertIn("plan_completion", data["checks"])
+        self.assertIn("arrival", data["checks"])
         kinds = {item["kind"] for item in data["evidence"]}
         self.assertIn("observation", kinds)
-        self.assertIn("map", kinds)
         json.dumps(result.to_dict())
 
     def test_neither_the_return_nor_its_evidence_quotes_the_goal_pose(self):
@@ -2087,12 +2147,17 @@ class VerifyGoalTest(unittest.TestCase):
         for channel in (json.dumps(result.to_dict(), default=str), result.to_prompt()):
             for token in ("[7.0, 8.0, 9.0]", "7.00", "8.00", "9.00"):
                 self.assertNotIn(token, channel)
-        # the layer the check ran against is still citable ...
-        self.assertIn("map", {item["kind"] for item in result.data["evidence"]})
-        # ... and the check's own numbers (a sensor-readable distance) survive
-        self.assertAlmostEqual(
-            result.data["checks"]["distance_to_target_m"], 13.93, places=2
-        )
+            for field in (
+                "distance_to_target_m", "target_in_fov", "point_to_target_m",
+                "point_on_target", "recalled_observation_to_target_m",
+                "recalled_observation_on_target", "goal_position",
+            ):
+                self.assertNotIn(field, channel)
+        # with no self-measured reference the verdict is an honest uncertainty -
+        # the scene's own distance is never substituted for one
+        self.assertEqual(result.data["verified"], "uncertain")
+        self.assertEqual(result.data["reason"], "no_evidence")
+        self.assertIsNone(result.data["measured_distance_m"])
 
     def test_the_goal_pose_never_reaches_the_next_prompt(self):
         """Same lock at the channel the model really reads: the turn prompt."""
@@ -2122,8 +2187,11 @@ class VerifyGoalTest(unittest.TestCase):
         prompt = vlm.seen[1]
         for token in ("[7.0, 8.0, 9.0]", "7.00", "8.00", "9.00"):
             self.assertNotIn(token, prompt)
-        # the prompt still carries the honest verdict of the call
-        self.assertIn("verified=False", prompt)
+        # the prompt carries the call's honest verdict: no self-measured
+        # reference exists, so it may not be a pass (and no GT distance is used)
+        self.assertIn("verified=uncertain", prompt)
+        self.assertNotIn("distance_to_target_m", prompt)
+        self.assertNotIn("target_in_fov", prompt)
 
     def test_no_navigation_answer_quotes_the_goal_pose(self):
         """Registry-wide lock: the goal's pose is not an answer any tool gives.
@@ -2147,6 +2215,7 @@ class VerifyGoalTest(unittest.TestCase):
             "approach_candidate": {},
             "go_to_viewpoint": {},
             "return_to_observation": {},
+            "confirm_candidate": {},
             "finish": {"reason": "done"},
             # the read-only batch: its inner call answers, the wrapper must not
             # introduce a channel either
@@ -2158,6 +2227,14 @@ class VerifyGoalTest(unittest.TestCase):
                 with self.subTest(tool=name, status=result.status):
                     self.assertNotIn("[7.0, 8.0, 9.0]", channel)
                     self.assertNotIn("7.00", channel)
+                    # version 3: the derived check values were GT channels too
+                    for field in (
+                        "distance_to_target_m", "target_in_fov",
+                        "point_to_target_m", "point_on_target",
+                        "recalled_observation_to_target_m",
+                        "recalled_observation_on_target",
+                    ):
+                        self.assertNotIn(field, channel)
 
     def test_depth_beats_any_fabricated_range(self):
         world = FakeWorld(
@@ -2184,44 +2261,60 @@ class VerifyGoalTest(unittest.TestCase):
         self.assertIs(result.data["verified"], False)
         self.assertEqual(result.data["reason"], "unmet_conditions")
         checks = {item["check"] for item in result.data["unmet"]}
-        self.assertIn("distance_to_target_m", checks)
+        self.assertIn("measured_distance_m", checks)
+        self.assertNotIn("distance_to_target_m", checks)
 
-    def test_false_when_target_is_out_of_view(self):
+    def test_no_self_measurement_is_uncertain_regardless_of_the_scene(self):
+        # the old check read the scene's ``target_in_fov``; version 3 has no
+        # such channel, so a call with no pixel/candidate/observation is
+        # honestly inconclusive even when the scene would say "in view"
         world = FakeWorld(position=(1.0, 0.0, 0.0), target=(2.4, 0.0, 0.0),
                           depth=1.4, in_fov=False)
         ctx = make_context(world)
         result = registry().call("verify_goal", {}, ctx)
-        self.assertIs(result.data["verified"], False)
-        self.assertIn("target_in_fov", {item["check"] for item in result.data["unmet"]})
+        self.assertEqual(result.data["verified"], "uncertain")
+        self.assertEqual(result.data["reason"], "no_evidence")
+        self.assertNotIn("target_in_fov", json.dumps(result.to_dict(), default=str))
 
     def test_a_1_32_m_standoff_is_not_verified_against_a_1_2_m_gate(self):
-        """The runner's gate is *the* gate: 1.32 m is outside 1.2 m.
+        """The agent's own gate is *the* gate: 1.32 m is outside 1.2 m.
 
-        The decision-loop v3 run claimed exactly this standoff: ``verify_goal``
-        fell back to its own ``max(1.5, radius + 0.5)`` default while the
-        episodes were evaluated against ``--success-dist + radius`` (1.2 m), so
-        four arms "verified" a goal they had not reached (book_near, seed 11).
+        The distance is dead reckoning over the agent's candidate estimate (no
+        scene read): the same 1.32 m standoff the decision-loop v3 run wrongly
+        verified with its old fallback stays outside the declared tolerance.
         """
         world = FakeWorld(position=(0.68, 0.0, 0.0), target=(2.0, 0.0, 0.0),
                           radius_m=0.3)
-        ctx = make_context(world, extra={"done_dist": 1.2})
-        result = registry().call("verify_goal", {"reason": "confirm"}, ctx)
+        ctx = make_context(
+            world,
+            extra={"done_dist": 1.2,
+                   "candidate_positions": {"cand_1": [2.0, 0.0, 0.0]}},
+        )
+        result = registry().call(
+            "verify_goal", {"reason": "confirm", "candidate_id": "cand_1"}, ctx
+        )
         self.assertIs(result.data["verified"], False)
         self.assertEqual(result.data["reason"], "unmet_conditions")
+        self.assertEqual(result.data["checks"]["distance_source"], "dead_reckoning")
         unmet = next(item for item in result.data["unmet"]
-                     if item["check"] == "distance_to_target_m")
+                     if item["check"] == "measured_distance_m")
         self.assertEqual(1.2, unmet["max_m"])
         self.assertAlmostEqual(1.32, unmet["value_m"], places=3)
 
     def test_the_check_reports_the_limit_it_used(self):
         world = FakeWorld(position=(1.0, 0.0, 0.0), target=(2.4, 0.0, 0.0),
                           radius_m=0.3)
-        inside = make_context(world, extra={"done_dist": 1.5})
-        result = registry().call("verify_goal", {"reason": "confirm"}, inside)
+        extra = {"candidate_positions": {"cand_1": [2.4, 0.0, 0.0]}}
+        inside = make_context(world, extra={**extra, "done_dist": 1.5})
+        result = registry().call(
+            "verify_goal", {"reason": "confirm", "candidate_id": "cand_1"}, inside
+        )
         self.assertIs(result.data["verified"], True)
         self.assertAlmostEqual(1.5, result.data["checks"]["distance_limit_m"], places=6)
-        outside = make_context(world, extra={"done_dist": 1.2})
-        result = registry().call("verify_goal", {"reason": "confirm"}, outside)
+        outside = make_context(world, extra={**extra, "done_dist": 1.2})
+        result = registry().call(
+            "verify_goal", {"reason": "confirm", "candidate_id": "cand_1"}, outside
+        )
         self.assertIs(result.data["verified"], False)
         self.assertAlmostEqual(1.2, result.data["checks"]["distance_limit_m"], places=6)
 
@@ -2463,11 +2556,29 @@ class LowAltitudeProfileTest(unittest.TestCase):
         ctx = make_context(world)
         store_candidate(ctx, "cand_1", position=[5.0, 0.0, -1.5])
         result = registry().call("approach_candidate", {"candidate_id": "cand_1"}, ctx)
-        goal_z = -2.0 + 0.35  # bbox bottom + min(0.6 * height, 0.35)
-        self.assertAlmostEqual(result.data["waypoint"][2], goal_z, places=6)
-        self.assertAlmostEqual(float(ctx.world.position[2]), goal_z, places=6)
+        # the candidate's own measured height (box centre -1.5) is the anchor,
+        # not the semantic target's bbox bottom (-2.0 + 0.35)
+        self.assertAlmostEqual(result.data["waypoint"][2], -1.5, places=6)
+        self.assertAlmostEqual(float(ctx.world.position[2]), -1.5, places=6)
         self.assertLess(float(ctx.world.position[2]), -1.0)  # not above the object
+        self.assertEqual(result.data["goal_height_source"], "candidate_position")
         self.assertEqual(result.data["outcome"], "arrived")
+
+    def test_the_approach_goal_follows_the_candidate_not_the_semantic_target(self):
+        # the holdout classroom failure: the candidate sits 5.2 m above the
+        # final target's box, and the old code pinned every leg to the target
+        # bbox bottom + min(0.6 * height, 0.35) = -2.23 m
+        world = env_style_declaration(
+            FakeWorld(position=(0.0, 0.0, 0.0), target=(5.0, 0.0, -2.26), radius_m=0.08),
+            floor_z=-5.52, bottom_z=-2.51, size_z=0.45,
+        )
+        ctx = make_context(world)
+        store_candidate(ctx, "cand_1", position=[5.0, 0.0, 3.061])
+        result = registry().call("approach_candidate", {"candidate_id": "cand_1"}, ctx)
+        self.assertAlmostEqual(result.data["waypoint"][2], 3.061, places=6)
+        self.assertAlmostEqual(float(ctx.world.position[2]), 3.061, places=6)
+        self.assertEqual(result.data["goal_height_source"], "candidate_position")
+        self.assertGreater(result.data["waypoint"][2] - (-2.2333), 5.0)
 
     def test_the_approach_goal_uses_the_measured_height_without_a_box(self):
         ctx = make_context(FakeWorld(position=(0.0, 0.0, 1.5)))
@@ -2475,6 +2586,7 @@ class LowAltitudeProfileTest(unittest.TestCase):
         result = registry().call("approach_candidate", {"candidate_id": "cand_1"}, ctx)
         self.assertAlmostEqual(result.data["waypoint"][2], -1.2, places=6)
         self.assertAlmostEqual(float(ctx.world.position[2]), -1.2, places=6)
+        self.assertEqual(result.data["goal_height_source"], "candidate_position")
 
     def test_the_approach_goal_never_dives_below_the_cruise_floor(self):
         world = env_style_declaration(
@@ -2484,9 +2596,72 @@ class LowAltitudeProfileTest(unittest.TestCase):
         ctx = make_context(world)
         store_candidate(ctx, "cand_1", position=[5.0, 0.0, -2.0])
         result = registry().call("approach_candidate", {"candidate_id": "cand_1"}, ctx)
-        # the box asks for -2.88 m; the floor's own cruise floor allows -1.4 m
+        # the candidate asks for -2.0 m; the floor's own cruise floor allows -1.4 m
         self.assertAlmostEqual(result.data["waypoint"][2], -1.4, places=6)
         self.assertAlmostEqual(float(ctx.world.position[2]), -1.4, places=6)
+        self.assertEqual(result.data["goal_height_source"], "candidate_position")
+
+    def test_a_ray_only_candidate_keeps_its_sighting_elevation(self):
+        world = env_style_declaration(
+            FakeWorld(position=(0.0, 0.0, 0.0), target=(5.0, 0.0, -2.26), radius_m=0.08),
+            bottom_z=-2.51, size_z=0.45,
+        )
+        ctx = make_context(world)
+        store_candidate(
+            ctx, "cand_1",
+            ray={"origin_flu": [0.0, 0.0, 0.0], "bearing_deg": 0.0, "elevation_deg": 30.0},
+        )
+        result = registry().call("approach_candidate", {"candidate_id": "cand_1"}, ctx)
+        # the ray step carries the sighting's elevation: sin(30) * 3 m = 1.5 m,
+        # never the semantic target's bbox height
+        self.assertAlmostEqual(result.data["waypoint"][2], 1.5, places=6)
+        self.assertEqual(result.data["goal_height_source"], "candidate_ray")
+
+    def test_the_semantic_target_box_is_only_the_no_candidate_fallback(self):
+        world = env_style_declaration(
+            FakeWorld(position=(0.0, 0.0, 0.0), target=(5.0, 0.0, -2.0)),
+            bottom_z=-2.0, size_z=1.0,
+        )
+        goal = navigation_module._approach_goal_z(world, None, candidate_known=False)
+        self.assertEqual(goal, (-1.65, "semantic_target_bbox"))
+        # a ray-only candidate is still candidate information: no fallback
+        self.assertIsNone(
+            navigation_module._approach_goal_z(world, None, candidate_known=True)
+        )
+
+    def test_the_viewpoint_ring_uses_the_targets_local_floor(self):
+        # multi-level scene: the global navigable minimum is a storey below the
+        # object, so the ring must be measured from the target's own support
+        # height (bbox bottom), not from the global floor
+        world = env_style_declaration(
+            FakeWorld(position=(0.0, 0.0, -2.0), target=(5.0, 0.0, -2.26), radius_m=0.08),
+            floor_z=-5.52, bottom_z=-2.51, size_z=0.45,
+        )
+        ctx = make_context(world)
+        result = registry().call("propose_viewpoints", {}, ctx)
+        self.assertEqual(result.status, "ok")
+        for item in result.data["viewpoints"]:
+            self.assertGreaterEqual(item["position"][2], -2.51 + 0.6 - 1e-9)
+            self.assertLessEqual(item["position"][2], -2.51 + 1.2 + 1e-9)
+            self.assertEqual(item["altitude_source"], "semantic_target_bbox")
+
+    def test_a_candidate_hypothesis_sets_the_viewpoint_altitude(self):
+        # a candidate at 3.06 m is above the global cruise ceiling; a ring that
+        # is aimed at it must follow the candidate instead of being clipped
+        # into the floor-relative window a storey below
+        world = env_style_declaration(
+            FakeWorld(position=(0.0, 0.0, -2.0), target=(5.0, 0.0, -2.26), radius_m=0.08),
+            floor_z=-5.52, bottom_z=-2.51, size_z=0.45,
+        )
+        ctx = make_context(world)
+        store_candidate(ctx, "cand_1", position=[5.0, 0.0, 3.061])
+        result = registry().call(
+            "propose_viewpoints", {"target_hypothesis": "cand_1"}, ctx
+        )
+        self.assertEqual(result.status, "ok")
+        for item in result.data["viewpoints"]:
+            self.assertAlmostEqual(item["position"][2], 3.061, places=6)
+            self.assertEqual(item["altitude_source"], "candidate_position")
 
 
 def _write_test_ply(path, gaussians):
@@ -2852,7 +3027,7 @@ class RecalledObservationTargetTest(unittest.TestCase):
             result.data["next_action"]["args"], {"observation_id": obs_id}
         )
 
-    def test_verify_goal_checks_a_recalled_observation_pose(self):
+    def test_verify_goal_uses_a_recalled_observation_pose_as_its_measurement(self):
         world = FakeWorld(position=(2.5, 0.0, 0.0), target=(3.0, 0.0, 0.0))
         ctx = make_context(world)
         obs_id = self.seen_at(ctx, (2.9, 0.0, 0.0), yaw_deg=0.0)
@@ -2863,13 +3038,17 @@ class RecalledObservationTargetTest(unittest.TestCase):
         self.assertEqual(
             result.data["checks"]["recalled_observation_position"], [2.9, 0.0, 0.0]
         )
+        # dead reckoning from the drone's own pose to the place it recorded -
+        # not a comparison with the scene's target
         self.assertAlmostEqual(
-            result.data["checks"]["recalled_observation_to_target_m"], 0.1, places=3
+            result.data["checks"]["measured_distance_m"], 0.4, places=3
         )
+        self.assertEqual(result.data["checks"]["distance_source"], "dead_reckoning")
+        self.assertNotIn("recalled_observation_to_target_m", result.data["checks"])
         self.assertIn(obs_id, [item["ref"] for item in result.data["evidence"]])
         self.assertIn("finish", result.data["hint"])
 
-    def test_verify_goal_rejects_a_recalled_place_that_is_not_the_goal(self):
+    def test_verify_goal_rejects_a_recalled_place_beyond_the_tolerance(self):
         world = FakeWorld(position=(2.5, 0.0, 0.0), target=(3.0, 0.0, 0.0))
         ctx = make_context(world)
         obs_id = self.seen_at(ctx, (0.0, 0.0, 0.0), yaw_deg=0.0)
@@ -2879,6 +3058,10 @@ class RecalledObservationTargetTest(unittest.TestCase):
         self.assertIs(result.data["verified"], False)
         self.assertEqual(result.data["reason"], "unmet_conditions")
         self.assertIn(
+            "measured_distance_m",
+            {item["check"] for item in result.data["unmet"]},
+        )
+        self.assertNotIn(
             "recalled_observation_on_target",
             {item["check"] for item in result.data["unmet"]},
         )
@@ -3102,22 +3285,26 @@ class RealWorldIntegrationTest(unittest.TestCase):
         self.assertIn(moved.data["last_observation_id"], ctx.extra["observations"])
         json.dumps(moved.to_dict())
 
-    def test_verify_goal_reports_depth_and_distance_without_depth_sensor(self):
-        # SplatWorldCPU has no depth_at_pixel: the point cannot be localized
+    def test_verify_goal_without_a_depth_sensor_is_uncertain_not_gt_graded(self):
+        # SplatWorldCPU has no depth_at_pixel: there is no measurement, and the
+        # scene's own distance is not substituted for one (version 3)
         ctx = make_context(self.world)
         far = registry().call("verify_goal", {"pixel": [500.0, 500.0]}, ctx)
         self.assertEqual(far.status, "ok")
-        self.assertIs(far.data["verified"], False)  # target is 3.2 m away
+        self.assertEqual(far.data["verified"], "uncertain")
+        self.assertEqual(far.data["reason"], "no_depth_estimate")
         self.assertEqual(
             {item["check"] for item in far.data["unmet"]},
-            {"distance_to_target_m", "depth"},
+            {"depth"},
         )
+        self.assertIsNone(far.data["measured_distance_m"])
 
-        # inside the goal radius, but still no depth -> honest uncertainty
+        # even inside the old goal radius the answer stays an honest uncertainty
         self.world.state.position_flu = np.asarray([3.0, 1.0, 0.0])
         near = registry().call("verify_goal", {"pixel": [500.0, 500.0]}, ctx)
         self.assertEqual(near.data["verified"], "uncertain")
         self.assertEqual(near.data["reason"], "no_depth_estimate")
+        self.assertIsNone(near.data["measured_distance_m"])
 
     def test_no_fabricated_target_point_without_a_range(self):
         """``estimate_point_world`` must not invent a range (the old 2 m fallback)."""
@@ -3152,9 +3339,18 @@ class RealWorldIntegrationTest(unittest.TestCase):
                 return result
 
         class ToolAndGroundingVLM:
-            """Scripted model + grounding backend in one object."""
+            """Scripted model + grounding/confirmation backend in one object."""
 
             GROUND_REPLY = '{"candidates": [{"box": [450, 450, 550, 550]}]}'
+            CONFIRM_REPLY = json.dumps({
+                "target": True,
+                "same_instance": True,
+                "attributes_match": True,
+                "relation_supported": True,
+                "box": [450, 450, 550, 550],
+                "confidence": 0.9,
+                "reason": "the same blob from the new view",
+            })
 
             def __init__(self, tools, script):
                 self.tools = tools
@@ -3164,13 +3360,20 @@ class RealWorldIntegrationTest(unittest.TestCase):
             def _is_grounding(self, system_prompt):
                 return "grounding" in str(system_prompt or "").lower()
 
+            def _is_confirmation(self, system_prompt):
+                return "identity-confirmation" in str(system_prompt or "").lower()
+
             def decide(self, frames, system_prompt, user_prompt, context=None):
+                if self._is_confirmation(system_prompt):
+                    return self.CONFIRM_REPLY
                 if self._is_grounding(system_prompt):
                     return self.GROUND_REPLY
                 return self._tool_call()
 
             def decide_with_tools(self, frames, system_prompt, user_prompt,
                                   tools_text="", context=None):
+                if self._is_confirmation(system_prompt):
+                    return self.CONFIRM_REPLY
                 if self._is_grounding(system_prompt):
                     return self.GROUND_REPLY
                 return self._tool_call()
@@ -3186,11 +3389,25 @@ class RealWorldIntegrationTest(unittest.TestCase):
                         args[key] = result.data.get("observation_id")
                     if value == "$candidate_id" and result is not None:
                         candidates = result.data.get("candidates") or []
-                        args[key] = candidates[0]["id"] if candidates else value
+                        args[key] = (
+                            result.data.get("candidate_id")
+                            or (candidates[0]["id"] if candidates else value)
+                        )
                 item["args"] = args
                 return json.dumps(item)
 
         world = DepthWorld(surface_m=4.0, target=(4.0, 0.0, 0.0), radius_m=0.3)
+
+        def varied_render():
+            # the fake world's default frame is constant; the confirmation
+            # independence rule is about *different views*, so this world has
+            # to render differently from a new heading/pose
+            frame = np.zeros((3, 4, 4), dtype=np.float32)
+            frame[0, 0, 0] = float(world.yaw_rad)
+            frame[1, 0, 0] = float(world.position[0])
+            return frame
+
+        world.render = varied_render
         tools = Tools()
         vlm = ToolAndGroundingVLM(
             tools,
@@ -3200,8 +3417,9 @@ class RealWorldIntegrationTest(unittest.TestCase):
                  "args": {"instruction": "the blob", "observation_id": "$observation_id"}},
                 {"tool": "approach_candidate",
                  "args": {"candidate_id": "$candidate_id", "standoff_m": 1.0}},
+                {"tool": "confirm_candidate", "args": {"candidate_id": "$candidate_id"}},
                 {"tool": "verify_goal", "args": {"success_dist_m": 3.5}},
-                {"tool": "finish", "args": {"reason": "approached and verified",
+                {"tool": "finish", "args": {"reason": "approached and confirmed",
                                             "success": True}},
             ],
         )
@@ -3212,7 +3430,8 @@ class RealWorldIntegrationTest(unittest.TestCase):
 
         self.assertEqual(
             [turn.tool for turn in log.turns],
-            ["observe", "ground_target", "approach_candidate", "verify_goal", "finish"],
+            ["observe", "ground_target", "approach_candidate", "confirm_candidate",
+             "verify_goal", "finish"],
         )
         grounded = log.turns[1].data
         self.assertEqual(grounded["candidates"][0]["id"], "cand_1")
@@ -3229,8 +3448,12 @@ class RealWorldIntegrationTest(unittest.TestCase):
         self.assertAlmostEqual(approach.data["moved_m"], 3.0, places=3)
         self.assertTrue(approach.data["last_observation_id"])
         self.assertLess(float(np.linalg.norm(world.position - np.asarray([4.0, 0.0, 0.0]))), 1.4)
+        # version 2: arrival is followed by an accepted instance confirmation
+        confirmed = log.turns[3]
+        self.assertEqual(confirmed.data["verdict"], "accepted")
+        self.assertIs(confirmed.data["new_confirmation"], True)
         # the episode's success rests on the verification of that place
-        self.assertIs(log.turns[3].data["verified"], True)
+        self.assertIs(log.turns[4].data["verified"], True)
         self.assertEqual(log.finish_reason, "finish")
         self.assertTrue(log.success)
 

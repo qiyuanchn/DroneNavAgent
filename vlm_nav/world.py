@@ -11,8 +11,9 @@ Both backends expose the same minimal interface used by the harness:
 Depth reads (``depth_at_pixel`` on normalized [0, 1000] pixels, and
 ``depth_map``) follow the ``SuperPlannerWorld`` contract: axial metres from the
 current pose, ``None``/0 where nothing is visible. The splat backends derive
-them from their own renderer, ``EnvWorld``/``SuperPlannerWorld`` from the MoGe
-estimate of the last frame.
+them from their own renderer, ``EnvWorld`` from a CPU mirror of the env's
+activated Gaussians and ``SuperPlannerWorld`` from the MoGe estimate of the
+last frame.
 
 Pixel-to-ray conversions go through the intrinsics the world itself declares
 (``world_intrinsics`` -> ``observations.resolve_intrinsics``); a world that
@@ -443,7 +444,13 @@ class SplatWorldCPU(_StandoffMixin):
     def yaw_rad(self) -> float:
         return self.state.yaw_rad
 
-    def quat_xyzw(self) -> np.ndarray:
+    #: depth reads can be taken through a pitched camera (a candidate above
+    #: or below the level frame still has to be measurable)
+    supports_pitched_depth = True
+
+    def quat_xyzw(self, pitch_rad: float = 0.0) -> np.ndarray:
+        if pitch_rad:
+            return yaw_pitch_quat_xyzw(self.state.yaw_rad, float(pitch_rad))
         return yaw_to_quat_xyzw(self.state.yaw_rad)
 
     def render(self) -> torch.Tensor:
@@ -454,27 +461,31 @@ class SplatWorldCPU(_StandoffMixin):
         own renderer returns RGB only)."""
         return self.renderer
 
-    def depth_map(self) -> torch.Tensor:
-        """Axial-depth map [H, W] of the current frame, in scene units (metres
-        for a metric scene), 0 where no Gaussian reached the pixel.
+    def depth_map(self, pitch_rad: float = 0.0) -> torch.Tensor:
+        """Axial-depth map [H, W] of a camera at the current pose, in scene
+        units (metres for a metric scene), 0 where no Gaussian reached the pixel.
 
         The world is static and the renderer deterministic, so the frame
         rendered from the current pose *is* the frame an observation taken here
         was captured from; the map is cached per pose because a single
-        ``ground_target`` call reads one depth per candidate.
+        ``ground_target`` call reads one depth per candidate. ``pitch_rad`` is a
+        body pitch (nose-down positive): a candidate above the level frame is
+        measurable through a pitched camera, and the cache key carries the pitch
+        so the two renders never share a map.
         """
         key = (
             np.asarray(self.state.position_flu, dtype=np.float64).tobytes(),
             float(self.state.yaw_rad).hex(),
+            float(pitch_rad).hex(),
         )
         if self._depth_key != key:
             _, depth = self._depth_renderer().render_with_depth(
-                self.state.position_flu, self.quat_xyzw()
+                self.state.position_flu, self.quat_xyzw(pitch_rad)
             )
             self._depth_key, self._depth_frame = key, depth
         return self._depth_frame
 
-    def depth_at_pixel(self, pixel: tuple[float, float]) -> float | None:
+    def depth_at_pixel(self, pixel: tuple[float, float], pitch_rad: float = 0.0) -> float | None:
         """Axial depth (metres, along the camera axis) at a normalized [0, 1000]
         pixel of the current frame.
 
@@ -484,7 +495,7 @@ class SplatWorldCPU(_StandoffMixin):
         :func:`depth_from_window` for how the robustness window and the pointed
         pixel itself are combined.
         """
-        depth = self.depth_map()
+        depth = self.depth_map(pitch_rad)
         height, width = depth.shape
         u = min(max(int(pixel[0] / 1000.0 * width), 0), width - 1)
         v = min(max(int(pixel[1] / 1000.0 * height), 0), height - 1)
@@ -743,6 +754,11 @@ class EnvWorld(_StandoffMixin):
         self._target_override = target
         self.state = PoseState(np.zeros(3), 0.0)
         self.trajectory: list[tuple[float, float, float]] = []
+        # depth reads run on a CPU mirror of the activated Gaussians: the HiGS
+        # renderer returns RGB only and the env declares no depth sensor
+        self._depth_cpu_mirror: CpuSplatRenderer | None = None
+        self._depth_key: tuple | None = None
+        self._depth_frame: torch.Tensor | None = None
 
     def _install_noop_planner(self) -> None:
         self.env._configure_super_planner = lambda: None
@@ -807,6 +823,94 @@ class EnvWorld(_StandoffMixin):
     def render(self) -> torch.Tensor:
         obs = self.env.get_observations()
         return obs["exteroception_rgb_camera"][0].detach().cpu()
+
+    #: the CPU depth mirror renders any attitude, so a candidate above or below
+    #: the level frame is measurable through a pitched read
+    supports_pitched_depth = True
+
+    def quat_xyzw(self, pitch_rad: float = 0.0) -> np.ndarray:
+        """Camera quaternion of the current wrapper pose (``pitch_rad`` is a
+        body pitch, nose-down positive)."""
+        return yaw_pitch_quat_xyzw(self.state.yaw_rad, float(pitch_rad))
+
+    def _depth_renderer(self) -> CpuSplatRenderer:
+        """CPU mirror of the env's activated Gaussians, for depth reads.
+
+        The HiGS renderer returns RGB only and the env declares no depth sensor,
+        so ``EnvWorld`` had no ``depth_at_pixel`` at all: every confirmation's
+        location check returned ``no_depth_measurement``. The mirror shares the
+        activated model and the camera convention of the GPU renderer (the same
+        path ``SplatWorldHiGS._depth_renderer`` uses). It renders at a reduced
+        but aspect-correct size; normalized pixels are resolution independent.
+        """
+        mirror = getattr(self, "_depth_cpu_mirror", None)
+        if mirror is not None:
+            return mirror
+        model = getattr(self.env, "gaussians", None)
+        if model is None or not hasattr(model, "sh"):
+            raise RuntimeError("no_gaussian_model")
+        intrinsics = world_intrinsics(self)
+        hfov = intrinsics.get("hfov_deg")
+        if hfov is None:
+            raise RuntimeError("hfov_unknown")
+        width = int(intrinsics.get("width") or 0)
+        height = int(intrinsics.get("height") or 0)
+        if width <= 0 or height <= 0:
+            width, height = 320, 180
+        scale = min(1.0, 320.0 / float(width))
+        width = max(64, int(round(width * scale)))
+        height = max(36, int(round(height * scale)))
+        mirror = CpuSplatRenderer(
+            CpuGaussianScene.from_gaussian_model(model),
+            CameraSpec(width, height, float(hfov)),
+        )
+        self._depth_cpu_mirror = mirror
+        return mirror
+
+    def depth_map(self, pitch_rad: float = 0.0) -> torch.Tensor:
+        """Axial-depth map ``[H, W]`` of a camera at the current pose, in scene
+        units.
+
+        Cached per pose *and pitch*, exactly like the splat backends: every
+        depth read in one confirmation shares one render. ``pitch_rad`` is a
+        body pitch (nose-down positive) - the mirror renders the candidate's
+        elevation instead of reporting ``target_out_of_view`` for everything
+        above the level frame.
+        """
+        key = (
+            np.asarray(self.state.position_flu, dtype=np.float64).tobytes(),
+            float(self.state.yaw_rad).hex(),
+            float(pitch_rad).hex(),
+        )
+        if (
+            getattr(self, "_depth_key", None) != key
+            or getattr(self, "_depth_frame", None) is None
+        ):
+            _, depth = self._depth_renderer().render_with_depth(
+                self.state.position_flu, self.quat_xyzw(pitch_rad)
+            )
+            self._depth_key, self._depth_frame = key, depth
+        return self._depth_frame
+
+    def depth_at_pixel(self, pixel: tuple[float, float], pitch_rad: float = 0.0) -> float | None:
+        """Axial depth at a normalized [0, 1000] pixel of the current frame.
+
+        Same contract as :meth:`SplatWorldCPU.depth_at_pixel` and
+        ``SuperPlannerWorld.depth_at_pixel``: ``None`` where no Gaussian reaches
+        the pixel (or no activated model is available).
+        """
+        try:
+            depth = self.depth_map(pitch_rad)
+        except (RuntimeError, AttributeError, TypeError):
+            return None
+        height, width = depth.shape
+        u = min(max(int(pixel[0] / 1000.0 * width), 0), width - 1)
+        v = min(max(int(pixel[1] / 1000.0 * height), 0), height - 1)
+        window = depth[
+            max(0, v - DEPTH_WINDOW_PX):v + DEPTH_WINDOW_PX + 1,
+            max(0, u - DEPTH_WINDOW_PX):u + DEPTH_WINDOW_PX + 1,
+        ]
+        return depth_from_window(window.numpy(), centre=float(depth[v, u]))
 
     def distance_to_target(self) -> float:
         return float(
@@ -905,6 +1009,10 @@ class SuperPlannerWorld(EnvWorld):
     ``apply_initial_yaw`` semantics, planner preflight priming, and the env's
     own collision-aware start sampling.
     """
+
+    #: ``depth_at_pixel`` serves the last level MoGe estimate: a pitched read
+    #: would return that level map at a pitched pixel, so it is not offered
+    supports_pitched_depth = False
 
     def __init__(
         self,

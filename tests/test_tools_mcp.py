@@ -648,7 +648,12 @@ class TestMcpResources(unittest.TestCase):
             bev = _blob(out["bev"].contents)
             with Image.open(io.BytesIO(base64.b64decode(bev.blob))) as decoded:
                 self.assertEqual(decoded.size, (64, 64))
-            self.assertEqual(_json_content(out["state"].contents)["distance_to_target_m"], 4.25)
+            state = _json_content(out["state"].contents)
+            # agent-facing state only: no target identity/position/distance/FOV
+            self.assertEqual(state["position_flu"], [0.0, 0.0, 1.0])
+            self.assertNotIn("distance_to_target_m", state)
+            self.assertNotIn("target_in_fov", state)
+            self.assertNotIn("target", state)
 
             traj = _json_content(out["traj"].contents)
             self.assertEqual(traj["step_count"], 3)

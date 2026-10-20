@@ -1539,6 +1539,41 @@ def ray_only_search_event(*, turn=1):
     )
 
 
+def accepted_confirmation_event(
+    *, turn=1, candidate_id="cand_1", revision=None, signal=False
+):
+    """A ``confirm_candidate`` result that is an accepted identity.
+
+    ``signal=False`` leaves the executor's completion signal out: the event only
+    records the identity evidence, so the movement result that follows is what
+    closes the stage (the order the evidence-binding tests exercise).
+    """
+    data = {
+        "candidate_id": candidate_id,
+        "verdict": "accepted",
+        "new_confirmation": True,
+        "missing": [],
+        "position_check": {
+            "available": True,
+            "delta_m": 0.2,
+            "tolerance_m": 1.0,
+            "reason": "depth",
+        },
+        "observation_ids": ["obs_9"],
+    }
+    if revision is not None:
+        data["evidence_revision"] = int(revision)
+    if signal:
+        data["identity_confirmed"] = True
+    return step_event(
+        "confirm_candidate",
+        turn=turn,
+        data=data,
+        evidence=[("observation", "obs_9")],
+        kind="task" if signal else "",
+    )
+
+
 def located_move_event(*, turn=1, signal=True, arrived=True, resolved=True):
     """A movement call that resolved the candidate's place and flew a leg."""
     data = {
@@ -1581,7 +1616,9 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
 
         self.assertEqual(outcome["claimed"], "st_1")
         self.assertEqual(outcome["completed"], "")
-        self.assertEqual(outcome["evidence_missing"], ["located", "reached"])
+        self.assertEqual(
+            outcome["evidence_missing"], ["located", "reached", "confirmation"]
+        )
         self.assertEqual(
             [entry["to"] for entry in outcome["transitions"]], [SUBTASK_CLAIMED_DONE]
         )
@@ -1596,10 +1633,135 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
         self.assertEqual(data["done_subtasks"], [])
         self.assertEqual(data["claimed_subtasks"][0]["id"], "st_1")
         self.assertEqual(data["claimed_subtasks"][0]["evidence_missing"],
-                         ["located", "reached"])
+                         ["located", "reached", "confirmation"])
         self.assertEqual(data["current_subtask"]["status"], SUBTASK_CLAIMED_DONE)
         self.assertEqual(data["current_step"], 1)
         self.assertIn("current=st_1[claimed_done]", subtask_progress(ctx))
+
+    def test_a_movement_stage_needs_an_accepted_confirmation(self):
+        """Reach + locate is not identity: the stage stays open until confirmed."""
+        registry, ctx = plan_registry(), make_context()
+        self._door_plan(registry, ctx)
+
+        without = executor_step(ctx, located_move_event())
+        self.assertEqual(without["completed"], "", without)
+        self.assertIn("confirmation", without["evidence_missing"])
+        self.assertEqual(subtasks_of(ctx)[0]["status"], SUBTASK_CLAIMED_DONE)
+
+        confirmed = executor_step(ctx, accepted_confirmation_event(turn=2))
+        self.assertEqual(confirmed["completed"], "st_1", confirmed)
+        self.assertEqual(subtasks_of(ctx)[0]["status"], SUBTASK_DONE)
+
+    def test_a_confirmation_of_another_candidate_does_not_close_the_stage(self):
+        """Only the current candidate/revision can back the stage's identity."""
+        registry, ctx = plan_registry(), make_context()
+        self._door_plan(registry, ctx)
+        executor_step(ctx, located_move_event(turn=1))
+
+        stale = executor_step(
+            ctx,
+            accepted_confirmation_event(
+                turn=2, candidate_id="cand_2", revision=1, signal=True
+            ),
+        )
+        self.assertEqual(stale["completed"], "")
+        self.assertIn("confirmation", stale["evidence_missing"])
+
+        # the current candidate's accepted confirmation does close it
+        current = executor_step(
+            ctx,
+            accepted_confirmation_event(
+                turn=3, candidate_id="cand_1", revision=2, signal=True
+            ),
+        )
+        self.assertEqual(current["completed"], "st_1", current)
+
+    def test_a_nearby_new_candidate_inherits_the_confirmation(self):
+        """Re-grounding the same stage can mint cand_10 near the confirmed
+        cand_1. The acceptance is transferred to the new id (same sub-task,
+        distance inside the inheritance radius); a far candidate is not."""
+        from vlm_nav.tools import select_scope_candidate
+
+        registry, ctx = plan_registry(), make_context()
+        self._door_plan(registry, ctx)
+        subtask = subtasks_of(ctx)[0]
+        ctx.extra["perception.candidates"] = {
+            "cand_1": {"id": "cand_1", "position_flu": [1.0, 0.0, 0.0]},
+            "cand_2": {"id": "cand_2", "position_flu": [1.8, 0.0, 0.0]},
+            "cand_3": {"id": "cand_3", "position_flu": [6.0, 0.0, 0.0]},
+        }
+        scope = select_scope_candidate(ctx, "cand_1")
+        subtask.update(
+            _evidence_marks=["ref", "located", "reached", "confirmed", "identity"],
+            _evidence_candidate="cand_1",
+            _evidence_revision=scope["evidence_revision"],
+            _evidence_confirmed={
+                "candidate_id": "cand_1",
+                "evidence_revision": scope["evidence_revision"],
+                "position_delta_m": 0.2,
+            },
+        )
+        self.assertTrue(evidence_verdict(subtask)["confirmed"])
+
+        nearby = select_scope_candidate(ctx, "cand_2")
+        record = subtask["_evidence_confirmed"]
+        self.assertEqual(record["candidate_id"], "cand_2")
+        self.assertEqual(record["evidence_revision"], nearby["evidence_revision"])
+        self.assertEqual(record["inherited_from"], "cand_1")
+        self.assertAlmostEqual(record["inherited_distance_m"], 0.8, places=6)
+        self.assertTrue(evidence_verdict(subtask)["confirmed"])
+
+        # a candidate 4.2 m away is another instance: the acceptance is stale
+        select_scope_candidate(ctx, "cand_3")
+        self.assertFalse(evidence_verdict(subtask)["confirmed"])
+
+    def test_reach_is_the_wider_of_candidate_and_stage_centre(self):
+        """A stage centre 2 m away is outside ``reach_m`` while the arrival is
+        on the candidate's standoff shell: the reach is still valid and says
+        which geometry justified it."""
+        registry, ctx = plan_registry(), make_context()
+        plan_with(
+            registry,
+            ctx,
+            [
+                {
+                    "id": "st_1",
+                    "goal": "approach the shelf",
+                    "done_when": "the shelf is reached",
+                    "goal_position": [0.0, 0.0, 0.0],
+                    "locate_m": 2.0,
+                    "reach_m": 1.5,
+                }
+            ],
+        )
+        executor_step(
+            ctx,
+            step_event(
+                "ground_target",
+                data={"candidate_id": "cand_1", "target_position": [2.0, 0.0, 0.0]},
+                evidence=[("observation", "obs_1")],
+            ),
+        )
+        executor_step(
+            ctx,
+            step_event(
+                "approach_candidate",
+                turn=2,
+                data={
+                    "candidate_id": "cand_1",
+                    "outcome": "arrived",
+                    "task_status": "arrived",
+                    "remaining_m": 0.05,
+                    "standoff_m": 1.2,
+                    "target_position": [2.0, 0.0, 0.0],
+                },
+                evidence=[("observation", "obs_2")],
+            ),
+        )
+
+        verdict = evidence_verdict(subtasks_of(ctx)[0])
+        self.assertTrue(verdict["reached"], verdict)
+        self.assertEqual(verdict["reach_basis"], "candidate")
 
     def test_a_partial_leg_is_not_reach_evidence(self):
         """A flown leg is ``moved``, not ``reached``: the movement stage stays
@@ -1635,14 +1797,16 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
         )
         self.assertEqual(partial["claimed"], "st_1")
         self.assertEqual(partial["completed"], "")
-        self.assertEqual(partial["evidence_missing"], ["reached"])
+        self.assertEqual(partial["evidence_missing"], ["reached", "confirmation"])
         self.assertEqual(subtasks_of(ctx)[0]["status"], SUBTASK_CLAIMED_DONE)
 
+        confirmed = executor_step(ctx, accepted_confirmation_event(turn=2))
+        self.assertEqual(confirmed["completed"], "")
         done = executor_step(
             ctx,
             step_event(
                 "approach_candidate",
-                turn=2,
+                turn=3,
                 data={
                     "outcome": "arrived",
                     "task_status": "arrived",
@@ -1685,7 +1849,7 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
             ),
         )
         self.assertEqual(located["claimed"], "st_1")
-        self.assertEqual(located["evidence_missing"], ["reached"])
+        self.assertEqual(located["evidence_missing"], ["reached", "confirmation"])
 
         elsewhere = executor_step(
             ctx,
@@ -1704,11 +1868,12 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
         self.assertEqual(elsewhere["completed"], "")
         self.assertEqual(subtasks_of(ctx)[0]["status"], SUBTASK_CLAIMED_DONE)
 
+        executor_step(ctx, accepted_confirmation_event(turn=3))
         at_target = executor_step(
             ctx,
             step_event(
                 "approach_candidate",
-                turn=3,
+                turn=4,
                 data={
                     "outcome": "arrived",
                     "task_status": "arrived",
@@ -1751,7 +1916,7 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
             ),
         )
         self.assertEqual(claim["claimed"], "st_1")
-        self.assertEqual(claim["evidence_missing"], ["reached"])
+        self.assertEqual(claim["evidence_missing"], ["reached", "confirmation"])
 
         far = executor_step(
             ctx,
@@ -1770,11 +1935,12 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
         self.assertEqual(far["completed"], "")
         self.assertEqual(subtasks_of(ctx)[0]["status"], SUBTASK_CLAIMED_DONE)
 
+        executor_step(ctx, accepted_confirmation_event(turn=3))
         close = executor_step(
             ctx,
             step_event(
                 "approach_candidate",
-                turn=3,
+                turn=4,
                 data={
                     "outcome": "partial",
                     "remaining_m": 0.6,
@@ -1789,7 +1955,8 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
     def test_a_movement_result_with_the_object_place_closes_the_step(self):
         registry, ctx = plan_registry(), make_context()
         self._door_plan(registry, ctx)
-        outcome = executor_step(ctx, located_move_event())
+        executor_step(ctx, accepted_confirmation_event(turn=1))
+        outcome = executor_step(ctx, located_move_event(turn=2))
 
         self.assertEqual(outcome["completed"], "st_1")
         self.assertEqual(outcome["claimed"], "")
@@ -1805,12 +1972,13 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
         executor_step(ctx, ray_only_search_event())
         self.assertEqual(subtasks_of(ctx)[0]["status"], SUBTASK_CLAIMED_DONE)
 
-        outcome = executor_step(ctx, located_move_event(turn=2))
+        executor_step(ctx, accepted_confirmation_event(turn=2))
+        outcome = executor_step(ctx, located_move_event(turn=3))
         self.assertEqual(outcome["completed"], "st_1")
         self.assertEqual(
             outcome["transitions"][0],
             {"id": "st_1", "from": SUBTASK_CLAIMED_DONE, "to": SUBTASK_DONE,
-             "reason": "done_when_met", "turn": 2},
+             "reason": "done_when_met", "turn": 3},
         )
         self.assertEqual(subtasks_of(ctx)[0]["status"], SUBTASK_DONE)
 
@@ -1822,7 +1990,8 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
         executor_step(ctx, ray_only_search_event())
         self.assertEqual(subtasks_of(ctx)[0]["status"], SUBTASK_CLAIMED_DONE)
 
-        outcome = executor_step(ctx, located_move_event(turn=2, signal=False))
+        executor_step(ctx, accepted_confirmation_event(turn=2))
+        outcome = executor_step(ctx, located_move_event(turn=3, signal=False))
         self.assertEqual(outcome["completed"], "st_1")
         self.assertEqual(outcome["claimed"], "")
         self.assertEqual(subtasks_of(ctx)[0]["status"], SUBTASK_DONE)
@@ -1859,7 +2028,8 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
             ctx,
             [{"id": "st_1", "goal": "confirm the box", "done_when": TARGET_DONE_WHEN}],
         )
-        outcome = executor_step(ctx, located_move_event())
+        executor_step(ctx, accepted_confirmation_event(turn=1))
+        outcome = executor_step(ctx, located_move_event(turn=2))
         self.assertEqual(outcome["completed"], "st_1")
         self.assertEqual(outcome["claimed"], "")
         self.assertEqual(subtasks_of(ctx)[0]["status"], SUBTASK_DONE)
@@ -1867,7 +2037,7 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
     def test_budget_exhaustion_with_complete_evidence_marks_the_step_done(self):
         registry, ctx = plan_registry(), make_context()
         self._door_plan(registry, ctx, budget=1)
-        first = executor_step(ctx, located_move_event(turn=1, signal=False))
+        first = executor_step(ctx, accepted_confirmation_event(turn=1))
         self.assertEqual(first["charged"], "st_1")
         self.assertEqual(subtasks_of(ctx)[0]["status"], SUBTASK_ACTIVE)
 
@@ -1948,7 +2118,7 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
                     "done_when": DOOR_DONE_WHEN,
                     "goal_position": [10.0, 0.0, 0.0],
                     "locate_m": 2.0,
-                    "budget": {"tool_calls": 1},
+                    "budget": {"tool_calls": 2},
                 }
             ],
         )
@@ -1961,7 +2131,7 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
                 evidence=[("observation", "obs_11")],
             ),
         )
-        over = executor_step(
+        executor_step(
             ctx,
             step_event(
                 "approach_candidate",
@@ -1976,6 +2146,7 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
                 evidence=[("observation", "obs_12")],
             ),
         )
+        over = executor_step(ctx, accepted_confirmation_event(turn=3))
         self.assertEqual(over["budget_with_evidence"], "st_1")
         self.assertEqual(over["failed"], "")
         self.assertEqual(subtasks_of(ctx)[0]["status"], SUBTASK_DONE)
@@ -2017,11 +2188,12 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
         self.assertEqual(subtasks_of(ctx)[0]["status"], SUBTASK_CLAIMED_DONE)
         self.assertEqual(subtasks_of(ctx)[1]["status"], SUBTASK_PENDING)
 
+        executor_step(ctx, accepted_confirmation_event(turn=2))
         done = executor_step(
             ctx,
             step_event(
                 "approach_candidate",
-                turn=2,
+                turn=3,
                 data={
                     "outcome": "arrived",
                     "task_status": "arrived",
@@ -2070,11 +2242,13 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
         self.assertIn("located", claim["evidence_missing"])
 
         # 1.4 m away, reported by a call without a completion signal, closes it
+        # once the stage's identity has also been accepted
+        executor_step(ctx, accepted_confirmation_event(turn=2))
         done = executor_step(
             ctx,
             step_event(
                 "approach_candidate",
-                turn=2,
+                turn=3,
                 data={
                     "outcome": "arrived",
                     "task_status": "arrived",
@@ -2091,7 +2265,8 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
     def test_unscoped_located_evidence_is_marked_weak(self):
         registry, ctx = plan_registry(), make_context()
         self._door_plan(registry, ctx)
-        outcome = executor_step(ctx, located_move_event())
+        executor_step(ctx, accepted_confirmation_event(turn=1))
+        outcome = executor_step(ctx, located_move_event(turn=2))
 
         self.assertEqual(outcome["completed"], "st_1")
         self.assertTrue(outcome["evidence_weak"])
@@ -2138,9 +2313,9 @@ class ExecutorEvidenceBindingTest(unittest.TestCase):
 
         ctx.episode_id = "ep_2"
         self.assertIsNotNone(resume_plan(ctx, "ep_2", "find the wooden door"))
-        # the carried evidence still satisfies done_when, so the exhausted budget
-        # closes the step instead of failing it
-        over = executor_step(ctx, step_event("observe", turn=1))
+        # the carried movement evidence plus the accepted identity satisfies
+        # done_when, so the exhausted budget closes the step instead of failing it
+        over = executor_step(ctx, accepted_confirmation_event(turn=1))
         self.assertEqual(over["completed"], "st_1")
         self.assertEqual(subtasks_of(ctx)[0]["reason"], "budget_with_evidence")
 
@@ -2465,6 +2640,134 @@ class PlanResumeTest(unittest.TestCase):
         record = resume_plan(ctx, "ep_1", "go")
         self.assertEqual(record["resume_count"], 0)
         self.assertEqual(record["resumed_from"], "")
+
+    @staticmethod
+    def _resumed_wrong_done(*, position_delta_m):
+        registry, ctx = plan_registry(), make_context(episode_id="ep_1")
+        plan_with(
+            registry,
+            ctx,
+            [
+                {"id": "st_1", "goal": "reach the shelf", "done_when": "the shelf is reached", "reach_m": 1.5},
+                {"id": "st_2", "goal": "reach the desk", "done_when": "the desk is reached", "reach_m": 1.5},
+            ],
+        )
+        record = plan_state(ctx)
+        first, second = record["subtasks"]
+        first.update(
+            status=SUBTASK_DONE,
+            reason="done_when_met",
+            evidence=["observation:obs_7"],
+            _evidence_marks=["ref", "located", "moved", "reached", "identity", "confirmed"],
+            _evidence_places=[[1.0, 0.0, 0.0]],
+            _evidence_move_places=[[1.0, 0.0, 0.0]],
+            _evidence_remaining=[0.1],
+            _evidence_candidate="cand_1",
+            _evidence_revision=2,
+            _evidence_confirmed={
+                "candidate_id": "cand_1",
+                "evidence_revision": 2,
+                "observation_ids": ["obs_7"],
+                "position_delta_m": position_delta_m,
+            },
+        )
+        second["status"] = SUBTASK_ACTIVE
+        ctx.extra["perception.candidates"] = {
+            "cand_1": {"id": "cand_1", "status": "accepted", "position_flu": [1.0, 0.0, 0.0]}
+        }
+        ctx.extra["confirmation_ledger"] = {
+            "cand_1": {"last_verdict": "accepted", "accepted_revision": 2}
+        }
+        ctx.episode_id = "ep_2"
+        return ctx, resume_plan(ctx, "ep_2", record.get("instruction") or "go"), first
+
+    def test_a_resumed_confirmation_without_an_independent_anchor_is_rechecked(self):
+        """The checkpoint's done stage is re-judged on the first evidence turn.
+
+        seed37 resumed with ``st_1 done`` even though its confirmation had no
+        independent positional anchor (delta was the self-consistent 0.0). The
+        first call of the resumed leg demotes it to ``claimed_done`` and marks
+        the candidate rejected - the agent's own record, no ground truth.
+        """
+        ctx, record, first = self._resumed_wrong_done(position_delta_m=None)
+        self.assertIsNotNone(record)
+        self.assertEqual(first["status"], SUBTASK_DONE)
+
+        outcome = executor_step(
+            ctx,
+            step_event("observe", data={"observation_id": "obs_9"}, evidence=[("observation", "obs_9")]),
+        )
+
+        self.assertEqual(first["status"], SUBTASK_CLAIMED_DONE)
+        self.assertIn("resume_recheck", first["reason"])
+        self.assertEqual(outcome["resume_recheck"]["corrected"], ["st_1"])
+        self.assertEqual(ctx.extra["confirmation_ledger"]["cand_1"]["last_verdict"], "rejected")
+        self.assertEqual(
+            ctx.extra["perception.candidates"]["cand_1"]["status"], "rejected"
+        )
+        verdict = evidence_verdict(first)
+        self.assertFalse(verdict["confirmed"], verdict)
+        self.assertFalse(verdict["ok"], verdict)
+
+    def test_an_already_open_claimed_stage_is_not_counted_as_corrected(self):
+        """Re-judging a claimed_done stage confirms it is open; nothing was overturned."""
+        ctx, record, first = self._resumed_wrong_done(position_delta_m=None)
+        first["status"] = SUBTASK_CLAIMED_DONE
+        first["reason"] = "evidence_insufficient:reached,confirmation"
+        # an open claim with no accepted confirmation: nothing to overturn
+        first.pop("_evidence_confirmed", None)
+
+        outcome = executor_step(
+            ctx,
+            step_event("observe", data={"observation_id": "obs_9"}, evidence=[("observation", "obs_9")]),
+        )
+
+        self.assertEqual(first["status"], SUBTASK_CLAIMED_DONE)
+        self.assertEqual(outcome["resume_recheck"]["corrected"], [])
+        self.assertIn("st_1", outcome["resume_recheck"]["checked"])
+        self.assertFalse(
+            outcome["resume_recheck"]["details"][0]["corrected"],
+            outcome["resume_recheck"],
+        )
+
+    def test_new_evidence_that_rejects_the_confirmed_candidate_demotes_done(self):
+        """A fresh rejection overturns a checkpoint belief on the first turn."""
+        ctx, record, first = self._resumed_wrong_done(position_delta_m=0.2)
+        self.assertIsNotNone(record)
+
+        outcome = executor_step(
+            ctx,
+            step_event(
+                "confirm_candidate",
+                data={
+                    "candidate_id": "cand_1",
+                    "verdict": "rejected",
+                    "reason": "different_instance",
+                },
+                evidence=[("observation", "obs_9")],
+            ),
+        )
+
+        self.assertEqual(first["status"], SUBTASK_CLAIMED_DONE)
+        self.assertIn("resume_recheck", first["reason"])
+        self.assertEqual(outcome["resume_recheck"]["corrected"], ["st_1"])
+        self.assertEqual(
+            ctx.extra["perception.candidates"]["cand_1"]["status"], "rejected"
+        )
+
+    def test_a_well_anchored_checkpoint_confirmation_survives_the_recheck(self):
+        """A fresh, independently anchored confirmation is not distrusted."""
+        ctx, record, first = self._resumed_wrong_done(position_delta_m=0.3)
+        self.assertIsNotNone(record)
+
+        outcome = executor_step(
+            ctx,
+            step_event("observe", data={"observation_id": "obs_9"}, evidence=[("observation", "obs_9")]),
+        )
+
+        self.assertEqual(first["status"], SUBTASK_DONE)
+        self.assertEqual(outcome["resume_recheck"]["corrected"], [])
+        self.assertEqual(ctx.extra["confirmation_ledger"]["cand_1"]["last_verdict"], "accepted")
 
 
 class SubtaskGroundInstructionTest(unittest.TestCase):

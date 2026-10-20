@@ -185,7 +185,7 @@ def ref(kind: str, name: str) -> dict:
 def make_leg(entries, *, label="seed7_leg1", summary=None, executor=None, interrupted=False,
              reason="", plan=None, prompt_id="ep_007", instruction="do the chain",
              carry=None, vlm_calls=1, log=None, out_dir=None, start_pose=(0.0, 0.0, 1.0),
-             role="fresh"):
+             role="fresh", checkpoint=None, final_plan=None):
     leg_plan = DRIVER.LegPlan(
         label=label,
         instruction=instruction,
@@ -211,6 +211,8 @@ def make_leg(entries, *, label="seed7_leg1", summary=None, executor=None, interr
         wall_time_s=1.0,
         start_pose=list(start_pose),
         log=dict(log or {}),
+        checkpoint=dict(checkpoint or {}),
+        final_plan=final_plan,
     )
 
 
@@ -637,6 +639,61 @@ def complete_stage_entry(seq, place, ref_name, *, tool="ground_target", pose=Non
     return row
 
 
+def checkpoint_plan(task, statuses, *, label="seed7_leg1",
+                    instruction="do the chain", evidence=None):
+    """The plan record an interrupted leg's checkpoint carries (agent state)."""
+    subtasks = []
+    for stage, status in zip(task.stages, statuses):
+        subtasks.append(
+            {
+                "id": f"st_{stage.index}",
+                "goal": stage.step,
+                "status": status,
+                "evidence": list((evidence or {}).get(stage.index) or []),
+            }
+        )
+    done = [stage.index for stage, status in zip(task.stages, statuses) if status == "done"]
+    current = min(
+        [stage.index for stage, status in zip(task.stages, statuses) if status != "done"]
+        or [len(task.stages)]
+    )
+    return {
+        "plan_id": "plan_1",
+        "revision": 1,
+        "steps": [stage.step for stage in task.stages],
+        "subtasks": subtasks,
+        "current_step": current,
+        "done": done,
+        "episode_id": label,
+        "instruction": instruction,
+    }
+
+
+def make_checkpoint(*, plan=None, pose=(1.0, 2.0, 3.0), yaw=0.5,
+                    ledger=None, candidates=None, observations=None,
+                    open_questions=None, source_leg="seed7_leg1"):
+    return {
+        "version": 3,
+        "source": "runtime.ctx.extra",
+        "source_leg": source_leg,
+        "source_episode_id": "ep_007",
+        "instruction": "do the chain",
+        "pose": {"position_flu": [float(v) for v in pose], "yaw_rad": float(yaw)},
+        "plan": plan,
+        "confirmation_ledger": dict(ledger or {}),
+        "candidates": dict(candidates or {}),
+        "observations": dict(observations or {}),
+        "viewpoints_by_id": {},
+        "hypotheses": {},
+        "task_scope": {"task_id": "plan_1", "subtask_id": "st_1",
+                       "candidate_id": "", "evidence_revision": 0},
+        "beliefs": {},
+        "open_questions": open_questions,
+        "evidence_pack": {},
+        "last_observation_id": "",
+    }
+
+
 class ResumeTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -645,21 +702,26 @@ class ResumeTest(unittest.TestCase):
         self.task = make_task(self.directory)
 
     def _partial_leg(self, *, only_first=True):
-        places = [stage.position for stage in self.task.stages]
-        entries = [complete_stage_entry(1, places[0], "obs_1")]
+        statuses = ["done", "active", "pending"]
         if not only_first:
-            entries.append(complete_stage_entry(2, places[1], "obs_2"))
-        leg = make_leg(entries, interrupted=True, reason="budget_exhausted")
-        # the fresh leg's own recorded start pose (the sampled one) and where it
-        # stopped: the two control arms must be distinguishable by them
-        leg.entries[-1]["pose_after"] = [1.0, 2.0, 3.0]
-        leg.entries[-1]["yaw_after"] = 0.5
+            statuses = ["done", "done", "pending"]
+        plan = checkpoint_plan(
+            self.task, statuses, evidence={1: ["obs_1"], 2: ["obs_2"]}
+        )
+        checkpoint = make_checkpoint(plan=plan)
+        leg = make_leg(
+            [], interrupted=True, reason="budget_exhausted", checkpoint=checkpoint
+        )
         return leg
 
-    def test_only_evidenced_stages_are_marked_done(self):
+    def test_resume_state_is_the_checkpoint_verbatim(self):
         leg = self._partial_leg()
         state = DRIVER.build_resume_state(leg, self.task, prompt_episode_id="ep_007",
                                           world=_StubWorld())
+        # the whole checkpoint is carried untouched, including the agent's own
+        # plan statuses and evidence - nothing is recomputed from the ledger
+        self.assertEqual(state["checkpoint"], leg.checkpoint)
+        self.assertEqual(state["plan"], leg.checkpoint["plan"])
         self.assertEqual(state["done"], [1])
         plan = state["plan"]
         self.assertEqual(plan["current_step"], 2)
@@ -669,13 +731,242 @@ class ResumeTest(unittest.TestCase):
         self.assertIn("obs_1", plan["subtasks"][0]["evidence"])
         self.assertEqual(state["complete_count"], 1)
 
+    def test_a_wrong_done_belief_survives_restart_and_is_scored_offline(self):
+        """The checkpoint says st_1 is done; the scene says it never was.
+
+        The resumed leg must inherit the wrong belief (that is what makes the
+        restart a memory test), and only the offline report may call it wrong.
+        """
+        plan = checkpoint_plan(self.task, ["done", "pending", "pending"])
+        checkpoint = make_checkpoint(plan=plan)
+        leg = make_leg([], interrupted=True, reason="budget_exhausted",
+                       checkpoint=checkpoint)
+
+        state = DRIVER.build_resume_state(leg, self.task, prompt_episode_id="ep_007",
+                                          world=_StubWorld())
+        self.assertEqual(state["done"], [1])
+        self.assertEqual(state["plan"]["subtasks"][0]["status"],
+                         task_module.SUBTASK_DONE)
+        self.assertIn("st_1", state["brief"])
+        self.assertIn("done", state["brief"])
+
+        # the offline channel is the only one that reads the scene: no entry
+        # supports stage 1, so the agent's 'done' is a wrong belief
+        report = DRIVER.checkpoint_report(self.task, [leg])
+        self.assertTrue(report["available"])
+        self.assertEqual(report["claimed_done"], ["st_1"])
+        self.assertEqual(report["gt_done"], [])
+        self.assertEqual(report["wrong_done"], ["st_1"])
+        self.assertEqual(report["wrong_belief_count"], 1)
+        self.assertEqual(report["resume_corrections"], 0)
+
+    def test_a_resumed_leg_can_correct_the_checkpoint_belief_itself(self):
+        plan = checkpoint_plan(self.task, ["done", "pending", "pending"])
+        leg = make_leg([], interrupted=True, reason="budget_exhausted",
+                       checkpoint=make_checkpoint(plan=plan))
+        # the resumed leg's own plan now marks the stage blocked: it noticed
+        corrected_plan = checkpoint_plan(self.task, ["blocked", "pending", "pending"])
+        follow = make_leg(
+            [], label="seed7_leg2_resume", role="resume",
+            checkpoint=make_checkpoint(plan=corrected_plan, source_leg="seed7_leg2_resume"),
+            final_plan=corrected_plan,
+        )
+        report = DRIVER.checkpoint_report(self.task, [leg, follow])
+        self.assertEqual(report["wrong_done"], ["st_1"])
+        self.assertEqual(report["resume_corrections"], 1)
+        self.assertEqual(report["corrected"], ["st_1"])
+
+    def test_the_resumed_leg_recheck_shows_up_as_a_checkpoint_correction(self):
+        """The agent-side recheck overturns a wrong done; the offline score sees it.
+
+        No ground truth enters the recheck: the first evidence turn of the
+        resumed leg re-judges the checkpoint's confirmation (here: accepted
+        without an independent position anchor) and demotes the stage. The
+        offline checkpoint report then counts ``st_1`` as corrected because the
+        follow leg's own final plan no longer says done.
+        """
+        plan = checkpoint_plan(self.task, ["done", "pending", "pending"])
+        first = plan["subtasks"][0]
+        first.update(
+            status="done",
+            _evidence_marks=["ref", "identity", "confirmed"],
+            _evidence_confirmed={
+                "candidate_id": "cand_1",
+                "evidence_revision": 1,
+                "observation_ids": ["obs_1"],
+                "position_delta_m": None,
+            },
+        )
+        checkpoint = make_checkpoint(plan=plan)
+        leg = make_leg([], interrupted=True, reason="budget_exhausted", checkpoint=checkpoint)
+
+        state = DRIVER.build_resume_state(
+            leg, self.task, prompt_episode_id="ep_007", world=_StubWorld()
+        )
+        ctx = ToolContext(
+            world=_StubWorld(), memory=None, episode_id="ep_007",
+            budget={"tool_calls_left": 8},
+            extra={
+                "plan": state["resume_plan"],
+                "instruction": state["instruction"],
+                "confirmation_ledger": {"cand_1": {"last_verdict": "accepted"}},
+                "perception.candidates": {
+                    "cand_1": {"id": "cand_1", "status": "accepted"}
+                },
+            },
+        )
+        adopted = task_module.resume_plan(ctx, "ep_007", state["instruction"])
+        self.assertIsNotNone(adopted)
+        outcome = task_module.executor_step(
+            ctx,
+            {
+                "tool": "observe",
+                "args": {},
+                "status": STATUS_OK,
+                "data": {"observation_id": "obs_9"},
+                "evidence": [ref("observation", "obs_9")],
+                "turn": 1,
+            },
+        )
+        self.assertEqual(
+            outcome["resume_recheck"]["corrected"], ["st_1"], outcome
+        )
+        self.assertEqual(adopted["subtasks"][0]["status"], task_module.SUBTASK_CLAIMED_DONE)
+        self.assertEqual(
+            ctx.extra["confirmation_ledger"]["cand_1"]["last_verdict"], "rejected"
+        )
+
+        follow = make_leg(
+            [], label="seed7_leg2_resume", role="resume",
+            checkpoint=make_checkpoint(
+                plan=adopted,
+                ledger=ctx.extra["confirmation_ledger"],
+                source_leg="seed7_leg2_resume",
+            ),
+            final_plan=adopted,
+        )
+        report = DRIVER.checkpoint_report(self.task, [leg, follow])
+        self.assertEqual(report["wrong_done"], ["st_1"])
+        self.assertIn("st_1", report["corrected"])
+        self.assertGreaterEqual(report["resume_corrections"], 1)
+
+    def test_wrong_confirmation_crosses_the_stage_scope(self):
+        """An accepted identity is scored from the leg's whole candidate table.
+
+        v10 seed23 accepted (again) a candidate that had been proposed under the
+        *landmark* sub-task while the plan was executing the *object* stage.
+        The stage-scoped confirmation cannot resolve that candidate's place, so
+        its distance/correctness stayed ``None`` and ``wrong_confirmed`` missed
+        it. The checkpoint score must fall back to the candidate table the whole
+        leg built, exactly like the offline instance audit.
+        """
+        object_place = self.task.stages[1].position
+        stale_place = (object_place[0], object_place[1] + 2.5, object_place[2])
+        entries = [
+            scoped_entry(
+                1, "ground_target", subtask="st_1", candidate="cand_1",
+                data={"candidates": [{"id": "cand_1", "position_flu": list(stale_place)}]},
+                evidence=[ref("observation", "obs_1")],
+                pose=list(self.task.stages[0].position),
+            ),
+            scoped_entry(
+                2, "confirm_candidate", subtask="st_2", candidate="cand_1", revision=1,
+                data={"verdict": "accepted"},
+                evidence=[ref("memory", "cand_1")],
+                pose=list(object_place),
+            ),
+        ]
+        plan = checkpoint_plan(self.task, ["active", "active", "pending"])
+        ledger = {"cand_1": {"last_verdict": "accepted", "accepted_revision": 1}}
+        leg = make_leg(entries, interrupted=True, reason="budget_exhausted",
+                       checkpoint=make_checkpoint(plan=plan, ledger=ledger))
+        truth = DRIVER.stage_report(
+            entries, self.task, subtask_map=DRIVER.stage_subtask_map(self.task, [leg])
+        )
+        object_row = truth["stages"]["object"]
+        self.assertTrue(object_row["confirmed"])
+        self.assertIsNone(object_row["confirmation_correct"])
+        self.assertIsNone(object_row["confirmation_distance_m"])
+        report = DRIVER.checkpoint_report(self.task, [leg])
+        self.assertEqual(report["wrong_confirmed"], ["cand_1"])
+        self.assertFalse(report["checkpoint_correct"])
+
+    def test_a_claimed_done_without_the_scene_completion_is_a_wrong_belief(self):
+        """``claimed_done`` is a completion claim even before it says ``done``."""
+        plan = checkpoint_plan(self.task, ["claimed_done", "pending", "pending"])
+        leg = make_leg([], interrupted=True, reason="budget_exhausted",
+                       checkpoint=make_checkpoint(plan=plan))
+        report = DRIVER.checkpoint_report(self.task, [leg])
+        self.assertEqual(report["claimed_done"], [])
+        self.assertEqual(report["wrong_claimed"], ["st_1"])
+        self.assertEqual(report["wrong_done"], [])
+        self.assertEqual(report["wrong_belief_count"], 1)
+        self.assertFalse(report["checkpoint_correct"])
+
+    def test_the_brief_reads_candidates_from_the_perception_table(self):
+        """The runtime stores candidates under ``perception.candidates``."""
+        plan = checkpoint_plan(self.task, ["active", "pending", "pending"])
+        checkpoint = make_checkpoint(plan=plan)
+        checkpoint["perception.candidates"] = {
+            "cand_1": {"id": "cand_1", "position_flu": [-0.70, 0.388, -0.698]},
+        }
+        leg = make_leg([], interrupted=True, reason="budget_exhausted",
+                       checkpoint=checkpoint)
+        brief = DRIVER.resume_brief(leg, self.task)
+        self.assertIn("cand_1 at (-0.70, 0.39, -0.70)", brief["text"])
+        self.assertIn([-0.70, 0.388, -0.698], brief["places"])
+
+    def test_resume_chain_never_calls_stage_report(self):
+        """The resume path consumes the checkpoint, not the evaluator's verdict."""
+        import ast
+        import inspect
+        import textwrap
+
+        for function in (DRIVER.resume_brief, DRIVER.build_resume_state,
+                         DRIVER._leg_checkpoint, DRIVER.plan_legs):
+            tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+            called = {
+                node.func.id
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            } | {
+                node.func.attr
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            }
+            self.assertNotIn("stage_report", called)
+        leg = self._partial_leg()
+        original = DRIVER.stage_report
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("stage_report called on the resume path")
+
+        DRIVER.stage_report = forbidden
+        try:
+            state = DRIVER.build_resume_state(
+                leg, self.task, prompt_episode_id="ep_007", world=_StubWorld()
+            )
+            self.assertEqual(state["done"], [1])
+            DRIVER.plan_legs(
+                7, task=self.task, args=self._args(), prompt_episode_id="ep_007",
+                interrupt=("budget", 3.0), base_budget=8, base_turns=8,
+                resume_leg=leg, world=_StubWorld(), control=True,
+            )
+            DRIVER.plan_legs(
+                7, task=self.task, args=self._args(), prompt_episode_id="ep_007",
+                interrupt=("budget", 3.0), base_budget=8, base_turns=8,
+                resume_leg=leg, world=_StubWorld(),
+            )
+        finally:
+            DRIVER.stage_report = original
+
     def test_resume_leg_adopts_the_carried_plan_through_the_module(self):
         leg = self._partial_leg()
         state = DRIVER.build_resume_state(leg, self.task, prompt_episode_id="ep_007",
                                           world=_StubWorld())
         ctx = ToolContext(world=_StubWorld(), memory=None, episode_id="ep_007",
                           budget={"tool_calls_left": 8},
-                          extra={"plan": state["plan"],
+                          extra={"plan": state["resume_plan"],
                                  "instruction": state["instruction"]})
         adopted = task_module.resume_plan(ctx, "ep_007", state["instruction"])
         self.assertIsNotNone(adopted)
@@ -685,6 +976,10 @@ class ResumeTest(unittest.TestCase):
         self.assertEqual(task_module.plan_progress(ctx).split(":")[0].strip().split()[0],
                          adopted["plan_id"])
         self.assertIn("step 2/3", task_module.plan_progress(ctx))
+        # the statuses/evidence stay the checkpoint's own, not a re-derivation
+        self.assertEqual([item["status"] for item in adopted["subtasks"]],
+                         [task_module.SUBTASK_DONE, task_module.SUBTASK_ACTIVE,
+                          task_module.SUBTASK_PENDING])
 
     def test_resume_is_refused_for_another_instruction(self):
         leg = self._partial_leg()
@@ -744,18 +1039,26 @@ class ResumeTest(unittest.TestCase):
         for stage in self.task.stages:
             self.assertNotIn(json.dumps(list(stage.position)), text)
 
-    def test_brief_names_only_places_the_leg_reported(self):
-        places = [stage.position for stage in self.task.stages]
-        offset = (places[0][0] + 0.4, places[0][1], places[0][2])
-        leg = make_leg([complete_stage_entry(1, offset, "obs_1")],
-                       interrupted=True, reason="budget_exhausted")
+    def test_brief_names_only_places_in_the_checkpoint(self):
+        truth = self.task.stages[0].position
+        self.assertIsNotNone(truth)
+        offset = (truth[0] + 0.4, truth[1], truth[2])
+        plan = checkpoint_plan(self.task, ["done", "active", "pending"])
+        checkpoint = make_checkpoint(
+            plan=plan,
+            candidates={"cand_1": {"position_flu": list(offset), "status": "confirmed"}},
+            observations={"obs_1": {"position_flu": list(offset)}},
+        )
+        leg = make_leg([], interrupted=True, reason="budget_exhausted",
+                       checkpoint=checkpoint)
         state = DRIVER.build_resume_state(leg, self.task, prompt_episode_id="ep_007",
                                           world=_StubWorld())
         brief = state["brief"]
         self.assertIn("SESSION RESUME", brief)
         self.assertIn("(-0.60, 2.00, 0.50)", brief)
         self.assertNotIn("(-1.00, 2.00, 0.50)", brief)  # the ground truth never leaks
-        traced = DRIVER.reported_places(leg.entries)
+        # every place the brief names is one the checkpoint itself carries
+        traced = DRIVER.positions_in(checkpoint)
         for place in state["brief_places"]:
             self.assertTrue(
                 any(DRIVER._distance(place, candidate) < 1e-9 for candidate in traced),
@@ -775,10 +1078,12 @@ class ResumeTest(unittest.TestCase):
                                           world=_StubWorld())
         self.assertTrue(state["instruction"].startswith(leg.plan.instruction))
         self.assertIn("SESSION RESUME", state["instruction"])
-        # the record carries the module's own truncation of that instruction,
-        # which is the string resume_plan compares against
+        # the verbatim record keeps the interrupted leg's own instruction ...
+        self.assertEqual(state["plan"]["instruction"], leg.checkpoint["plan"]["instruction"])
+        # ... while the run copy carries the module's own truncation of the
+        # resumed instruction, the string resume_plan compares against
         limit = getattr(task_module, "MAX_INSTRUCTION_CHARS", 160)
-        self.assertEqual(state["plan"]["instruction"], state["instruction"][:limit])
+        self.assertEqual(state["resume_plan"]["instruction"], state["instruction"][:limit])
 
     def _args(self, *extra):
         return DRIVER.parse_args([
@@ -1106,32 +1411,50 @@ def _logit(p: float) -> float:
     return math.log(p / (1 - p))
 
 
-def _make_scene(path: Path, target=(2.0, 0.5, 0.0)) -> None:
+def _make_scene(path: Path, target=(2.0, 0.5, 0.0)):
+    """Tiny FLU scene; returns the FLU origin the world frame is shifted by.
+
+    ``CpuGaussianScene`` reads PLY vertices as absolute 3DGS coordinates and
+    puts the FLU origin at their centroid, so geometry authored in FLU has to
+    be rotated into the 3DGS frame and the world poses shifted by that centroid
+    (otherwise a rendered target and a FLU target are two different points).
+    """
+    points: list[np.ndarray] = []
+    rng = np.random.default_rng(0)
+    for _ in range(120):
+        point = rng.uniform(-6, 6, size=3)
+        point[2] = -1.5
+        points.append(point)
+    for offset in ((0.0, 0.0, 0.0), (0.15, 0.1, 0.0), (0.0, 0.2, 0.1)):
+        points.append(np.asarray(target, dtype=np.float64) + np.asarray(offset))
+    origin = np.mean(points, axis=0)
     header = "\n".join([
-        "ply", "format binary_little_endian 1.0", "element vertex 123",
+        "ply", "format binary_little_endian 1.0",
+        f"element vertex {len(points)}",
         "property float x", "property float y", "property float z",
         "property float f_dc_0", "property float f_dc_1", "property float f_dc_2",
         "property float opacity", "property float scale_0", "property float scale_1",
         "property float scale_2", "property float rot_0", "property float rot_1",
         "property float rot_2", "property float rot_3", "end_header",
     ])
-    rng = np.random.default_rng(0)
     rows = []
-    for _ in range(120):
-        point = rng.uniform(-6, 6, size=3)
-        point[2] = -1.5
-        rows.append(list(point) + [0.0, 0.0, 0.0, _logit(0.8)]
-                    + [math.log(0.2), math.log(0.2), math.log(0.05)]
-                    + [1.0, 0.0, 0.0, 0.0])
-    for offset in ((0.0, 0.0, 0.0), (0.15, 0.1, 0.0), (0.0, 0.2, 0.1)):
-        point = np.asarray(target) + np.asarray(offset)
-        rows.append(list(point) + [2.0, -1.0, -1.0, _logit(0.9)]
-                    + [math.log(0.25), math.log(0.25), math.log(0.25)]
-                    + [1.0, 0.0, 0.0, 0.0])
+    for index, point in enumerate(points):
+        local = np.asarray(point, dtype=np.float64) - origin
+        # FLU -> the 3DGS frame CpuGaussianScene renders in
+        x, y, z = float(-local[1]), float(local[2]), float(-local[0])
+        if index < 120:
+            sh, opacity = (0.0, 0.0, 0.0), _logit(0.8)
+            scale = math.log(0.2)
+        else:
+            sh, opacity = (2.0, -1.0, -1.0), _logit(0.9)
+            scale = math.log(0.25)
+        rows.append([x, y, z, *sh, opacity, scale, scale, scale,
+                     1.0, 0.0, 0.0, 0.0])
     with open(path, "wb") as handle:
         handle.write((header + "\n").encode("ascii"))
         for row in rows:
             handle.write(struct.pack("<14f", *row))
+    return origin
 
 
 TARGET = (2.0, 0.5, 0.0)
@@ -1158,20 +1481,25 @@ E2E_MOCK_SCRIPT = [
                                        "reason": "locate the landmark"}},
     {"tool": "approach_candidate", "args": {"candidate_id": "$candidate_id",
                                             "standoff_m": 1.0}},
-    {"tool": "verify_goal", "args": {"reason": "confirm the landmark"}},
+    # version 2: every movement stage needs the accepted identity, not only the
+    # terminal one (a reached candidate is not yet a confirmed instance)
+    {"tool": "confirm_candidate", "args": {"candidate_id": "$candidate_id"}},
+    {"tool": "observe", "args": {"mode": "forward", "reason": "look at stage 2"}},
     {"tool": "ground_target", "args": {"observation_id": "$observation_id",
                                        "instruction": "$target_name",
                                        "reason": "locate the object of stage 2"}},
     {"tool": "approach_candidate", "args": {"candidate_id": "$candidate_id",
                                             "standoff_m": 1.5}},
-    {"tool": "verify_goal", "args": {"reason": "confirm the object"}},
+    {"tool": "confirm_candidate", "args": {"candidate_id": "$candidate_id"}},
+    {"tool": "observe", "args": {"mode": "forward", "reason": "look at stage 3"}},
     {"tool": "ground_target", "args": {"observation_id": "$observation_id",
                                        "instruction": "$target_name",
                                        "reason": "locate the target of stage 3"}},
     {"tool": "approach_candidate", "args": {"candidate_id": "$candidate_id",
-                                            "standoff_m": 1.2}},
-    {"tool": "verify_goal", "args": {"reason": "confirm the target"}},
-    {"tool": "finish", "args": {"reason": "target reached and verified", "success": True}},
+                                            "standoff_m": 1.0}},
+    {"tool": "confirm_candidate", "args": {"candidate_id": "$candidate_id"}},
+    {"tool": "verify_goal", "args": {"reason": "the reached instance is verified"}},
+    {"tool": "finish", "args": {"reason": "target reached and confirmed", "success": True}},
 ]
 
 
@@ -1185,8 +1513,8 @@ class EndToEndTest(unittest.TestCase):
             "--ply", str(scene),
             "--backend", "mock",
             "--mock-script", str(script),
-            "--tool-budget", "16",
-            "--max-turns", "16",
+            "--tool-budget", "20",
+            "--max-turns", "20",
             *extra,
         ]
         env = dict(os.environ)
@@ -1196,7 +1524,15 @@ class EndToEndTest(unittest.TestCase):
 
     def _fixtures(self, directory: Path):
         scene = directory / "scene.ply"
-        _make_scene(scene)
+        origin = _make_scene(scene)
+        # the world's FLU frame is the authored one shifted by the scene origin
+        def shift(point):
+            return [float(v) for v in (np.asarray(point, dtype=np.float64) - origin)]
+
+        stages = [
+            {**stage, "position_flu": shift(stage["position_flu"])}
+            for stage in E2E_STAGES
+        ]
         task_file = directory / "task.json"
         task_file.write_text(json.dumps({
             "name": "e2e_chain",
@@ -1204,12 +1540,12 @@ class EndToEndTest(unittest.TestCase):
             "scene": {
                 "world": "cpu",
                 "target_name": "target",
-                "target_pos": list(TARGET),
+                "target_pos": shift(TARGET),
                 "target_radius": 0.5,
-                "start_pos": [-3.0, 0.0, 1.0],
+                "start_pos": shift([-3.0, 0.0, 1.0]),
                 "success_dist": 1.5,
             },
-            "stages": E2E_STAGES,
+            "stages": stages,
         }))
         script = directory / "mock_script.json"
         script.write_text(json.dumps(E2E_MOCK_SCRIPT))
@@ -1284,6 +1620,13 @@ class EndToEndTest(unittest.TestCase):
             self.assertEqual(resume_leg["carry"]["mode"], "resume")
             self.assertEqual(resume_leg["carry"]["done"], [])
             self.assertIn("SESSION RESUME", resume_leg["plan"]["instruction"])
+            # version 3 wiring: the interrupted leg wrote its runtime checkpoint
+            # and the offline report scored it against the scene
+            self.assertTrue(
+                (out_dir / "seed7" / "seed7_leg1" / "checkpoint.json").exists()
+            )
+            self.assertTrue(budget_row["checkpoint"]["available"])
+            self.assertIn("plan", budget_row["checkpoint"]["fields"])
             restart_leg = next(leg for leg in budget_row["legs"]
                                if leg["label"] == "seed7_leg2_restart")
             self.assertEqual(restart_leg["carry"]["mode"], "restart")
@@ -1309,6 +1652,9 @@ class EndToEndTest(unittest.TestCase):
             self.assertTrue(checks["carry_plan_steps"]["match_task"])
 
             aggregate = report["aggregate"]
+            self.assertGreaterEqual(
+                aggregate["checkpoint_correctness"]["episodes"], 1
+            )
             self.assertEqual(aggregate["interrupt"]["n_episodes"], 2)
             self.assertEqual(aggregate["interrupt"]["recovered"], 2, diagnostics)
             self.assertEqual(aggregate["interrupt"]["recovery_rate"], 1.0)
@@ -1498,6 +1844,82 @@ class AnalyzeRunTest(unittest.TestCase):
         self.assertEqual(metrics["decision_nodes"], 1)
         self.assertEqual(metrics["n_plan_transitions"], 1)
 
+    def test_load_leg_restores_the_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg_dir = Path(tmp) / "seed7_leg1"
+            leg_dir.mkdir(parents=True)
+            (leg_dir / "ledger.jsonl").write_text("")
+            (leg_dir / "run_config.json").write_text(json.dumps({
+                "leg": {"label": "seed7_leg1", "instruction": "do it",
+                        "prompt_episode_id": "ep_007", "tool_budget": 8, "max_turns": 8,
+                        "role": "fresh", "carry": {}},
+            }))
+            plan = {"plan_id": "plan_1", "subtasks": [
+                {"id": "st_1", "status": "done"},
+                {"id": "st_2", "status": "pending"},
+                {"id": "st_3", "status": "pending"},
+            ]}
+            checkpoint = {
+                "version": 3, "source": "runtime.ctx.extra",
+                "source_leg": "seed7_leg1",
+                "pose": {"position_flu": [0.0, 0.0, 1.0], "yaw_rad": 0.0},
+                "plan": plan, "confirmation_ledger": {}, "candidates": {},
+                "observations": {}, "viewpoints_by_id": {}, "hypotheses": {},
+                "task_scope": {}, "beliefs": {}, "open_questions": None,
+                "evidence_pack": {}, "last_observation_id": "",
+            }
+            (leg_dir / "checkpoint.json").write_text(json.dumps(checkpoint))
+            leg = DRIVER.load_leg(leg_dir)
+        self.assertIsNotNone(leg)
+        self.assertEqual(leg.checkpoint, checkpoint)
+        self.assertEqual(leg.final_plan, plan)
+
+    def test_analyze_run_scores_the_checkpoint(self):
+        """Re-analysis must load ``checkpoint.json`` and score it, not 0/0."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            task = make_task(run_dir)
+            (run_dir / "task.json").write_text(json.dumps({
+                "name": task.name, "instruction": task.instruction,
+                "scene": task.scene, "stages": [stage.to_dict() for stage in task.stages],
+            }))
+            leg_dir = run_dir / "seed7" / "seed7_leg1"
+            leg_dir.mkdir(parents=True)
+            (leg_dir / "ledger.jsonl").write_text("")
+            (leg_dir / "run_config.json").write_text(json.dumps({
+                "leg": {"label": "seed7_leg1", "instruction": task.instruction,
+                        "prompt_episode_id": "ep_007", "tool_budget": 8, "max_turns": 8,
+                        "role": "fresh", "carry": {}},
+            }))
+            (leg_dir / "leg_summary.json").write_text(json.dumps({
+                "interrupted": True, "interrupt_reason": "budget_exhausted",
+                "executor": {"legs": 0, "ticks": 0}, "vlm_calls_wrapper": 1,
+                "wall_time_s": 1.0, "start_pose": [0.0, 0.0, 1.0],
+            }))
+            plan = {"plan_id": "plan_1", "subtasks": [
+                {"id": "st_1", "status": "done"},
+                {"id": "st_2", "status": "pending"},
+                {"id": "st_3", "status": "pending"},
+            ]}
+            checkpoint = {
+                "version": 3, "source": "runtime.ctx.extra",
+                "source_leg": "seed7_leg1",
+                "pose": {"position_flu": [0.0, 0.0, 1.0], "yaw_rad": 0.0},
+                "plan": plan, "confirmation_ledger": {}, "candidates": {},
+                "observations": {}, "viewpoints_by_id": {}, "hypotheses": {},
+                "task_scope": {}, "beliefs": {}, "open_questions": None,
+                "evidence_pack": {}, "last_observation_id": "",
+            }
+            (leg_dir / "checkpoint.json").write_text(json.dumps(checkpoint))
+            report = DRIVER.analyze_run(run_dir, write=False)
+        episode = report["episodes"][0]
+        self.assertTrue(episode["checkpoint"]["available"])
+        self.assertEqual(episode["checkpoint"]["wrong_done"], ["st_1"])
+        self.assertEqual(report["aggregate"]["checkpoint_correctness"]["episodes"], 1)
+        self.assertEqual(
+            report["aggregate"]["checkpoint_correctness"]["wrong_done_beliefs"], 1
+        )
+
     def test_analyze_run_rebuilds_the_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
@@ -1596,17 +2018,152 @@ class ScopeContractTest(unittest.TestCase):
 
     def test_scoped_stage_report_counts_the_subtask_own_call(self):
         entries = [
-            scoped_entry(1, "ground_target", subtask="st_2",
-                         data={"candidates": [{"position_flu": list(self.places[1])}]},
+            scoped_entry(1, "ground_target", subtask="st_2", candidate="cand_1",
+                         revision=1,
+                         data={"candidate_id": "cand_1",
+                               "position_flu": list(self.places[1])},
                          pose=list(self.places[1]), evidence=[ref("observation", "obs_2")]),
+            scoped_entry(2, "confirm_candidate", subtask="st_2", candidate="cand_1",
+                         revision=1,
+                         data={"candidate_id": "cand_1", "verdict": "accepted"},
+                         evidence=[ref("observation", "obs_9")]),
         ]
         report = DRIVER.stage_report(
             entries, self.task, subtask_map=self.mapping, scoped=True
         )
         self.assertTrue(report["stages"]["object"]["located"])
         self.assertTrue(report["stages"]["object"]["reach"])
+        self.assertTrue(report["stages"]["object"]["confirmed"])
         self.assertTrue(report["stages"]["object"]["complete"])
         self.assertFalse(report["stages"]["landmark"]["complete"])
+
+    def test_a_scoped_stage_without_a_confirmation_is_not_identity_complete(self):
+        """Reach + locate is only the version-1 half: identity needs a confirm."""
+        entries = [
+            scoped_entry(1, "ground_target", subtask="st_2", candidate="cand_1",
+                         revision=1,
+                         data={"candidate_id": "cand_1",
+                               "position_flu": list(self.places[1])},
+                         pose=list(self.places[1]), evidence=[ref("observation", "obs_2")]),
+        ]
+        report = DRIVER.stage_report(
+            entries, self.task, subtask_map=self.mapping, scoped=True
+        )
+        row = report["stages"]["object"]
+        self.assertTrue(row["reach"])
+        self.assertTrue(row["located"])
+        self.assertIs(row["confirmation_required"], True)
+        self.assertIs(row["confirmed"], False)
+        self.assertIs(row["complete"], False)
+        self.assertEqual(report["identity_complete_count"], 0)
+
+    def test_a_stale_confirmation_does_not_complete_the_stage(self):
+        """A confirmation of the previous candidate/revision is not identity."""
+        far = [self.places[1][0] + 4.0, self.places[1][1], self.places[1][2]]
+        entries = [
+            scoped_entry(1, "ground_target", subtask="st_2", candidate="cand_1",
+                         revision=1,
+                         data={"candidate_id": "cand_1",
+                               "position_flu": list(self.places[1])},
+                         pose=list(self.places[1]), evidence=[ref("observation", "obs_2")]),
+            scoped_entry(2, "confirm_candidate", subtask="st_2", candidate="cand_1",
+                         revision=1,
+                         data={"candidate_id": "cand_1", "verdict": "accepted"},
+                         evidence=[ref("observation", "obs_9")]),
+            scoped_entry(3, "ground_target", subtask="st_2", candidate="cand_2",
+                         revision=2,
+                         data={"candidate_id": "cand_2", "position_flu": far},
+                         pose=list(self.places[1]), evidence=[ref("observation", "obs_10")]),
+        ]
+        report = DRIVER.stage_report(
+            entries, self.task, subtask_map=self.mapping, scoped=True
+        )
+        row = report["stages"]["object"]
+        self.assertIs(row["confirmed"], False)
+        self.assertIs(row["complete"], False)
+        self.assertEqual(row["confirmation_inherited_from"], [])
+
+    def test_a_nearby_new_candidate_inherits_the_confirmation(self):
+        """A re-grounding 0.4 m from the confirmed candidate is the same
+        instance: the acceptance is inherited instead of being made stale."""
+        nearby = [self.places[1][0] + 0.4, self.places[1][1], self.places[1][2]]
+        entries = [
+            scoped_entry(1, "ground_target", subtask="st_2", candidate="cand_1",
+                         revision=1,
+                         data={"candidate_id": "cand_1",
+                               "position_flu": list(self.places[1])},
+                         pose=list(self.places[1]), evidence=[ref("observation", "obs_2")]),
+            scoped_entry(2, "confirm_candidate", subtask="st_2", candidate="cand_1",
+                         revision=1,
+                         data={"candidate_id": "cand_1", "verdict": "accepted"},
+                         evidence=[ref("observation", "obs_9")]),
+            scoped_entry(3, "ground_target", subtask="st_2", candidate="cand_2",
+                         revision=2,
+                         data={"candidate_id": "cand_2", "position_flu": nearby},
+                         pose=list(self.places[1]), evidence=[ref("observation", "obs_10")]),
+        ]
+        report = DRIVER.stage_report(
+            entries, self.task, subtask_map=self.mapping, scoped=True
+        )
+        row = report["stages"]["object"]
+        self.assertIs(row["confirmed"], True)
+        self.assertIs(row["identity_complete"], True)
+        self.assertIs(row["complete"], True)
+        self.assertEqual(row["confirmation_inherited_from"], ["cand_1"])
+
+    def test_reach_accepts_the_candidate_standoff_shell(self):
+        """The stage centre can stay outside ``reach_m`` while the arrival is on
+        the confirmed candidate's standoff shell: that is a reach, recorded
+        with its own basis."""
+        candidate = [self.places[1][0] + 0.59, self.places[1][1], self.places[1][2]]
+        pose = [candidate[0] + 1.2, candidate[1], candidate[2]]
+        entries = [
+            scoped_entry(1, "ground_target", subtask="st_2", candidate="cand_1",
+                         revision=1,
+                         data={"candidate_id": "cand_1", "position_flu": candidate},
+                         pose=list(self.places[1]), evidence=[ref("observation", "obs_2")]),
+            scoped_entry(2, "approach_candidate", subtask="st_2", candidate="cand_1",
+                         revision=1,
+                         data={"candidate_id": "cand_1", "outcome": "arrived",
+                               "standoff_m": 1.2},
+                         pose=pose, evidence=[ref("observation", "obs_3")]),
+        ]
+        report = DRIVER.stage_report(
+            entries, self.task, subtask_map=self.mapping, scoped=True
+        )
+        row = report["stages"]["object"]
+        # the stage centre is 1.79 m away, outside reach_m=1.5; the arrival is
+        # on the candidate's 1.2 m shell, which is a reach on its own
+        self.assertGreater(
+            DRIVER._distance(pose, list(self.places[1])), row["reach_m"]
+        )
+        self.assertTrue(row["reach"])
+        self.assertEqual(row["reach_basis"], "candidate")
+        self.assertAlmostEqual(row["reach_distance_m"], 1.2, places=6)
+        self.assertAlmostEqual(row["reach_candidate_distance_m"], 1.2, places=6)
+        self.assertAlmostEqual(row["reach_standoff_m"], 1.2, places=6)
+
+    def test_a_wrong_instance_confirmation_is_not_identity_complete(self):
+        """An accepted instance 3 m from the stage place is not this stage's object."""
+        wrong = [self.places[1][0] + 3.0, self.places[1][1], self.places[1][2]]
+        entries = [
+            scoped_entry(1, "ground_target", subtask="st_2", candidate="cand_1",
+                         revision=1,
+                         data={"candidate_id": "cand_1", "position_flu": wrong},
+                         pose=list(self.places[1]), evidence=[ref("observation", "obs_2")]),
+            scoped_entry(2, "confirm_candidate", subtask="st_2", candidate="cand_1",
+                         revision=1,
+                         data={"candidate_id": "cand_1", "verdict": "accepted"},
+                         evidence=[ref("observation", "obs_9")]),
+        ]
+        report = DRIVER.stage_report(
+            entries, self.task, subtask_map=self.mapping, scoped=True
+        )
+        row = report["stages"]["object"]
+        self.assertIs(row["confirmed"], True)
+        self.assertIs(row["confirmation_correct"], False)
+        self.assertIs(row["identity_complete"], False)
+        self.assertIs(row["complete"], False)
 
     def test_scoped_completion_rejects_a_stale_candidate_confirmation(self):
         target = self.places[2]
@@ -1630,13 +2187,22 @@ class ScopeContractTest(unittest.TestCase):
         self.assertFalse(verdict["verified"])
         self.assertTrue(verdict["scoped"])
         self.assertGreaterEqual(verdict["rejected_records"], 1)
-        # the current candidate's arrival closes the scoped chain
+        # the current candidate's arrival plus its accepted confirmation closes
+        # the scoped chain (version 2: arrival alone shares the grounding place)
         entries.append(
             scoped_entry(4, "approach_candidate", subtask="st_3",
                          candidate="cand_2", revision=2,
                          data={"candidate_id": "cand_2", "outcome": "arrived",
                                "target_position": list(target)},
                          evidence=[ref("memory", "cand_2")])
+        )
+        without = DRIVER.completion_chain(entries)
+        self.assertFalse(without["verified"])
+        entries.append(
+            scoped_entry(5, "confirm_candidate", subtask="st_3",
+                         candidate="cand_2", revision=2,
+                         data={"candidate_id": "cand_2", "verdict": "accepted"},
+                         evidence=[ref("observation", "obs_9")])
         )
         verdict = DRIVER.completion_chain(entries)
         self.assertTrue(verdict["verified"])
@@ -1779,18 +2345,25 @@ class ScopeContractTest(unittest.TestCase):
         finish["args"] = {"success": True}
         bad = make_leg([first, finish], summary={"success": False,
                                                  "finish_reason": "max_turns"})
-        good_entries = [
-            scoped_entry(i + 1, "ground_target", subtask=f"st_{i + 1}",
-                         data={"candidates": [{"position_flu": list(place)}]},
-                         pose=list(place), evidence=[ref("observation", f"obs_{i + 1}")])
-            for i, place in enumerate(self.places)
-        ]
-        good_entries.append(
-            scoped_entry(9, "verify_goal", subtask="st_3",
-                         data={"verified": True},
-                         pose=list(self.places[2]),
-                         evidence=[ref("observation", "obs_9")])
-        )
+        good_entries = []
+        for i, place in enumerate(self.places):
+            candidate = f"cand_{i + 1}"
+            subtask = f"st_{i + 1}"
+            good_entries.append(
+                scoped_entry(2 * i + 1, "ground_target", subtask=subtask,
+                             candidate=candidate, revision=i + 1,
+                             data={"candidate_id": candidate,
+                                   "position_flu": list(place)},
+                             pose=list(place),
+                             evidence=[ref("observation", f"obs_{i + 1}")])
+            )
+            good_entries.append(
+                scoped_entry(2 * i + 2, "confirm_candidate", subtask=subtask,
+                             candidate=candidate, revision=i + 1,
+                             data={"candidate_id": candidate, "verdict": "accepted"},
+                             pose=list(place),
+                             evidence=[ref("observation", f"obs_c{i + 1}")])
+            )
         good = make_leg(good_entries,
                         summary={"success": True, "finish_reason": "finish"})
         episodes = [

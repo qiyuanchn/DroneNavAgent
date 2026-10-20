@@ -30,6 +30,7 @@ from vlm_nav.tools import ToolContext, ToolRegistry
 from vlm_nav.vlm import MockVLM
 from vlm_nav.world import (
     EnvWorld,
+    PoseState,
     SplatWorldCPU,
     SplatWorldHiGS,
     SuperPlannerWorld,
@@ -892,6 +893,64 @@ class SplatWorldDepthTest(unittest.TestCase):
     def test_depth_at_pixel_is_none_where_nothing_is_visible(self):
         world = self._world()
         self.assertIsNone(world.depth_at_pixel((40.0, 40.0)))  # empty sky corner
+
+    def test_env_world_serves_depth_from_its_activated_gaussians(self):
+        """``EnvWorld`` had no depth hook at all (the v7 0/16 position checks)."""
+        from types import SimpleNamespace
+
+        from diffaero.utils.gaussian_splatting.runtime import GaussianModelLite
+
+        model = GaussianModelLite(self.ply, device=torch.device("cpu"))
+        world = EnvWorld.__new__(EnvWorld)
+        world.state = PoseState(
+            np.asarray(self.start_flu, dtype=np.float64), 0.0
+        )
+        world.env = SimpleNamespace(gaussians=model)
+        world.hfov_deg, world.width, world.height = 86.0, 320, 180
+
+        depth = world.depth_at_pixel((500.0, 500.0))
+        self.assertIsNotNone(depth)
+        self.assertAlmostEqual(depth, 3.0, delta=0.2)
+        self.assertEqual(tuple(world.depth_map().shape), (180, 320))
+
+    def test_a_pitched_camera_reads_a_target_above_the_level_frame(self):
+        """The v8 seed7/seed17 geometry: an elevated centre is out of a level frame.
+
+        The position check used to project such a candidate into the level
+        camera and give up (``target_out_of_view``). A camera pitched nose-up at
+        the candidate's elevation has to read its depth, and the pitch has to be
+        part of the depth cache key.
+        """
+        import tempfile
+
+        center = np.asarray((3.0, 0.0, 2.0))
+        with tempfile.TemporaryDirectory() as tmp:
+            ply = f"{tmp}/above.ply"
+            origin = _write_flu_ply(ply, [
+                (tuple(center + np.asarray(offset)),
+                 (2.0, -1.0, -1.0), _logit(0.9), (math.log(0.15),) * 3,
+                 (1.0, 0.0, 0.0, 0.0))
+                for offset in ((0.0, 0.0, 0.0), (0.05, 0.03, 0.02), (-0.03, -0.04, 0.03))
+            ])
+            world = SplatWorldCPU(
+                ply_path=ply,
+                target=TargetSpec(
+                    name="target", position_flu=tuple(center - origin), radius_m=0.2
+                ),
+                start_flu=tuple(-np.asarray(origin)),
+                start_yaw_deg=0.0,
+                bound_radius=20.0,
+            )
+
+            elevation = math.degrees(math.atan2(2.0, 3.0))
+            self.assertIsNone(world.depth_at_pixel((500.0, 500.0)))  # level: empty sky
+            depth = world.depth_at_pixel(
+                (500.0, 500.0), pitch_rad=math.radians(-elevation)
+            )
+            self.assertIsNotNone(depth, "a nose-up camera must hold the candidate")
+            self.assertAlmostEqual(depth, math.hypot(3.0, 2.0), delta=0.15)
+            # the read really is pitched: the level camera still cannot see it
+            self.assertIsNone(world.depth_at_pixel((500.0, 500.0)))
 
     def test_the_depth_frame_follows_the_pose(self):
         world = self._world()

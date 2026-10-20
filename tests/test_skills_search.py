@@ -1071,5 +1071,36 @@ class SearchCompareViewsTest(unittest.TestCase):
         self.assertGreaterEqual(skills_search.DEFAULT_COMPARE_VIEWS, 2)
 
 
+class GroundingConfirmationTest(unittest.TestCase):
+    """search_target may only call a candidate confirmed when its range is sane."""
+
+    def test_a_distance_uncertain_candidate_is_not_reported_confirmed(self):
+        candidate = {"confidence": 0.9, "distance_uncertain": True}
+        self.assertFalse(
+            skills_search._grounding_confirmed(candidate, 0.9, 0.5)
+        )
+
+    def test_a_conflicted_distance_source_is_not_reported_confirmed(self):
+        candidate = {"confidence": 0.9, "distance_source": "conflict"}
+        self.assertFalse(
+            skills_search._grounding_confirmed(candidate, 0.9, 0.5)
+        )
+
+    def test_a_sane_high_confidence_candidate_is_confirmed(self):
+        candidate = {"confidence": 0.9, "distance_source": "depth_consistent"}
+        self.assertTrue(
+            skills_search._grounding_confirmed(candidate, 0.9, 0.5)
+        )
+
+    def test_the_candidate_summary_carries_the_distance_fields(self):
+        summary = skills_search._candidate_summary(
+            {"id": "cand_1", "distance_source": "conflict",
+             "distance_uncertain": True, "distance_conflict": {"resolved": False}}
+        )
+        self.assertEqual(summary["distance_source"], "conflict")
+        self.assertTrue(summary["distance_uncertain"])
+        self.assertEqual(summary["distance_conflict"], {"resolved": False})
+
+
 if __name__ == "__main__":
     unittest.main()

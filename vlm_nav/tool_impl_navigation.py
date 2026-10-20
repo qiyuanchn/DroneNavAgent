@@ -27,25 +27,40 @@ can never be confused with "go to the object in that frame":
   in between returns ``cached`` plus a hint instead of the same payload again.
 - ``cancel_task``: interrupt a running task (``status=cancelled``); a task that
   is already terminal reports ``cached``.
-- ``verify_goal``: independent completion check against ``world.target`` using
-  ``world.depth_at_pixel`` / ``estimate_point_world``. The distance check is
-  taken against the *caller's* gate when the context carries one
-  (``ctx.extra["done_dist"]``: what the runner judges the episode with, i.e.
-  ``--success-dist`` measured from the target surface, plus the target radius);
-  its own ``max(1.5, radius + 0.5)`` default only fills the gap. The effective
-  limit is reported in ``checks.distance_limit_m``. This is the one tool that
-  may read ``world.target`` - and its answer reports only its own checks (FOV,
-  the gate, the measured point, the recalled pose). The goal's true pose is
-  never part of the return or of its evidence refs: the completion check must
-  not become the shortcut past the visual evidence the episode is testing.
+- ``confirm_candidate``: version-2 identity confirmation. It approaches the
+  candidate to inspection distance, captures *new* views (different heading /
+  pose), asks the model once per independent view whether the target matches the
+  candidate's attributes and the *whole* relation anchor, re-measures the
+  candidate on each fresh frame, and returns ``accepted`` / ``uncertain`` (with
+  ``missing=distance|identity|relation|path|localization`` and a directed next
+  step) / ``rejected`` (the candidate is marked rejected and is no longer
+  approached or counted by ``finish``). Acceptance requires every independent
+  view to support and the fresh measurement to agree; a candidate confirmed
+  repeatedly without a new acceptance returns ``blocked(confirm_stalled)`` with
+  a different next action. Re-using the same image never increases the
+  confirmation count.
+- ``verify_goal``: version-3 self-state completion check. It reads no scene
+  ground truth - no ``world.target``, no ``distance_to_target`` and no
+  ``target_in_fov``. A pointed pixel is measured through ``world.depth_at_pixel``
+  / ``estimate_point_world``; the distance the verdict uses is a *measured*
+  one (``checks.measured_distance_m`` with ``distance_source`` = ``depth`` or
+  ``dead_reckoning`` over the agent's own candidate/observation pose). The
+  identity half is reported as ``checks.identity_status`` (``accepted`` /
+  ``uncertain`` / ``rejected`` / ``unconfirmed`` / ``stale`` plus the
+  ``evidence_revision``) from the episode's own confirmation ledger, and
+  ``checks.plan_completion`` / ``checks.arrival`` come from the agent's plan
+  and evidence pack. ``checks.distance_limit_m`` is the tolerance the agent
+  declared (``ctx.extra["done_dist"]`` or ``success_dist_m``), never a target
+  distance. Ground truth is scored offline only.
 - ``finish``: end the episode with an explicit outcome. The claim is judged on
   the episode's *evidence pack* (``ctx.extra["evidence_pack"]``, written by this
-  module's ``verify_goal``/arrivals and, for candidate identity, by the arrival
-  of an approach): ``"success": true`` without a passing verification or a
-  grounded candidate plus an arrival comes back ``success: false`` with
+  module's ``verify_goal``/arrivals and, for candidate identity, by
+  ``confirm_candidate``): ``"success": true`` without a passing verification or
+  a grounded candidate plus an arrival *and* an accepted confirmation of that
+  instance under the current revision comes back ``success: false`` with
   ``claim=unverified`` and the list of what is missing, so the runtime's verdict
-  follows the trail instead of the model's word (goal.md P4). ``"success":
-  false`` is the honest give-up and a bare finish claims nothing.
+  follows the trail instead of the model's word (goal.md P4/version 2).
+  ``"success": false`` is the honest give-up and a bare finish claims nothing.
 - ``batch_read``: one call that runs several *read-only* checks (observe +
   query_memory, a compare and an inspect) and returns their merged results. A
   pose-changing tool is refused inside a batch - movement stays serial, one leg
@@ -88,10 +103,10 @@ Each segment appends structured events to ``ctx.extra["events"]`` - the channel
 ``AgentRuntime`` drains after every tool call and re-emits through its
 ``on_event`` hooks, so an event wakes the model loop: ``arrived``,
 ``path_blocked`` (blocked leg or blocked pre-check), ``map_changed`` (the
-observed map grew significantly), ``target_rediscovered`` (a False -> True
-target-in-FOV transition, reported without target geometry - ``verify_goal``
-stays the only tool that reads the goal's pose), ``task_failed`` (timeout /
-segment budget / world error) and ``task_cancelled``. An event record is flat
+observed map grew significantly), ``task_failed`` (timeout / segment budget /
+world error) and ``task_cancelled``. There is no target-rediscovery event:
+whether the goal is visible is ground truth, so it is not part of the agent's
+event channel either. An event record is flat
 (``{seq, event, task_id, status, progress_m, remaining_m, reason, ...}``) and is
 mirrored as ``{"name": ..., "data": {...}}`` for the runtime drain; every event
 is kept on its task record and in the bounded ``ctx.extra["nav_events"]`` log.
@@ -103,7 +118,7 @@ Task bookkeeping lives in ``ctx.extra``:
 - ``nav_tasks``: ``nav_N`` -> full task record (status, reason, intent, target,
   target key, progress/remaining/moved, segments, ``max_segments``,
   ``timeout_s`` / ``deadline``, ``map_points`` / ``map_version``,
-  ``target_in_fov``, events, candidate viewpoints, query bookkeeping, last
+  events, candidate viewpoints, query bookkeeping, last
   result for cached replays)
 - ``nav_events``: bounded, sequence-ordered log of every navigation event
 - ``events``: the runtime-drained event queue (see above)
@@ -148,7 +163,7 @@ step that is a *different* call from the failing one.
 
 Evidence refs are symbolic and stable (``map:sense_points``,
 ``trajectory:trajectory``, ``memory:vp_N``, ``observation:obs_N``,
-``map:goal_check``, ``trajectory:nav_N`` for a task); the runtime resolves them
+``map:self_state_check:<revision>``, ``trajectory:nav_N`` for a task); the runtime resolves them
 to real frames/resources. No ref names the goal's true pose: a citation the
 model can read is a place it could fly to, and the goal is exactly what its own
 sensors have to establish.
@@ -158,11 +173,12 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
 from . import skills_approach
+from .skills_confirm import register_confirm_tools
 from .actions import MAX_WAYPOINT_TRANSLATE_M, MAX_WAYPOINT_YAW_DEG, NavAction
 from .observations import (
     IdTypeError,
@@ -178,7 +194,10 @@ from .tool_impl_perception import (
     resolve_observation_pose,
 )
 from .tools import (
+    ARRIVAL_OUTCOMES,
+    CONFIRMATION_ACCEPTED,
     FINISH_SCHEMA,
+    MISSING_CONFIRMATION,
     MISSING_PLAN_COMPLETE,
     MISSING_SCOPE_MISMATCH,
     MISSING_STALE_CONFIRMATION,
@@ -633,6 +652,13 @@ def _candidate_entries(ctx: ToolContext) -> list:
     return entries
 
 
+def _candidate_status(entry: Any) -> str:
+    """Status of a candidate record (dict or a duck-typed tracker object)."""
+    if isinstance(entry, dict):
+        return str(entry.get("status") or "")
+    return str(getattr(entry, "status", "") or "")
+
+
 def _candidate_ids(ctx: ToolContext, limit: int = 8) -> tuple[list[str], list[str]]:
     """(ids that resolve to a world position, ids that do not).
 
@@ -650,6 +676,8 @@ def _candidate_ids(ctx: ToolContext, limit: int = 8) -> tuple[list[str], list[st
         key = _entry_id(entry)
         if key is None or key in resolved or key in unresolved:
             continue
+        if _candidate_status(entry) == "rejected":
+            continue  # a rejected candidate is not offered for another approach
         (resolved if _entry_position(entry) is not None else unresolved).append(key)
     return resolved[-limit:], unresolved[-limit:]
 
@@ -675,6 +703,8 @@ def _candidate_position(ctx: ToolContext, candidate_id: Any) -> np.ndarray | Non
     for entry in _candidate_entries(ctx):
         if _entry_id(entry) != key:
             continue
+        if _candidate_status(entry) == "rejected":
+            return None  # a rejected instance resolves nowhere, tracker or store
         pos = _entry_position(entry)
         if pos is not None:
             return pos
@@ -1127,43 +1157,70 @@ def _envelope_z(world: Any, z: float) -> float:
     return float(z)
 
 
-def _viewpoint_altitude(world: Any, pos: Any) -> float:
-    """Altitude of a proposed viewpoint (world FLU).
+def _viewpoint_altitude(
+    world: Any, pos: Any, hypothesis: Any = None
+) -> tuple[float, str]:
+    """Altitude of a proposed viewpoint (world FLU) and where it came from.
 
-    The near/far ring sits within the target's own height band
-    (``obj_top + 0.3``) clipped into the low cruise window, or at the drone's
-    current altitude clipped into that window when no target box is known - so a
-    viewpoint is never proposed above the no-fly ceiling and the ring no longer
-    inherits a start altitude sampled over the object. With neither a target box
-    nor a known floor the altitude is left alone.
+    A ring aimed at a *candidate* follows that candidate's own measured height
+    (the ``hypothesis`` z itself). It is deliberately not clipped into the
+    floor-relative cruise window: in a multi-level scene the global navigable
+    minimum can be a storey below the candidate, so clipping there would
+    propose viewpoints the target can never be seen from. Only the world's
+    declared flight envelope caps it.
+
+    Without a candidate the semantic target's box is the initial-cruise anchor
+    (``obj_top + 0.3``) clipped into the low cruise window measured from the
+    *target's own* support height (``bbox bottom``) - the local floor of that
+    object - falling back to the global floor when no box is declared. With
+    neither a target box nor a known floor the altitude is left alone.
     """
+    point = _as_position(hypothesis)
+    if point is not None:
+        return _envelope_z(world, float(point[2])), "candidate_position"
     z = float(np.asarray(pos, dtype=np.float64).reshape(3)[2])
     box = _target_bbox_z(world)
     if box is not None:
         z = float(box[1]) + VIEWPOINT_LOOK_DOWN_M
-    window = _cruise_window(world, _floor_z(world))
+        floor = float(box[0])
+        source = "semantic_target_bbox"
+    else:
+        floor = _floor_z(world)
+        source = "current_altitude"
+    window = _cruise_window(world, floor)
     if window is not None:
         z = min(max(z, window[0]), window[1])
-    return _envelope_z(world, z)
+    return _envelope_z(world, z), source
 
 
-def _approach_goal_z(world: Any, target_point: Any) -> float | None:
-    """Altitude the approach's standoff point aims at, or None without a target.
+def _approach_goal_z(
+    world: Any, target_point: Any, *, candidate_known: bool = True
+) -> tuple[float, str] | None:
+    """Altitude the approach's standoff point aims at, and where it came from.
 
-    The drone parks *beside* the object, not above it: with the target box
-    declared the goal is ``bottom + min(0.6 * height, 0.35)``, without one the
-    measured point's own height is the anchor. Either way the goal stays above
-    the floor, raised to the cruise floor when that is higher.
+    The height belongs to the *current candidate*, not to the semantic target:
+    the candidate's own measured/estimated position z is the goal. With only a
+    ray (the candidate's box was seen but its range is not known) this returns
+    None so the caller keeps the ray step's own z - the sighting's elevation.
+    Only when no candidate information exists at all (``candidate_known``
+    False) does the semantic target's box provide the fallback
+    ``bottom + min(0.6 * height, 0.35)``. Either way the goal stays above the
+    global floor, raised to the cruise floor when that is higher.
     """
     point = _as_position(target_point)
-    if point is None:
-        return None
-    z = float(point[2])
-    box = _target_bbox_z(world)
-    if box is not None:
+    if point is not None:
+        z = float(point[2])
+        source = "candidate_position"
+    elif candidate_known:
+        return None  # a ray-only candidate keeps its sighting elevation
+    else:
+        box = _target_bbox_z(world)
+        if box is None:
+            return None
         z = float(box[0]) + min(
             APPROACH_GOAL_HEIGHT_FRACTION * (box[1] - box[0]), APPROACH_GOAL_HEIGHT_MAX_M
         )
+        source = "semantic_target_bbox"
     floor = _floor_z(world)
     if floor is not None:
         window = _cruise_window(world, floor)
@@ -1171,7 +1228,7 @@ def _approach_goal_z(world: Any, target_point: Any) -> float | None:
         if window is not None:
             clearance = max(clearance, window[0] - floor)
         z = max(z, floor + clearance)
-    return _envelope_z(world, z)
+    return _envelope_z(world, z), source
 
 
 # ---------------------------------------------------------------------------
@@ -1185,6 +1242,7 @@ def _build_viewpoints(
     count: int,
     radius_m: float | None = None,
     spread_deg: float | None = None,
+    hypothesis: Any = None,
 ) -> list[dict]:
     """Candidate observation points on an arc around the current pose.
 
@@ -1193,11 +1251,13 @@ def _build_viewpoints(
     (:func:`_viewpoint_altitude`) and are scored on map evidence only (no pose
     change, no rendering). ``radius_m`` overrides the far ring radius (the near
     ring follows at 0.65x); ``spread_deg`` widens the arc (360 = full circle,
-    used for retry suggestions behind the drone).
+    used for retry suggestions behind the drone). ``hypothesis`` is the
+    candidate position the ring is aimed at: its own height anchors the ring
+    instead of the floor-relative cruise window.
     """
     world = ctx.world
     pos = _position(world)
-    altitude = _viewpoint_altitude(world, pos)
+    altitude, altitude_source = _viewpoint_altitude(world, pos, hypothesis)
     pts = _known_points(world)
     traj = _trajectory(world)
     bound = getattr(world, "bound_radius", None)
@@ -1236,6 +1296,7 @@ def _build_viewpoints(
         candidates.append(
             {
                 "position": _pos_list(vp),
+                "altitude_source": altitude_source,
                 "distance_m": _round(dist),
                 "bearing_deg": _round(_bias_deg(bearing)),
                 "cost_m": _round(cost),
@@ -1280,6 +1341,7 @@ def _tool_propose_viewpoints(ctx: ToolContext, args: dict) -> ToolResult:
     radius_m = None if radius_m is None else _float_arg(args, "radius_m", VIEWPOINT_FAR_M)
     base_bearing = yaw
     hypothesis_note = ""
+    resolved = None
     hypothesis = args.get("target_hypothesis")
     if hypothesis in (None, ""):
         hypothesis = args.get("target_id")  # MCP contract alias
@@ -1295,7 +1357,9 @@ def _tool_propose_viewpoints(ctx: ToolContext, args: dict) -> ToolResult:
     elif args.get("direction_deg") is not None:
         base_bearing = yaw + math.radians(_float_arg(args, "direction_deg", 0.0))
 
-    candidates = _build_viewpoints(ctx, base_bearing, count, radius_m)
+    candidates = _build_viewpoints(
+        ctx, base_bearing, count, radius_m, hypothesis=resolved
+    )
     stored = _register_viewpoints(ctx, candidates)
     stored.sort(key=lambda item: (-item["utility"], item["cost_m"]))
     reachable = [item for item in stored if item["reachable"]]
@@ -1478,17 +1542,6 @@ def _now() -> float:
     return time.time()
 
 
-def _target_in_fov(world: Any) -> bool | None:
-    """Whether the goal target is currently visible (None without the probe)."""
-    fn = getattr(world, "target_in_fov", None)
-    if not callable(fn):
-        return None
-    try:
-        return bool(fn())
-    except Exception:
-        return None
-
-
 def _task_store(ctx: ToolContext) -> dict[str, dict]:
     """``ctx.extra["nav_tasks"]`` repaired into a dict (a runtime may leave
     ``extra`` sparse, a foreign caller may park a non-dict there)."""
@@ -1602,6 +1655,11 @@ def _task_data(ctx: ToolContext, task: dict, extra: dict | None = None) -> dict:
             data[key] = str(value)
     if task.get("standoff_m") is not None:
         data["standoff_m"] = _round(float(task.get("standoff_m")))
+    if task.get("goal_height_source"):
+        # which geometry set the approach's target altitude: the candidate's
+        # own position, its sighting ray, or the semantic target's box (an
+        # initial-cruise fallback only)
+        data["goal_height_source"] = str(task["goal_height_source"])
     if extra:
         data.update(extra)
     return data
@@ -2051,7 +2109,6 @@ def _create_task(
         "last_query_signature": "",
         "map_points": int(len(_known_points(world))),
         "map_version": int(ctx.extra.get("map_version", 0)),
-        "target_in_fov": _target_in_fov(world),
         "terminated_pose": None,
         "last_result": None,
     }
@@ -2144,12 +2201,26 @@ def _already_at_pose_action(ctx: ToolContext, task: dict) -> dict:
     return _underfoot_action(ctx, str(task.get("intent") or ""), _task_target_id(task))
 
 
+def _confirm_action(ctx: ToolContext, candidate_id: Any) -> dict:
+    """The version-2 next step after reaching a candidate: confirm the instance."""
+    args: dict[str, Any] = {"candidate_id": str(candidate_id or "")}
+    action: dict[str, Any] = {"tool": "confirm_candidate", "args": args}
+    scope = task_scope(ctx)
+    if scope_active(ctx, scope):
+        for field in SCOPE_FIELDS:
+            value = scope.get(field)
+            if value not in (None, ""):
+                args[field] = value
+        action["scope"] = {field: scope[field] for field in SCOPE_FIELDS}
+    return action
+
+
 def _underfoot_action(ctx: ToolContext, intent: str, intent_id: str) -> dict:
     """Executable next step when ``intent_id`` is where the drone already is."""
     if intent == INTENT_OBSERVATION:
         return _ground_again_action(ctx, intent_id)
     if intent == INTENT_CANDIDATE:
-        return {"tool": "verify_goal", "args": {"candidate_id": intent_id}}
+        return _confirm_action(ctx, intent_id)
     return {"tool": "propose_viewpoints", "args": {"count": 3}}
 
 
@@ -2223,7 +2294,6 @@ def _restore_yaw_result(ctx: ToolContext, task: dict, dyaw_rad: float) -> ToolRe
     obs_id = _capture_pose_result(ctx, task, "arrived_pose")
     _set_task_status(ctx, task, TASK_ARRIVED, "arrived")
     _map_change_event(ctx, task)
-    _target_rediscovery_event(ctx, task, obs_id)
     _emit_task_event(ctx, task, "arrived", observation_id=obs_id, turn_deg=_round(turned))
     _record_arrival(ctx, task, "arrived", _task_evidence(task, obs_id=obs_id))
     data = _movement_data(
@@ -2350,13 +2420,20 @@ def _segment_plan(
         return None, _blocked_precheck_result(
             ctx, task, args, "no_waypoint", None, hint=plan.hint
         )
-    goal_z = _approach_goal_z(ctx.world, target.position)
-    if goal_z is not None:
-        # the standoff shell is flanked, not overflown: the leg ends at the
-        # object's own height band instead of at whatever altitude the drone
-        # happened to start the approach from
+    goal = _approach_goal_z(
+        ctx.world, target.position, candidate_known=target.direction_known
+    )
+    if goal is not None:
+        # the standoff shell is flanked at the *candidate's own* height, not at
+        # the semantic target's: the candidate may sit metres above or below it
+        goal_z, goal_source = goal
         waypoint = np.asarray([waypoint[0], waypoint[1], goal_z], dtype=np.float64)
         plan.waypoint = _pos_list(waypoint)
+        task["goal_height_source"] = goal_source
+    elif target.ray is not None:
+        # a ray-only candidate keeps the z of its sighting elevation (the ray
+        # step): there is no measured height to replace it with
+        task["goal_height_source"] = "candidate_ray"
     # the standoff is the approach's goal distance whatever shape the target has
     # (a point or a ray): the arrival judgement and the reported remaining both
     # measure what is left *beyond* it
@@ -2378,7 +2455,9 @@ def _relocalize_after_leg(ctx: ToolContext, task: dict) -> dict:
         return {}
     record = skills_approach.candidate_record(ctx, task.get("candidate_id"))
     target = skills_approach.candidate_target(record, str(task.get("candidate_id") or ""))
-    measurement = skills_approach.relocalize(ctx, target, str(task.get("last_observation_id") or ""))
+    measurement = skills_approach.relocalize(
+        ctx, target, str(task.get("last_observation_id") or ""), allow_pitched=True
+    )
     if measurement.get("relocalized"):
         task["target_position"] = list(measurement["position_flu"])
     return measurement
@@ -2479,7 +2558,6 @@ def _run_segment(ctx: ToolContext, task: dict, args: dict) -> ToolResult:
 
     _set_task_status(ctx, task, status, reason)
     _map_change_event(ctx, task)
-    _target_rediscovery_event(ctx, task, obs_id)
     if status == TASK_ARRIVED:
         _emit_task_event(ctx, task, "arrived", observation_id=obs_id)
         _record_arrival(ctx, task, outcome, _task_evidence(task, evidence, obs_id))
@@ -2511,6 +2589,11 @@ def _run_segment(ctx: ToolContext, task: dict, args: dict) -> ToolResult:
     }
     if standoff:
         extra["standoff_m"] = _round(standoff)
+    if status == TASK_ARRIVED and str(task.get("intent") or "") == INTENT_CANDIDATE:
+        # arrival is only the navigation half of the confirmation: the identity
+        # still has to be accepted from a new view before finish may count it
+        extra["confirmation_required"] = True
+        extra["next_action"] = _confirm_action(ctx, task.get("candidate_id"))
     if plan_info.get("waypoint") is not None:
         extra["waypoint"] = _pos_list(waypoint)
     if measurement:
@@ -2814,6 +2897,67 @@ def _tool_approach_candidate(ctx: ToolContext, args: dict) -> ToolResult:
     except IdTypeError as exc:
         return _id_error_result(ctx, exc, args)
     record = skills_approach.candidate_record(ctx, candidate_id)
+    if str((record or {}).get("status") or "") == "rejected":
+        # a rejected candidate is not re-used: its instance was checked from a
+        # new view and did not match the instruction
+        resolved, unresolved = _candidate_ids(ctx)
+        return ToolResult(
+            STATUS_BLOCKED,
+            {
+                "reason": "candidate_rejected",
+                "candidate_id": candidate_id,
+                "status": PROGRESS_BLOCKED,
+                "outcome": "candidate_rejected",
+                "blocked_reason": "candidate_rejected",
+                "progress_m": 0.0,
+                "turn_deg": 0.0,
+                "remaining_m": None,
+                "task_id": "",
+                "last_observation_id": _observation_id(ctx),
+                "hint": (
+                    "that candidate was rejected by confirm_candidate: ground the "
+                    "target again instead of approaching the rejected place"
+                ),
+                "next_action": _ground_again_action(
+                    ctx, str((record or {}).get("observation_id") or "")
+                ),
+                "available_targets": resolved,
+                "unresolved_targets": unresolved,
+            },
+        )
+    if bool((record or {}).get("distance_uncertain")) or str(
+        (record or {}).get("distance_source") or ""
+    ) == "conflict":
+        # the box's depth and the model's range disagree: the point may be the
+        # wall behind the object, 10-20 m out. Flying to it burns the leg on a
+        # wrong place, so the approach refuses until a fresh view re-grounds it.
+        resolved, unresolved = _candidate_ids(ctx)
+        data: dict[str, Any] = {
+            "reason": "candidate_distance_uncertain",
+            "candidate_id": candidate_id,
+            "status": PROGRESS_BLOCKED,
+            "outcome": "candidate_distance_uncertain",
+            "blocked_reason": "candidate_distance_uncertain",
+            "progress_m": 0.0,
+            "turn_deg": 0.0,
+            "remaining_m": None,
+            "task_id": "",
+            "last_observation_id": _observation_id(ctx),
+            "distance_source": str((record or {}).get("distance_source") or ""),
+            "distance_conflict": (record or {}).get("distance_conflict"),
+            "hint": (
+                "that candidate's depth conflicts with the model's distance "
+                "estimate, so its position is not trusted; observe from another "
+                "heading/altitude and ground_target again (or inspect the "
+                "object's support point) instead of flying to it"
+            ),
+            "next_action": _ground_again_action(
+                ctx, str((record or {}).get("observation_id") or "")
+            ),
+            "available_targets": resolved,
+            "unresolved_targets": unresolved,
+        }
+        return ToolResult(STATUS_BLOCKED, data)
     target_info = skills_approach.candidate_target(record, candidate_id)
     if not target_info.direction_known:
         resolved, unresolved = _candidate_ids(ctx)
@@ -3023,31 +3167,6 @@ def _map_change_event(ctx: ToolContext, task: dict) -> dict | None:
     )
 
 
-def _target_rediscovery_event(ctx: ToolContext, task: dict, obs_id: str) -> dict | None:
-    """``target_rediscovered`` on a False -> True target-in-FOV transition.
-
-    Only the transition is reported - never the target position or distance,
-    which stay behind ``verify_goal``, the explicit completion check: the event
-    tells the model to look again, not where the goal is.
-    """
-    fov_now = _target_in_fov(ctx.world)
-    if fov_now is None:
-        return None
-    was = task.get("target_in_fov")
-    task["target_in_fov"] = fov_now
-    if fov_now and was is False:
-        return _emit_task_event(
-            ctx,
-            task,
-            "target_rediscovered",
-            observation_id=obs_id,
-            hint="target suspected visible again; run verify_goal to confirm",
-        )
-    return None
-
-
-
-
 # ---------------------------------------------------------------------------
 # task_status / cancel_task: query and interrupt a navigation task (goal.md 5)
 # ---------------------------------------------------------------------------
@@ -3244,6 +3363,125 @@ def _resolve_pixel(args: dict) -> tuple[Any, str | None]:
     return resolved, None
 
 
+def _verify_identity_status(ctx: ToolContext, candidate_id: str) -> dict:
+    """The episode's own identity verdict for one candidate instance.
+
+    Source is the confirmation ledger ``confirm_candidate`` writes (and the
+    candidate record's mirror of it) - never the scene. ``accepted`` is only
+    current while its revision still matches the task scope; an acceptance
+    taken before a re-grounding/switch is reported as ``stale``.
+    """
+    scope = task_scope(ctx)
+    current_revision = int(scope.get("evidence_revision", 0))
+    ledger = ctx.extra.get("confirmation_ledger")
+    entry = ledger.get(candidate_id) if isinstance(ledger, Mapping) else None
+    entry = entry if isinstance(entry, Mapping) else {}
+    store = ctx.extra.get(CANDIDATE_STORE_KEY)
+    record = store.get(candidate_id) if isinstance(store, Mapping) else None
+    record = record if isinstance(record, Mapping) else {}
+
+    status = str(entry.get("last_verdict") or record.get("confirmation_status") or "")
+    if not status:
+        raw = str(record.get("status") or "")
+        status = {"confirmed": CONFIRMATION_ACCEPTED}.get(raw, raw)
+    if not status:
+        status = "unconfirmed"
+
+    accepted_revision = entry.get("accepted_revision")
+    if accepted_revision is None:
+        accepted_revision = record.get("confirmation_revision")
+    try:
+        accepted_revision = (
+            None if accepted_revision is None else int(accepted_revision)
+        )
+    except (TypeError, ValueError):
+        accepted_revision = None
+    revision = entry.get("revision")
+    if revision is None:
+        revision = record.get("confirmation_revision", current_revision)
+    try:
+        revision = int(revision)
+    except (TypeError, ValueError):
+        revision = current_revision
+    if status == CONFIRMATION_ACCEPTED and (
+        accepted_revision is None or accepted_revision != current_revision
+    ):
+        status = "stale"
+    return {
+        "status": status,
+        "candidate_id": candidate_id,
+        "evidence_revision": current_revision,
+        "accepted_revision": accepted_revision,
+        "last_revision": revision,
+        "attempts": int(entry.get("attempts", 0) or 0),
+        "accepted_count": int(entry.get("accepted", 0) or 0),
+        "missing": [str(item) for item in entry.get("missing") or ()],
+        "source": "confirm_candidate",
+    }
+
+
+def _verify_plan_completion(ctx: ToolContext) -> dict:
+    """The agent's own plan progress (never a stage-reach comparison)."""
+    try:
+        from .tool_impl_task import plan_completion, plan_progress
+
+        completion = plan_completion(ctx)
+    except Exception:  # noqa: BLE001 - a context without the task module
+        completion = None
+    if not isinstance(completion, Mapping):
+        return {"available": False, "source": "plan"}
+    try:
+        summary = str(plan_progress(ctx))
+    except Exception:  # noqa: BLE001
+        summary = ""
+    return {
+        "available": True,
+        "source": "plan",
+        "plan_id": str(completion.get("task_id") or ""),
+        "revision": int(completion.get("revision", 0) or 0),
+        "complete": bool(completion.get("complete")),
+        "done_subtasks": [str(item) for item in completion.get("done_subtasks") or ()],
+        "open_subtasks": [
+            dict(item) for item in completion.get("open_subtasks") or ()
+            if isinstance(item, Mapping)
+        ],
+        "summary": summary,
+    }
+
+
+def _verify_arrival(ctx: ToolContext, candidate_id: str) -> dict:
+    """The latest arrival the episode recorded for this candidate/scope."""
+    pack = evidence_pack(ctx)
+    arrivals = [
+        item for item in pack.get("arrivals") or ()
+        if isinstance(item, Mapping) and str(item.get("outcome") or "") == "arrived"
+    ]
+    if candidate_id:
+        matching = [
+            item for item in arrivals
+            if candidate_id in {
+                str(item.get("candidate_id") or ""),
+                str(item.get("target_id") or ""),
+            }
+        ]
+        arrivals = matching or []
+    if not arrivals:
+        return {"available": False, "source": "evidence_pack"}
+    latest = arrivals[-1]
+    return {
+        "available": True,
+        "source": "evidence_pack",
+        "task_id": str(latest.get("task_id") or ""),
+        "candidate_id": str(latest.get("candidate_id") or latest.get("target_id") or ""),
+        "intent": str(latest.get("intent") or ""),
+        "outcome": "arrived",
+        "observation_id": str(latest.get("observation_id") or ""),
+        "remaining_m": latest.get("remaining_m"),
+        "evidence": [dict(item) for item in latest.get("evidence") or ()
+                     if isinstance(item, Mapping)],
+    }
+
+
 def _tool_verify_goal(ctx: ToolContext, args: dict) -> ToolResult:
     world = ctx.world
     pixel, error = _resolve_pixel(args)
@@ -3254,33 +3492,20 @@ def _tool_verify_goal(ctx: ToolContext, args: dict) -> ToolResult:
     unmet: list[dict] = []
     checks: dict[str, Any] = {}
 
-    target = getattr(world, "target", None)
-    target_pos = _as_position(getattr(target, "position_flu", None))
-    radius = getattr(target, "radius_m", 0.5)
-    try:
-        radius = float(radius)
-    except (TypeError, ValueError):
-        radius = 0.5
-
-    dist_fn = getattr(world, "distance_to_target", None)
-    dist = None
-    if callable(dist_fn):
-        try:
-            dist = float(dist_fn())
-        except Exception:
-            dist = None
-    if dist is None and target_pos is not None:
-        dist = float(np.linalg.norm(target_pos - _position(world)))
-    # ``done_dist`` is the gate the episode is judged with (the runner's
-    # ``--success-dist + radius``); without a caller gate this tool's own
-    # default applies, which is only a fallback - not the evaluation gate.
-    limit = ctx.extra.get("done_dist", max(1.5, radius + 0.5))
+    # The tolerance is the agent's own completion contract (the caller's
+    # ``done_dist``, else the configured standoff, else this tool's default).
+    # It is a limit, not a target distance: no scene ground truth is read here.
+    limit = ctx.extra.get("done_dist", 1.5)
     if args.get("success_dist_m") is not None:
         limit = _float_arg(args, "success_dist_m", limit)
     try:
         limit = float(limit)
     except (TypeError, ValueError):
-        limit = max(1.5, radius + 0.5)
+        limit = 1.5
+
+    position_now = _position(world)
+    measured_distance: float | None = None
+    distance_source = ""
 
     # -- pixel -> world point (only trusted when the world has real depth) ----
     depth = None
@@ -3305,6 +3530,10 @@ def _tool_verify_goal(ctx: ToolContext, args: dict) -> ToolResult:
             checks["depth_m"] = _round(float(depth))
             if point is not None:
                 checks["point_world"] = _pos_list(point)
+                # a real depth read makes this a measurement, not a distance
+                # copied from the scene: it is the length of the un-projected ray
+                measured_distance = float(np.linalg.norm(point - position_now))
+                distance_source = "depth"
             else:
                 checks["point_localization"] = (
                     "intrinsics_unknown"
@@ -3323,34 +3552,32 @@ def _tool_verify_goal(ctx: ToolContext, args: dict) -> ToolResult:
                 )
             )
 
-    # -- independent checks ---------------------------------------------------
+    # -- self-state checks (no scene ground truth) ---------------------------
     hard_fail = False
-    fov_fn = getattr(world, "target_in_fov", None)
-    if callable(fov_fn):
-        try:
-            in_fov = bool(fov_fn())
-        except Exception:
-            in_fov = None
-        if in_fov is not None:
-            checks["target_in_fov"] = in_fov
-            if not in_fov:
-                unmet.append({"check": "target_in_fov", "reason": "target_not_visible"})
-                hard_fail = True
+    candidate_id = args.get("candidate_id")
+    cand_pos = None
+    if candidate_id not in (None, ""):
+        cand_pos = _candidate_position(ctx, candidate_id)
 
-    if dist is not None:
-        checks["distance_to_target_m"] = _round(dist)
-        # the limit the verdict was taken against: the caller's gate
-        # (``ctx.extra["done_dist"]``, i.e. the runner's ``--success-dist +
-        # radius``) when it set one, else this tool's own default. Reported, so
-        # an experiment can check that the completion check and the evaluation
-        # gate really are the same number.
-        checks["distance_limit_m"] = _round(limit)
-        if dist > limit:
+    if cand_pos is not None and measured_distance is None:
+        # the agent's own candidate estimate is a dead-reckoned place: the range
+        # is where it believes the object is, never where the scene puts it
+        measured_distance = float(np.linalg.norm(cand_pos - position_now))
+        distance_source = "dead_reckoning"
+
+    # the tolerance is always reported: it is the agent's own completion
+    # contract, not a scene measurement (the measured value may be absent)
+    checks["distance_limit_m"] = _round(limit)
+    if measured_distance is not None:
+        checks["measured_distance_m"] = _round(measured_distance)
+        checks["distance_source"] = distance_source
+        if measured_distance > limit:
             unmet.append(
                 {
-                    "check": "distance_to_target_m",
-                    "value_m": _round(dist),
+                    "check": "measured_distance_m",
+                    "value_m": _round(measured_distance),
                     "max_m": _round(limit),
+                    "source": distance_source,
                 }
             )
             hard_fail = True
@@ -3358,9 +3585,7 @@ def _tool_verify_goal(ctx: ToolContext, args: dict) -> ToolResult:
     if pixel is not None and depth is None:
         unmet.append({"check": "depth", "reason": "no_depth_estimate"})
 
-    candidate_id = args.get("candidate_id")
     if candidate_id not in (None, ""):
-        cand_pos = _candidate_position(ctx, candidate_id)
         if cand_pos is None:
             unmet.append(
                 {
@@ -3391,24 +3616,40 @@ def _tool_verify_goal(ctx: ToolContext, args: dict) -> ToolResult:
                     )
                     hard_fail = True
 
-    if point is not None and target_pos is not None:
-        offset = float(np.linalg.norm(point - target_pos))
-        checks["point_to_target_m"] = _round(offset)
-        tolerance = max(radius + 1.0, 1.5)
-        if offset > tolerance:
+    # -- the identity half: the episode's own confirmation ledger -------------
+    identity_status: dict[str, Any] = {
+        "status": "not_checked",
+        "candidate_id": "" if candidate_id in (None, "") else str(candidate_id),
+        "evidence_revision": int(task_scope(ctx).get("evidence_revision", 0)),
+        "source": "confirm_candidate",
+    }
+    if candidate_id not in (None, ""):
+        identity_status = _verify_identity_status(ctx, str(candidate_id))
+        checks["identity_status"] = dict(identity_status)
+        if identity_status["status"] == "rejected":
             unmet.append(
                 {
-                    "check": "point_on_target",
-                    "offset_m": _round(offset),
-                    "max_m": _round(tolerance),
+                    "check": "identity_status",
+                    "status": "rejected",
+                    "candidate_id": identity_status["candidate_id"],
                 }
             )
             hard_fail = True
+        elif identity_status["status"] == "stale":
+            unmet.append(
+                {
+                    "check": "identity_status",
+                    "status": "stale",
+                    "candidate_id": identity_status["candidate_id"],
+                    "evidence_revision": identity_status["evidence_revision"],
+                    "accepted_revision": identity_status["accepted_revision"],
+                }
+            )
 
-    # -- a recalled observation id is verification evidence too ----------------
-    # "I saw the target at obs_5" is a checkable claim: when that place is the
-    # goal, the verification passes; when it is not, the answer says so and
-    # names the call that gets the drone there (never a silent success).
+    # -- a recalled observation id is the agent's own remembered place ---------
+    # It is a place, not an identity: the verdict may use it as a measured
+    # distance (dead reckoning), but it can never be compared with the scene's
+    # goal (that comparison is the offline evaluator's job).
     observation_id = args.get("observation_id", args.get("obs_id"))
     if observation_id in (None, "") and _looks_like_observation_id(args.get("target_id")):
         observation_id = args.get("target_id")
@@ -3436,34 +3677,56 @@ def _tool_verify_goal(ctx: ToolContext, args: dict) -> ToolResult:
                     note="recalled observation pose",
                 )
             )
-            if target_pos is not None:
-                offset = float(np.linalg.norm(recalled_pos - target_pos))
-                checks["recalled_observation_to_target_m"] = _round(offset)
-                tolerance = max(radius + 1.0, 1.5)
-                if offset > tolerance:
+            if measured_distance is None:
+                measured_distance = float(np.linalg.norm(recalled_pos - position_now))
+                distance_source = "dead_reckoning"
+                checks["measured_distance_m"] = _round(measured_distance)
+                checks["distance_source"] = distance_source
+                checks["distance_limit_m"] = _round(limit)
+                if measured_distance > limit:
                     unmet.append(
                         {
-                            "check": "recalled_observation_on_target",
-                            "offset_m": _round(offset),
-                            "max_m": _round(tolerance),
+                            "check": "measured_distance_m",
+                            "value_m": _round(measured_distance),
+                            "max_m": _round(limit),
+                            "source": distance_source,
                         }
                     )
                     hard_fail = True
 
-    if target_pos is not None:
-        # the check cites the layer it was taken against, never the goal
-        # geometry: quoting "red object at [x, y, z] r=0.20 m" handed the model
-        # the answer the visual evidence exists to support - and made the
-        # episode's own visual reasoning optional (G1 §6). The verdict's own
-        # numbers (FOV, distance, the measured point) are what travels back.
-        evidence.append(
-            EvidenceRef(
-                "map",
-                "goal_check",
-                note="completion check against the episode's own state",
-            )
+    # -- plan progress and arrival evidence, both the agent's own records ------
+    plan_completion = _verify_plan_completion(ctx)
+    checks["plan_completion"] = plan_completion
+    arrival = _verify_arrival(ctx, "" if candidate_id in (None, "") else str(candidate_id))
+    checks["arrival"] = arrival
+    if arrival.get("available"):
+        for item in arrival.get("evidence") or []:
+            if isinstance(item, Mapping) and item.get("kind") and item.get("ref"):
+                evidence.append(
+                    EvidenceRef(
+                        str(item["kind"]),
+                        str(item["ref"]),
+                        str(item.get("note") or "arrival evidence"),
+                    )
+                )
+    # a logical reference to the layer the check ran against (the agent's own
+    # records), never to the goal's pose: the revision makes a later check on
+    # new evidence a genuinely new reference
+    evidence.append(
+        EvidenceRef(
+            "map",
+            f"self_state_check:{int(task_scope(ctx).get('evidence_revision', 0))}",
+            note="completion check over the agent's own plan/confirmation/arrival records",
         )
+    )
 
+    checked_candidate = str(candidate_id) if candidate_id not in (None, "") else ""
+    identity_now = str(identity_status.get("status") or "")
+    has_self_evidence = bool(
+        measured_distance is not None
+        or identity_now == CONFIRMATION_ACCEPTED
+        or arrival.get("available")
+    )
     if hard_fail:
         verified: Any = False
         reason = "unmet_conditions"
@@ -3473,7 +3736,10 @@ def _tool_verify_goal(ctx: ToolContext, args: dict) -> ToolResult:
     elif unresolved_observation:
         verified = "uncertain"
         reason = "unknown_observation"
-    elif not checks:
+    elif identity_now == "stale":
+        verified = "uncertain"
+        reason = "stale_identity"
+    elif not has_self_evidence:
         verified = "uncertain"
         reason = "no_evidence"
     else:
@@ -3481,7 +3747,6 @@ def _tool_verify_goal(ctx: ToolContext, args: dict) -> ToolResult:
         reason = "verified"
 
     scope = task_scope(ctx)
-    checked_candidate = str(candidate_id) if candidate_id not in (None, "") else ""
     data = {
         "verified": verified,
         "evidence": [e.to_dict() for e in evidence],
@@ -3489,6 +3754,13 @@ def _tool_verify_goal(ctx: ToolContext, args: dict) -> ToolResult:
         "checks": checks,
         "reason": reason,
         "hint": _verify_hint(verified, unmet),
+        "measured_distance_m": (
+            None if measured_distance is None else _round(measured_distance)
+        ),
+        "distance_source": distance_source,
+        "identity_status": dict(identity_status),
+        "plan_completion": plan_completion,
+        "arrival": arrival,
         "task_id": scope["task_id"],
         "subtask_id": scope["subtask_id"],
         "candidate_id": checked_candidate or scope["candidate_id"],
@@ -3496,6 +3768,10 @@ def _tool_verify_goal(ctx: ToolContext, args: dict) -> ToolResult:
     }
     if pixel is not None:
         data["pixel"] = [float(pixel[0]), float(pixel[1])]
+    if checked_candidate and verified is not True:
+        # the identity question is about one candidate instance: confirm *it*
+        # from a new view instead of re-searching the whole task
+        data["next_action"] = _confirm_action(ctx, checked_candidate)
     # the verdict goes into the episode's evidence pack: it is what a later
     # finish call's claim is judged on (the same pack the MCP adapter and the
     # runner read - one trail, one verdict), bound to the candidate instance
@@ -3520,7 +3796,11 @@ def _verify_hint(verified: Any, unmet: list[dict]) -> str:
     non-verified answer names the call that can still change the verdict.
     """
     if verified is True:
-        return "verified: the checks passed - finish now, citing these checks"
+        return (
+            "verified against your own records (measured distance / confirmation / "
+            "plan and arrival): finish now, citing these checks; when the task was "
+            "to reach a candidate, confirm_candidate that instance first"
+        )
     if verified is False:
         failed = ", ".join(
             sorted({str(item.get("check", "")) for item in unmet if item.get("check")})
@@ -3532,9 +3812,10 @@ def _verify_hint(verified: Any, unmet: list[dict]) -> str:
             'again; do not finish with "success": true while a check is unmet'
         )
     return (
-        "inconclusive: point at the target (pixel/region) or pass the "
-        "observation_id of a remembered sighting, then call verify_goal again before "
-        "finishing"
+        "inconclusive: no self-measured distance, accepted confirmation or arrival "
+        "is on record yet; point at the object (pixel/region) when depth is "
+        "available, confirm the candidate, or pass the observation_id of a "
+        "remembered sighting - then call verify_goal again before finishing"
     )
 
 
@@ -3704,6 +3985,70 @@ def completion_claim(ctx: ToolContext, args: dict) -> tuple[dict, list[EvidenceR
         )
         missing.extend(plan["missing"])
     missing.extend(chain["missing"])
+
+    # -- version 2: reaching a candidate is not confirming it ----------------
+    # A movement stage's arrival is compatible with a wrong instance: grounding
+    # proposed the place, navigation reached that same place, so both can share
+    # one wrong position. The completion contract therefore also needs an
+    # *accepted* ``confirm_candidate`` taken from a new view/measurement under
+    # the current candidate/revision. A scoped approach arrival, or a completed
+    # plan whose terminal stage is a candidate-approach, makes the confirmation
+    # a necessary condition alongside plan completeness.
+    scoped_confirmations = [
+        record for record in scoped_records
+        if str(record.get("tool") or "") == "confirm_candidate"
+        and str((record.get("data") or {}).get("verdict") or "") == CONFIRMATION_ACCEPTED
+    ]
+    # a candidate rejected by a later confirmation is not counted by finish,
+    # even if an earlier view had accepted it
+    store = ctx.extra.get(CANDIDATE_STORE_KEY) if isinstance(ctx.extra, dict) else None
+    current_candidate_id = str(scope.get("candidate_id") or "")
+    if isinstance(store, Mapping) and current_candidate_id:
+        current_record = store.get(current_candidate_id)
+        if isinstance(current_record, Mapping) and str(
+            current_record.get("status") or ""
+        ) == "rejected":
+            scoped_confirmations = []
+    # Only an *approach of a candidate* creates the instance question. An
+    # arrival at a viewpoint or at a recalled camera pose is a place, not an
+    # object identity, and is still covered by verify_goal.
+    scoped_candidate_arrivals = [
+        record for record in scoped_records
+        if str((record.get("data") or {}).get("outcome") or "") in ARRIVAL_OUTCOMES
+        and (
+            str(record.get("tool") or "") == "approach_candidate"
+            or str((record.get("data") or {}).get("intent") or "") == "approach_candidate"
+        )
+    ]
+    movement_plan = False
+    if task_scoped and plan["complete"]:
+        try:
+            from .tool_impl_task import current_subtask, is_movement_subtask
+
+            # Only the *terminal* sub-task's evidence is current at finish:
+            # a confirmation recorded for an earlier stage belongs to that
+            # stage's (now advanced) scope. A final candidate-approach stage
+            # therefore has to carry the confirmation even when its arrival was
+            # completed by proximity rather than a recorded `arrived`.
+            current = current_subtask(ctx) or {}
+            if is_movement_subtask(current):
+                text = " ".join(
+                    str(current.get(key) or "")
+                    for key in ("goal", "done_when", "next_step")
+                ).lower()
+                movement_plan = (
+                    "candidate" in text or "候选" in text or "实例" in text
+                )
+        except Exception:  # noqa: BLE001 - a context without the task module
+            movement_plan = False
+    confirmation_required = bool(scoped_candidate_arrivals) or movement_plan
+    if (
+        confirmation_required
+        and not scoped_confirmations
+        and MISSING_CONFIRMATION not in missing
+    ):
+        missing.append(MISSING_CONFIRMATION)
+
     if not chain["verified"] and raw_chain["verified"]:
         current_candidate = str(scope.get("candidate_id") or "<none>")
         missing.append(
@@ -3737,6 +4082,9 @@ def completion_claim(ctx: ToolContext, args: dict) -> tuple[dict, list[EvidenceR
         "evidence_revision": int(scope["evidence_revision"]),
         "plan_complete": bool(plan["complete"]) if task_scoped else None,
         "missing_subtasks": list(plan["open_subtasks"]) if task_scoped else [],
+        "confirmation_required": bool(confirmation_required),
+        "confirmation_accepted": bool(scoped_confirmations),
+        "confirmation_count": len(scoped_confirmations),
     }
     if task_scoped:
         data["plan_id"] = plan["task_id"]
@@ -3813,10 +4161,16 @@ _TARGET_PROPERTIES = {
 }
 
 
-def register_navigation_tools(registry: ToolRegistry) -> None:
+def register_navigation_tools(registry: ToolRegistry, vlm: Any = None) -> None:
     """Register the three intent tools, propose_viewpoints, check_path,
-    task_status, cancel_task, verify_goal, finish, batch_read and the deprecated
-    navigate stub.
+    task_status, cancel_task, verify_goal, confirm_candidate, finish, batch_read
+    and the deprecated navigate stub.
+
+    ``vlm`` is the optional confirmation backend ``confirm_candidate`` uses to
+    judge a fresh view (``decide(frames, system_prompt, user_prompt, context)``);
+    when it is None the tool resolves the episode's backend from ``ctx.extra``
+    (``perception.vlm`` / ``vlm`` / the runtime) and reports ``uncertain:
+    identity`` instead of guessing when none exists.
 
     The read-only tools are registered ``cacheable=False``: their answer
     depends on the live pose, observed map or task state, which an args-keyed
@@ -4109,25 +4463,28 @@ def register_navigation_tools(registry: ToolRegistry) -> None:
         ToolSpec(
             name="verify_goal",
             description=(
-                "Independently verify task completion against the goal target using the "
-                "pointed pixel/region depth (or the current proximity and FOV when no "
-                "pixel is given, or the recorded pose of a recalled observation_id): "
-                "verified (true|false|uncertain), evidence, the unmet conditions and the "
-                "next step. Call it before finish: a finish may only claim success after "
-                "a verify_goal call that returned verified=true."
+                "Verify completion against your own episode state, not against scene "
+                "ground truth: the measured distance from the pointed pixel/region "
+                "depth or from your own candidate/recalled-observation estimate "
+                "(checks.measured_distance_m + distance_source), the confirmation "
+                "ledger's identity_status (accepted/uncertain/rejected/unconfirmed/"
+                "stale + evidence_revision), plan_completion and arrival evidence. "
+                "It returns verified (true|false|uncertain), evidence, unmet conditions "
+                "and the next step. Call it before finish: a finish may only claim "
+                "success after a verify_goal that returned verified=true."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "candidate_id": {
                         "type": ["string", "integer"],
-                        "description": "candidate whose identity should match the pointed region",
+                        "description": "candidate whose identity/confirmation state should be checked",
                     },
                     "observation_id": {
                         "type": "string",
                         "description": (
-                            "recalled observation id (obs_N): checks the place where the "
-                            "target was seen against the goal target"
+                            "recalled observation id (obs_N): uses the pose you recorded "
+                            "there as the dead-reckoned distance reference"
                         ),
                     },
                     "region": {
@@ -4143,7 +4500,7 @@ def register_navigation_tools(registry: ToolRegistry) -> None:
                     },
                     "success_dist_m": {
                         "type": "number",
-                        "description": "override the proximity threshold of the goal check",
+                        "description": "override the measured-distance tolerance of the check",
                     },
                 },
                 "required": [],
@@ -4161,7 +4518,8 @@ def register_navigation_tools(registry: ToolRegistry) -> None:
                 'Answer {"success": true} only when this episode left the trail: a '
                 "verify_goal that returned verified=true for the current candidate and "
                 "evidence_revision, or a grounded candidate plus an arrival "
-                "(outcome=arrived) - and, when a plan exists, every sub-task is done. "
+                "(outcome=arrived) plus an accepted confirm_candidate under the same "
+                "candidate/revision - and, when a plan exists, every sub-task is done. "
                 "A single verified stage never finishes the whole task: the call then "
                 "comes back blocked with missing_subtasks (the stages still open) and "
                 "missing (the evidence they owe). The answer also reports evidence_trail, "
@@ -4178,6 +4536,8 @@ def register_navigation_tools(registry: ToolRegistry) -> None:
     # several read-only checks in one turn (goal.md P4): the wrapper is registered
     # here so both adapters advertise it, and ToolRegistry.call dispatches it
     register_batch_tool(registry)
+    # version 2: arrival is upgraded to "arrived + confirmed instance"
+    register_confirm_tools(registry, vlm=vlm)
 
 
 __all__ = ["register_navigation_tools", "register_tools", "register_all"]

@@ -317,6 +317,32 @@ LOW_CONFIDENCE = 0.4
 MIN_RANGE_M = 0.1
 MAX_RANGE_M = 60.0
 
+#: A depth reading and the model's own distance estimate are contradictory when
+#: they differ by more than this ratio (and by more than the metric floor below).
+#: A huge box centre often lands on the wall behind the object (the classroom v2
+#: candidates: 16-27 m of depth against a 3-4 m model estimate).
+DISTANCE_CONFLICT_RATIO = 2.0
+DISTANCE_CONFLICT_DIFF_M = 3.0
+#: Converged support-contact samples override a model range that is more than
+#: :data:`DISTANCE_CONFLICT_RATIO` away: a tight cluster of depth reads is a
+#: measurement, while the model's range is the estimate that can be short. The
+#: consensus needs at least three samples within this relative and absolute
+#: spread; a dispersed set is not a surface and stays uncertain.
+DISTANCE_CONSENSUS_MIN_SAMPLES = 3
+DISTANCE_CONSENSUS_SPREAD_RATIO = 0.25
+DISTANCE_CONSENSUS_SPREAD_M = 1.0
+#: A box this large (fraction of the frame) or touching the frame border is not
+#: trusted at its centre: the centre is very likely background, not the object.
+LARGE_BOX_FRACTION = 0.5
+BOX_BORDER_MARGIN = 20.0
+
+#: ``distance_source`` values: how the range a candidate was placed at was chosen
+DISTANCE_DEPTH_CENTER = "depth_center"
+DISTANCE_DEPTH_GROUND = "depth_ground"
+DISTANCE_DEPTH_CONSISTENT = "depth_consistent"
+DISTANCE_MODEL = "model"
+DISTANCE_CONFLICT = "conflict"
+
 #: ``position_source`` values of a candidate location
 POSITION_DEPTH = "depth"
 POSITION_MODEL_DISTANCE = "model_distance"
@@ -1644,6 +1670,137 @@ def _frame_depth_reader(ctx: ToolContext, record: PerceptionObservation):
     return depth_fn, ""
 
 
+def _distance_conflict(model_m: float | None, depth_m: float | None) -> dict | None:
+    """``{model_m, depth_m, ratio, difference_m}`` when the two ranges disagree.
+
+    The model's own estimate and a depth reading are independent measurements of
+    the same range. A ratio above :data:`DISTANCE_CONFLICT_RATIO` (or a metric
+    difference above :data:`DISTANCE_CONFLICT_DIFF_M`) means at least one of them
+    is not measuring the box: the classroom v2 box centres reported 16-27 m of
+    wall while the model estimated 3-4 m, and the wall won.
+    """
+    if model_m is None or depth_m is None:
+        return None
+    model = float(model_m)
+    depth = float(depth_m)
+    if model <= MIN_RANGE_M or depth <= MIN_RANGE_M:
+        return None
+    ratio = max(depth / model, model / depth)
+    difference = abs(depth - model)
+    if ratio <= DISTANCE_CONFLICT_RATIO and difference <= DISTANCE_CONFLICT_DIFF_M:
+        return None
+    return {
+        "model_m": round(model, 3),
+        "depth_m": round(depth, 3),
+        "ratio": round(ratio, 3),
+        "difference_m": round(difference, 3),
+    }
+
+
+def _box_geometry(box: Box) -> dict:
+    """Frame coverage of a box: area fraction, border contact, large flag."""
+    area_fraction = max(0.0, box.width) * max(0.0, box.height) / 1_000_000.0
+    border = (
+        box.x1 <= BOX_BORDER_MARGIN
+        or box.y1 <= BOX_BORDER_MARGIN
+        or box.x2 >= 1000.0 - BOX_BORDER_MARGIN
+        or box.y2 >= 1000.0 - BOX_BORDER_MARGIN
+    )
+    return {
+        "area_fraction": round(area_fraction, 3),
+        "border_touching": bool(border),
+        "large": bool(area_fraction > LARGE_BOX_FRACTION or border),
+    }
+
+
+def _depth_point(
+    ctx: ToolContext,
+    record: PerceptionObservation,
+    pixel: tuple[float, float],
+    depth_fn,
+) -> dict | None:
+    """One pixel's depth + world point, or None when that sample is unusable."""
+    depth_pixel, _, problem = _source_pixel(ctx, record, pixel)
+    if problem:
+        return None
+    try:
+        depth = _as_float(depth_fn(depth_pixel), None)
+    except Exception:  # noqa: BLE001 - a depth backend is best effort
+        return None
+    if depth is None or depth <= MIN_RANGE_M:
+        return None
+    point, problem = _project_pixel(ctx, record, pixel, depth)
+    if point is None:
+        return None
+    return {
+        "pixel": [round(float(pixel[0]), 1), round(float(pixel[1]), 1)],
+        "depth_m": round(float(depth), 3),
+        "position_flu": point,
+    }
+
+
+def _ground_points(box: Box) -> list[tuple[str, tuple[float, float]]]:
+    """Multi-point samples across the box's lower half (a box centre on a large
+    box usually measures the wall behind the object).
+
+    The bottom edge is the object-support contact; the two interior rows catch
+    an object whose visible silhouette is tall enough that the bottom edge still
+    looks past it (a shelf, a desk) while an inside pixel lands on its near
+    surface. Samples are ordered from the support contact upwards.
+    """
+    width, height = box.width, box.height
+    # stay just inside the silhouette: the exact border pixel is a mix of the
+    # object and whatever is behind it
+    bottom = min(1000.0, max(0.0, box.y2 - max(2.0, 0.03 * height)))
+    xs = (
+        ("25", box.x1 + 0.25 * width),
+        ("centre", box.x1 + 0.50 * width),
+        ("75", box.x1 + 0.75 * width),
+    )
+    rows = (
+        ("bottom", bottom),
+        ("lower", min(1000.0, max(0.0, box.y2 - 0.30 * height))),
+        ("middle", min(1000.0, max(0.0, box.y1 + 0.50 * height))),
+    )
+    return [
+        (f"{row}_{label}", (x, y))
+        for row, y in rows
+        for label, x in xs
+    ]
+
+
+def _converged_sample(
+    samples: list[tuple[str, dict]],
+) -> tuple[str, dict, dict] | None:
+    """The nearest sample of a tight cluster, or None when the set is dispersed.
+
+    A support-contact row that reads the same surface three times is a
+    measurement; the same points spread over metres are not one surface (a
+    bottom edge crossing the object and the wall behind it). The nearest sample
+    of a converged row is the near surface the model's range may have
+    under-estimated.
+    """
+    if len(samples) < DISTANCE_CONSENSUS_MIN_SAMPLES:
+        return None
+    depths = sorted(float(sample["depth_m"]) for _, sample in samples)
+    median = depths[len(depths) // 2]
+    spread = depths[-1] - depths[0]
+    if median <= MIN_RANGE_M:
+        return None
+    if spread > DISTANCE_CONSENSUS_SPREAD_M:
+        return None
+    if spread / median > DISTANCE_CONSENSUS_SPREAD_RATIO:
+        return None
+    name, sample = min(samples, key=lambda item: float(item[1]["depth_m"]))
+    stats = {
+        "samples": len(samples),
+        "median_m": round(median, 3),
+        "spread_m": round(spread, 3),
+        "spread_ratio": round(spread / median, 3),
+    }
+    return name, sample, stats
+
+
 def _candidate_location(
     ctx: ToolContext,
     record: PerceptionObservation,
@@ -1654,19 +1811,30 @@ def _candidate_location(
 ) -> dict:
     """Where a candidate box is: a position when the range is known, else a ray.
 
-    The range comes from the frame's depth map when ``depth_fn`` is usable, else
-    from the model's own ``distance_m`` estimate. A box with neither is *not*
-    placed at a guessed range - an invented point would send the drone somewhere
-    the model never saw (goal.md section 6): it keeps the direction
-    (``ray``, ``position_source`` ``"ray"``) and reports ``range_status``
-    ``"unknown"``, so the caller can decide to observe again instead of flying
-    to a fiction. ``position_source`` names either how the position was obtained
-    (``depth`` / ``model_distance``) or why none exists: ``ray`` (direction
-    known, range not - the ray is attached), ``intrinsics_unknown`` (a range is
-    known but the field of view is not, so the direction is undetermined; the
-    range is attached), ``pitched_view`` / ``pose_unknown`` / ``no_world`` /
-    ``crop_source_unknown`` (this frame cannot be projected at all) or
-    ``no_valid_depth`` (no range and no usable direction).
+    The range is chosen from independent measurements of the box:
+
+    - the box centre's depth (``distance_source=depth_center``);
+    - multi-point samples across the box's lower half, bottom edge and interior
+      rows (``depth_ground``), selected by agreement with the model's range;
+    - a converged support-contact cluster on a normal (not border/large) box
+      (``depth_consistent``) when the model range is a short estimate: the
+      cluster is a measurement, the model range is recorded as an underestimate;
+    - the model's own ``distance_m`` estimate (``model``).
+
+    When the centre depth and the model estimate contradict each other (ratio
+    > 2 or difference > 3 m) the centre is not trusted: the surface samples are
+    tried first, then the model. A large or border-touching box always gets the
+    surface samples because its centre is usually background. If no independent
+    measurement agrees, the model range is used but the candidate is marked
+    ``distance_source=conflict`` / ``distance_uncertain=True`` - confirmation
+    may not accept it and navigation may not approach it until it is re-grounded
+    (goal.md section 6). A box with no usable range at all is *not* placed at a
+    guessed range: it keeps the direction (``ray``) and ``range_status=unknown``.
+
+    ``position_source`` names how the position was obtained (``depth`` /
+    ``model_distance``) or why none exists (``ray`` / ``intrinsics_unknown`` /
+    ``pitched_view`` / ``pose_unknown`` / ``no_world`` / ``crop_source_unknown``
+    / ``no_valid_depth``).
     """
     pixel = box.center
     # the depth map belongs to the frame rendered at the *current* pose, so the
@@ -1676,10 +1844,13 @@ def _candidate_location(
     # map measures whatever surface happens to sit under that unrelated pixel -
     # a box at the frame centre then reports the range of whatever is in front
     # of the drone instead of the range of the box)
-    depth_pixel, _, pixel_problem = _source_pixel(ctx, record, pixel)
+    _, _, pixel_problem = _source_pixel(ctx, record, pixel)
     location: dict = {
         "position_source": POSITION_NO_RANGE,
         "range_status": "unknown",
+        "distance_source": None,
+        "distance_conflict": None,
+        "distance_uncertain": False,
     }
     if depth_reason == POSITION_PITCHED:
         # a pitched frame does not share the level camera model, so neither a
@@ -1695,40 +1866,206 @@ def _candidate_location(
         if ray is not None:
             location["ray"] = ray
         return location
-    if depth_fn is not None and not pixel_problem:
-        depth = _as_float(depth_fn(depth_pixel), None)
-        if depth is not None and depth > MIN_RANGE_M:
-            point, problem = _project_pixel(ctx, record, pixel, depth)
-            if point is not None:
-                return {
-                    "position_source": POSITION_DEPTH,
-                    "position_flu": point,
-                    "range_m": round(float(depth), 3),
-                    "range_source": POSITION_DEPTH,
-                    "range_status": "known",
+
+    geometry = _box_geometry(box)
+    centre = None
+    ground: list[tuple[str, dict]] = []
+    usable_depth = depth_fn is not None and not pixel_problem
+    if usable_depth:
+        centre = _depth_point(ctx, record, pixel, depth_fn)
+        for name, point in _ground_points(box):
+            sample = _depth_point(ctx, record, point, depth_fn)
+            if sample is not None:
+                ground.append((name, sample))
+
+    selected: tuple[str, str, dict] | None = None  # (source, sample_name, sample)
+    conflict: dict | None = None
+    consensus_detail: dict | None = None
+    model = (
+        float(distance_m)
+        if distance_m is not None and MIN_RANGE_M < distance_m <= MAX_RANGE_M
+        else None
+    )
+    if centre is not None or ground:
+        candidates: list[tuple[str, str, dict]] = []
+        if centre is not None:
+            candidates.append((DISTANCE_DEPTH_CENTER, "centre", centre))
+        candidates.extend((DISTANCE_DEPTH_GROUND, name, sample) for name, sample in ground)
+        conflicts = {
+            (source, name): _distance_conflict(model, sample["depth_m"])
+            for source, name, sample in candidates
+        }
+        agreeing = [
+            item for item in candidates if conflicts[(item[0], item[1])] is None
+        ]
+        if agreeing and model is not None:
+            # with a model estimate to cross-check, prefer the support/surface
+            # samples on a large box and the centre on a normal one; within that
+            # group take the sample closest to the model's range (the near
+            # surface, not an agreeing wall)
+            preferred = (
+                [item for item in agreeing if item[0] == DISTANCE_DEPTH_GROUND]
+                if geometry["large"]
+                else [item for item in agreeing if item[0] == DISTANCE_DEPTH_CENTER]
+            )
+            pool = preferred or agreeing
+            selected = min(pool, key=lambda item: abs(float(item[2]["depth_m"]) - model))
+        elif agreeing:
+            # no model estimate: the box geometry alone decides
+            preferred = (
+                [item for item in agreeing if item[0] == DISTANCE_DEPTH_GROUND]
+                if geometry["large"]
+                else [item for item in agreeing if item[0] == DISTANCE_DEPTH_CENTER]
+            )
+            selected = preferred[0] if preferred else agreeing[0]
+        else:
+            # every depth sample contradicts the model. Two very different
+            # cases look alike at this point: the samples may be the wall
+            # behind the object (keep the model range, stay uncertain), or they
+            # may be a tight cluster on the object's support surface while the
+            # model's range is a short estimate. A converged support-contact
+            # row on a normal (not border/large) box is a measurement; use its
+            # near surface and record the model range as the underestimate.
+            support = [
+                (name, sample) for name, sample in ground
+                if name.startswith("bottom")
+            ] or list(ground)
+            converged = (
+                _converged_sample(support)
+                if model is not None and not geometry["large"]
+                else None
+            )
+            converged_conflict = (
+                _distance_conflict(model, converged[1]["depth_m"])
+                if converged is not None else None
+            )
+            if converged is not None and converged_conflict is not None:
+                name, sample, consensus = converged
+                selected = (DISTANCE_DEPTH_CONSISTENT, name, sample)
+                consensus_detail = {
+                    "model_m": round(model, 3),
+                    "depth_center_m": None if centre is None else centre["depth_m"],
+                    "depth_ground_m": sample["depth_m"],
+                    "ratio": converged_conflict["ratio"],
+                    "difference_m": converged_conflict["difference_m"],
+                    "samples": [
+                        {"sample": item_name, "depth_m": item["depth_m"]}
+                        for item_name, item in support
+                    ],
+                    "consensus": consensus,
+                    "resolved": True,
+                    "resolution": "depth_consensus",
+                    "model_underestimate": bool(float(model) < float(sample["depth_m"])),
+                    "warning": (
+                        "the model's range disagrees with a converged support-surface "
+                        "depth reading; the sample is used as the flight range"
+                    ),
                 }
-            location["position_source"] = problem or POSITION_NO_RANGE
-            if problem == POSITION_INTRINSICS_UNKNOWN:
-                # the range is real, the direction is not: report the range
-                location["range_m"] = round(float(depth), 3)
-                location["range_source"] = POSITION_DEPTH
-                location["range_status"] = "known"
-    if distance_m is not None and MIN_RANGE_M < distance_m <= MAX_RANGE_M:
-        point, problem = _project_pixel(ctx, record, pixel, distance_m)
+            else:
+                # the samples do not agree with each other or the support point
+                # is not trustworthy: keep the model range, but mark the
+                # disagreement so confirmation cannot just accept it
+                depth_details = [
+                    {
+                        "source": source,
+                        "sample": name,
+                        "depth_m": sample["depth_m"],
+                        "ratio": conflicts[(source, name)]["ratio"],
+                        "difference_m": conflicts[(source, name)]["difference_m"],
+                    }
+                    for source, name, sample in candidates
+                ]
+                conflict = {
+                    "model_m": round(model, 3) if model is not None else None,
+                    "depth_center_m": None if centre is None else centre["depth_m"],
+                    "depth_ground_m": ground[0][1]["depth_m"] if ground else None,
+                    "ratio": max(item["ratio"] for item in depth_details),
+                    "difference_m": max(item["difference_m"] for item in depth_details),
+                    "samples": depth_details,
+                    "resolved": False,
+                    "resolution": "model" if model is not None else "none",
+                }
+    elif model is None and not usable_depth:
+        conflict = None
+
+    if selected is not None:
+        source, sample_name, sample = selected
+        detail = consensus_detail if consensus_detail is not None else conflict
+        if detail is None and model is not None:
+            # record a resolved disagreement for the trace: the centre was
+            # rejected but a support sample agreed with the model
+            centre_conflict = (
+                _distance_conflict(model, centre["depth_m"]) if centre is not None else None
+            )
+            ground_conflict = (
+                _distance_conflict(model, ground[0][1]["depth_m"]) if ground else None
+            )
+            if centre_conflict is not None or ground_conflict is not None:
+                detail = {
+                    "model_m": round(model, 3),
+                    "depth_center_m": None if centre is None else centre["depth_m"],
+                    "depth_ground_m": ground[0][1]["depth_m"] if ground else None,
+                    "ratio": max(
+                        item["ratio"] for item in (centre_conflict, ground_conflict)
+                        if item is not None
+                    ),
+                    "difference_m": max(
+                        item["difference_m"] for item in (centre_conflict, ground_conflict)
+                        if item is not None
+                    ),
+                    "resolved": True,
+                    "resolution": sample_name,
+                }
+        return {
+            "position_source": POSITION_DEPTH,
+            "position_flu": sample["position_flu"],
+            "range_m": sample["depth_m"],
+            "range_source": POSITION_DEPTH,
+            "range_status": "known",
+            "distance_source": source,
+            "distance_conflict": detail,
+            "distance_uncertain": False,
+            "box_area_fraction": geometry["area_fraction"],
+        }
+
+    if model is not None:
+        point, problem = _project_pixel(ctx, record, pixel, model)
         if point is not None:
             return {
                 "position_source": POSITION_MODEL_DISTANCE,
                 "position_flu": point,
-                "range_m": round(float(distance_m), 3),
+                "range_m": round(model, 3),
                 "range_source": POSITION_MODEL_DISTANCE,
                 "range_status": "known",
+                "distance_source": (
+                    DISTANCE_CONFLICT if conflict is not None else DISTANCE_MODEL
+                ),
+                "distance_conflict": conflict,
+                "distance_uncertain": bool(conflict is not None),
+                "box_area_fraction": geometry["area_fraction"],
             }
         if location["position_source"] == POSITION_NO_RANGE:
             location["position_source"] = problem or POSITION_NO_RANGE
-        if problem == POSITION_INTRINSICS_UNKNOWN and location["range_status"] == "unknown":
-            location["range_m"] = round(float(distance_m), 3)
+        if problem == POSITION_INTRINSICS_UNKNOWN:
+            location["range_m"] = round(model, 3)
             location["range_source"] = POSITION_MODEL_DISTANCE
             location["range_status"] = "known"
+            location["distance_source"] = (
+                DISTANCE_CONFLICT if conflict is not None else DISTANCE_MODEL
+            )
+            location["distance_conflict"] = conflict
+            location["distance_uncertain"] = bool(conflict is not None)
+    elif centre is not None and conflict is None:
+        # a depth exists but no model estimate needed for a decision yet the
+        # projection failed: keep the measured range, not a fabricated point
+        if location["position_source"] == POSITION_NO_RANGE:
+            location["position_source"] = POSITION_INTRINSICS_UNKNOWN
+        location["range_m"] = centre["depth_m"]
+        location["range_source"] = POSITION_DEPTH
+        location["range_status"] = "known"
+        location["distance_source"] = DISTANCE_DEPTH_CENTER
+        location["box_area_fraction"] = geometry["area_fraction"]
+
     ray = _pixel_ray(ctx, record, pixel)
     if ray is not None:
         location["ray"] = ray
@@ -1736,6 +2073,7 @@ def _candidate_location(
             # a direction from a known place: the honest answer for an unknown
             # distance is the ray, not a point at an invented range
             location["position_source"] = POSITION_RAY
+    location["box_area_fraction"] = geometry["area_fraction"]
     return location
 
 
@@ -2475,6 +2813,7 @@ def _evidence_attempt(
         "attempts": 0,
         "failures": 0,
         "successes": 0,
+        "conflicts": 0,
         "last_observation_id": "",
         "last_reason": "",
     }
@@ -2624,6 +2963,43 @@ def _stagnant_result(
     return ToolResult(STATUS_BLOCKED, data, evidence)
 
 
+def _conflict_stagnant_result(
+    ctx: ToolContext, instruction: str, record: PerceptionObservation, attempt: dict
+) -> ToolResult:
+    """``blocked`` answer for evidence whose ranges keep contradicting the model.
+
+    The same view can return the same huge box again and again; each answer is
+    a new candidate id but not new evidence. Once two groundings on this
+    evidence produced unresolved ``distance_source=conflict`` candidates, the
+    next call is refused with a concrete change of viewpoint instead of more
+    candidates that confirmation cannot accept.
+    """
+    conflicts = int(attempt.get("conflicts", 0))
+    change = _strategy_change(ctx, record, "change_viewpoint")
+    data = {
+        "reason": "stagnant_distance_conflict",
+        "instruction": instruction,
+        "observation_id": record.observation_id,
+        "attempts": conflicts + 1,
+        "conflicting_candidates": conflicts,
+        "repeated_grounding": True,
+        "model_call_skipped": True,
+        "hint": (
+            "the same evidence returned candidates whose depth contradicts the "
+            "model's distance estimate: the box is likely background, so "
+            "observe from a different heading/altitude and ground the object's "
+            "support point instead of grounding this view again"
+        ),
+        "strategy_change": change,
+        "next_action": {"tool": change["tool"], "args": dict(change["args"])},
+        "available_candidate_ids": available_candidate_ids(ctx),
+    }
+    evidence = [
+        EvidenceRef("observation", record.observation_id, "frame returned conflicting ranges")
+    ]
+    return ToolResult(STATUS_BLOCKED, data, evidence)
+
+
 # --------------------------------------------------------------------------
 # ground_target
 # --------------------------------------------------------------------------
@@ -2693,6 +3069,11 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
     previous_failures = int(attempt.get("failures", 0)) if attempt is not None else 0
     if previous_failures >= STALL_BLOCK_AT - 1:
         return _stagnant_result(ctx, instruction, record, attempt)
+    previous_conflicts = int(attempt.get("conflicts", 0)) if attempt is not None else 0
+    if previous_conflicts >= STALL_FLAG_AT:
+        # the same pixels already produced two unresolved depth-vs-model
+        # conflicts: a third call would only mint another unusable candidate
+        return _conflict_stagnant_result(ctx, instruction, record, attempt)
     try:
         reply = backend.decide(
             [record.frame],
@@ -2787,12 +3168,20 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
             data["next_action"] = {"tool": change["tool"], "args": dict(change["args"])}
         return ToolResult(STATUS_EMPTY, data, evidence)
     # a candidate was found: the evidence is not stagnant any more
-    if attempt is not None:
-        attempt["attempts"] = int(attempt.get("attempts", 0)) + 1
-        attempt["failures"] = 0
-        attempt["successes"] = int(attempt.get("successes", 0)) + 1
-        attempt["last_observation_id"] = record.observation_id
-        attempt["last_reason"] = "candidate"
+    if attempt is None:
+        attempt = _evidence_attempt(
+            ledger,
+            _instruction_signature(instruction),
+            _region_signature(record.region),
+            record.position_flu,
+            record.yaw_deg,
+            create=True,
+        )
+    attempt["attempts"] = int(attempt.get("attempts", 0)) + 1
+    attempt["failures"] = 0
+    attempt["successes"] = int(attempt.get("successes", 0)) + 1
+    attempt["last_observation_id"] = record.observation_id
+    attempt["last_reason"] = "candidate"
     depth_fn, depth_reason = _frame_depth_reader(ctx, record)
     for candidate in candidates:
         candidate["observation_id"] = record.observation_id
@@ -2807,6 +3196,15 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
             candidate["position_source"] = POSITION_NO_RANGE
             candidate["range_status"] = "unknown"
         store[candidate["id"]] = candidate
+    conflict_ids = [
+        str(candidate["id"])
+        for candidate in candidates
+        if str(candidate.get("distance_source") or "") == DISTANCE_CONFLICT
+    ]
+    if conflict_ids:
+        attempt["conflicts"] = int(attempt.get("conflicts", 0)) + len(conflict_ids)
+    else:
+        attempt["conflicts"] = 0
     evidence.extend(EvidenceRef("memory", candidate["id"], "candidate") for candidate in candidates)
     # every candidate is a sighting of *this* frame: image + candidate + basis,
     # which is what makes a later "where did I see it" answer evidence instead
@@ -2827,6 +3225,14 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
         "intrinsics": _observation_intrinsics(ctx, record),
         "memory_sighting": sighting_write,
     }
+    if conflict_ids:
+        data["distance_conflict_candidates"] = conflict_ids
+        data["hint"] = (
+            "these candidates' depth contradicts the model's distance estimate "
+            "(the box is likely background): confirmation will keep them "
+            "uncertain - observe from a different heading/altitude and ground "
+            "the object's support point instead of repeating this view"
+        )
     return ToolResult(STATUS_OK, data, evidence)
 
 

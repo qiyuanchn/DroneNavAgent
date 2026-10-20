@@ -835,19 +835,214 @@ class CandidatePositionTest(unittest.TestCase):
             ctx.extra[CANDIDATE_STORE_KEY]["cand_1"]["position_flu"], [5.0, 0.0, 0.5]
         )
 
-    def test_depth_is_preferred_over_the_model_distance(self):
+    def test_depth_is_preferred_when_it_agrees_with_the_model_distance(self):
         world = FakeWorld(position=(0.0, 0.0, 0.0), yaw_deg=0.0, depth=4.0)
         ctx = make_ctx(world)
         observed = observe(ctx, {"mode": "forward"})
         result = ground_target(
             ctx,
             {"instruction": "chair", "observation_id": observed.data["observation_id"]},
-            vlm=FakeVLM('{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 9.0}]}'),
+            vlm=FakeVLM('{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 5.0}]}'),
         )
 
         candidate = result.data["candidates"][0]
         self.assertEqual(candidate["position_source"], "depth")
         self.assertEqual(candidate["position_flu"], [4.0, 0.0, 0.0])
+        self.assertEqual(candidate["distance_source"], "depth_center")
+        self.assertIsNone(candidate["distance_conflict"])
+        self.assertFalse(candidate["distance_uncertain"])
+
+    def test_a_box_centre_depth_that_contradicts_the_model_is_flagged(self):
+        """A huge, border-touching box whose centre depth is background.
+
+        The classroom v2 candidate was placed 16-27 m away from a shelf the
+        model estimated at 3-4 m. The centre depth must not be trusted when it
+        contradicts the model and no ground-contact sample resolves the
+        disagreement: the candidate keeps the model's range, is marked
+        ``distance_source=conflict`` and cannot be accepted by confirmation.
+        """
+        world = FakeWorld(
+            position=(0.0, 0.0, 0.0), yaw_deg=0.0,
+            depth=lambda pixel: 16.0, hfov_deg=90.0,
+        )
+        ctx = make_ctx(world)
+        observed = observe(ctx, {"mode": "forward"})
+        result = ground_target(
+            ctx,
+            {"instruction": "bookshelf", "observation_id": observed.data["observation_id"]},
+            vlm=FakeVLM(
+                '{"candidates": [{"box": [480, 0, 999, 400], "distance_m": 3.0}]}'
+            ),
+        )
+
+        candidate = result.data["candidates"][0]
+        self.assertEqual(candidate["position_source"], "model_distance")
+        self.assertEqual(candidate["distance_source"], "conflict")
+        self.assertAlmostEqual(candidate["range_m"], 3.0)
+        self.assertIs(candidate["distance_conflict"]["resolved"], False)
+        self.assertIs(candidate["distance_uncertain"], True)
+        self.assertGreater(candidate["distance_conflict"]["ratio"], 2.0)
+        self.assertGreater(candidate["distance_conflict"]["difference_m"], 3.0)
+        # the model's range (not the 16 m wall) is what navigation can use
+        position = np.asarray(candidate["position_flu"], dtype=np.float64)
+        self.assertGreater(position[0], 0.0)
+        self.assertLess(float(np.linalg.norm(position)), 6.0)
+
+    def test_a_big_box_prefers_the_ground_contact_depth(self):
+        """A large box whose centre is background but whose bottom edge lands
+        on the object's support: the ground sample resolves the disagreement."""
+        world = FakeWorld(
+            position=(0.0, 0.0, 0.0), yaw_deg=0.0,
+            depth=lambda pixel: 16.0 if pixel[1] < 300.0 else 3.2,
+            hfov_deg=90.0,
+        )
+        ctx = make_ctx(world)
+        observed = observe(ctx, {"mode": "forward"})
+        result = ground_target(
+            ctx,
+            {"instruction": "bookshelf", "observation_id": observed.data["observation_id"]},
+            vlm=FakeVLM(
+                '{"candidates": [{"box": [480, 0, 999, 400], "distance_m": 3.0}]}'
+            ),
+        )
+
+        candidate = result.data["candidates"][0]
+        self.assertEqual(candidate["position_source"], "depth")
+        self.assertEqual(candidate["distance_source"], "depth_ground")
+        self.assertAlmostEqual(candidate["range_m"], 3.2)
+        self.assertIs(candidate["distance_conflict"]["resolved"], True)
+        self.assertIs(candidate["distance_uncertain"], False)
+        self.assertAlmostEqual(candidate["distance_conflict"]["depth_center_m"], 16.0)
+
+    def test_multi_point_sampling_finds_a_near_surface_inside_the_box(self):
+        """The centre and the bottom edge can both read the wall behind the
+        object while an interior sample lands on the near surface. The chosen
+        sample has to agree with the model's range, not merely be the first."""
+        world = FakeWorld(
+            position=(0.0, 0.0, 0.0), yaw_deg=0.0,
+            depth=lambda pixel: 3.4 if 350.0 <= pixel[1] <= 400.0 else 15.0,
+            hfov_deg=90.0,
+        )
+        ctx = make_ctx(world)
+        observed = observe(ctx, {"mode": "forward"})
+        result = ground_target(
+            ctx,
+            {"instruction": "bookshelf", "observation_id": observed.data["observation_id"]},
+            vlm=FakeVLM(
+                '{"candidates": [{"box": [480, 100, 999, 500], "distance_m": 3.0}]}'
+            ),
+        )
+
+        candidate = result.data["candidates"][0]
+        self.assertEqual(candidate["position_source"], "depth")
+        self.assertEqual(candidate["distance_source"], "depth_ground")
+        self.assertAlmostEqual(candidate["range_m"], 3.4)
+        self.assertIs(candidate["distance_uncertain"], False)
+        self.assertIs(candidate["distance_conflict"]["resolved"], True)
+        # the centre is still the wall: the conflict is recorded, not hidden
+        self.assertEqual(candidate["distance_conflict"]["depth_center_m"], 15.0)
+
+    def test_converged_support_samples_override_a_model_underestimate(self):
+        """A tight support-contact cluster is a measurement, not a conflict.
+
+        The bedroom v4 seed41 lamp read 3.16-3.23 m along its bottom edge while
+        the model guessed 1.2 m; the old symmetric ratio rule refused the
+        probably-correct candidate. Converged bottom samples on a normal box
+        select the near surface and record the model range as an underestimate.
+        """
+        world = FakeWorld(
+            position=(0.0, 0.0, 0.0), yaw_deg=0.0,
+            depth=lambda pixel: (
+                2.6 if pixel[0] < 487.0 else (2.8 if pixel[0] < 512.0 else 3.0)
+            ),
+            hfov_deg=90.0,
+        )
+        ctx = make_ctx(world)
+        observed = observe(ctx, {"mode": "forward"})
+        result = ground_target(
+            ctx,
+            {"instruction": "the lamp", "observation_id": observed.data["observation_id"]},
+            vlm=FakeVLM(
+                '{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 1.2}]}'
+            ),
+        )
+
+        candidate = result.data["candidates"][0]
+        self.assertEqual(candidate["position_source"], "depth")
+        self.assertEqual(candidate["distance_source"], "depth_consistent")
+        self.assertIs(candidate["distance_uncertain"], False)
+        self.assertAlmostEqual(candidate["range_m"], 2.6, places=3)
+        conflict = candidate["distance_conflict"]
+        self.assertIs(conflict["resolved"], True)
+        self.assertEqual(conflict["resolution"], "depth_consensus")
+        self.assertIs(conflict["model_underestimate"], True)
+        self.assertIn("warning", conflict)
+        self.assertEqual(conflict["consensus"]["samples"], 3)
+
+    def test_dispersed_support_samples_stay_uncertain(self):
+        """Samples spread over metres are not one surface: keep the conflict.
+
+        The old rule is what protects a box whose bottom edge crosses the
+        object and the wall behind it. Only a converged cluster may override
+        the model range.
+        """
+        world = FakeWorld(
+            position=(0.0, 0.0, 0.0), yaw_deg=0.0,
+            depth=lambda pixel: (
+                2.6 if pixel[0] < 487.0 else (5.2 if pixel[0] < 512.0 else 9.0)
+            ),
+            hfov_deg=90.0,
+        )
+        ctx = make_ctx(world)
+        observed = observe(ctx, {"mode": "forward"})
+        result = ground_target(
+            ctx,
+            {"instruction": "the lamp", "observation_id": observed.data["observation_id"]},
+            vlm=FakeVLM(
+                '{"candidates": [{"box": [450, 450, 100, 100], "distance_m": 1.2}]}'
+            ),
+        )
+
+        candidate = result.data["candidates"][0]
+        self.assertEqual(candidate["position_source"], "model_distance")
+        self.assertEqual(candidate["distance_source"], "conflict")
+        self.assertIs(candidate["distance_uncertain"], True)
+        self.assertIs(candidate["distance_conflict"]["resolved"], False)
+        self.assertAlmostEqual(candidate["range_m"], 1.2, places=3)
+
+    def test_repeated_conflicting_groundings_on_one_view_are_stopped(self):
+        """Two unresolved conflicts on the same pixels stop the candidate loop.
+
+        A new observation id over the same view is not new evidence: repeating
+        the grounding there returned the same background box and the agent
+        burned its budget re-grounding. The third call is refused with a
+        viewpoint change instead of another unusable candidate.
+        """
+        world = FakeWorld(
+            position=(0.0, 0.0, 0.0), yaw_deg=0.0,
+            depth=lambda pixel: 16.0, hfov_deg=90.0,
+        )
+        ctx = make_ctx(world)
+        observed = observe(ctx, {"mode": "forward"})
+        vlm = FakeVLM(
+            '{"candidates": [{"box": [480, 0, 999, 400], "distance_m": 3.0}]}'
+        )
+        args = {
+            "instruction": "bookshelf",
+            "observation_id": observed.data["observation_id"],
+        }
+
+        first = ground_target(ctx, args, vlm=vlm)
+        second = ground_target(ctx, args, vlm=vlm)
+        third = ground_target(ctx, args, vlm=vlm)
+
+        self.assertEqual(first.status, "ok", first.data)
+        self.assertEqual(second.status, "ok", second.data)
+        self.assertEqual(third.status, "blocked", third.data)
+        self.assertEqual(third.data["reason"], "stagnant_distance_conflict")
+        self.assertIs(third.data["model_call_skipped"], True)
+        self.assertEqual(len(vlm.calls), 2)
+        self.assertNotEqual(third.data["next_action"]["tool"], "ground_target")
 
     def test_an_older_frame_uses_the_capture_pose_and_the_model_distance(self):
         world = FakeWorld(position=(0.0, 0.0, 0.0), yaw_deg=0.0, depth=6.0)
@@ -1858,7 +2053,7 @@ class ProjectionIntrinsicsTest(unittest.TestCase):
     """Pixel -> ray geometry runs on the observation's own intrinsics: the
     86 deg default used to bias every lateral offset by ~1.6x."""
 
-    def ground(self, hfov_deg, box=(800, 400, 200, 200), **extra):
+    def ground(self, hfov_deg, box=(800, 400, 100, 100), **extra):
         world = FakeWorld(width=640, height=360, yaw_deg=0.0, depth=4.0, hfov_deg=hfov_deg)
         ctx = make_ctx(world)
         observed = observe(ctx, {"mode": "forward"})
@@ -1877,8 +2072,8 @@ class ProjectionIntrinsicsTest(unittest.TestCase):
         candidate = self.ground(60.0)
 
         self.assertEqual(candidate["position_source"], "depth")
-        # u = 900/1000 * 640 = 576 px; fx = 640 / (2 tan 30 deg) = 554.26 px
-        expected_y = -((576 - 320) / 554.2563) * 4.0
+        # box centre u = 850/1000 * 640 = 544 px; fx = 640 / (2 tan 30 deg) = 554.26 px
+        expected_y = -((544 - 320) / 554.2563) * 4.0
         self.assertAlmostEqual(candidate["position_flu"][1], expected_y, places=2)
 
     def test_the_86_degree_default_would_have_been_1_6x_off(self):
@@ -2038,8 +2233,10 @@ class ProjectionIntrinsicsTest(unittest.TestCase):
         ).data["candidates"][0]
 
         # the crop pixel (500, 500) is source u = 750: the depth under *that*
-        # pixel (6 m), not the depth under the crop's own coordinates (2 m)
-        self.assertEqual(world.depth_reads[-1], (750.0, 500.0))
+        # pixel (6 m), not the depth under the crop's own coordinates (2 m).
+        # The support samples along the bottom edge are also read, but the
+        # centre sample is the one this normal-sized box uses.
+        self.assertIn((750.0, 500.0), world.depth_reads)
         self.assertEqual(direct["position_source"], "depth")
         self.assertEqual(direct["range_m"], 6.0)
         self.assertEqual(through_crop["position_source"], "depth")

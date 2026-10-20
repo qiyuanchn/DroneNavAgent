@@ -58,6 +58,10 @@ MIN_RANGE_M = 0.1
 MAX_RELOCALIZE_JUMP_M = 3.0
 #: shortest ray-following step (a shorter leg is not worth a turn)
 MIN_RAY_STEP_M = 0.5
+#: A candidate above/below the level frame is measured through a pitched camera
+#: centred on its elevation (the v8 ``target_out_of_view`` geometry). Beyond
+#: this elevation the target is nearly overhead and the read is not meaningful.
+MAX_MEASUREMENT_ELEVATION_DEG = 70.0
 
 POSITION_KEYS = ("position_flu", "position", "world_flu", "pos")
 RAY_KEYS = ("ray",)
@@ -432,12 +436,19 @@ def _pos_list(pos: Any) -> list[float]:
 
 
 def world_to_pixel(
-    point: Any, position_flu: Any, yaw_rad: float, intrinsics: Mapping | None
+    point: Any,
+    position_flu: Any,
+    yaw_rad: float,
+    intrinsics: Mapping | None,
+    pitch_rad: float = 0.0,
 ) -> tuple[float, float] | None:
     """Project a world point into a camera (normalized [0,1000] pixel) or None.
 
     None means "that point is behind the camera or outside the frame" (or the
     intrinsics are unknown) - the honest answer, never a clamped edge pixel.
+    ``pitch_rad`` is a body pitch, **nose-down positive**: a level camera cannot
+    hold a candidate whose elevation exceeds the vertical half-FOV, while a
+    camera pitched by ``-elevation`` centres it (the v8 position-check bug).
     """
     hfov = _hfov(intrinsics)
     width, height = _size(intrinsics)
@@ -450,14 +461,52 @@ def world_to_pixel(
     forward, left, up = (float(v) for v in offset)
     if forward <= MIN_RANGE_M:
         return None
+    cos_p, sin_p = math.cos(float(pitch_rad)), math.sin(float(pitch_rad))
+    cam_forward = forward * cos_p - up * sin_p
+    cam_up = forward * sin_p + up * cos_p
+    if cam_forward <= MIN_RANGE_M:
+        return None
     fx = width / (2.0 * math.tan(math.radians(hfov) / 2.0))
     vfov = 2.0 * math.atan(math.tan(math.radians(hfov) / 2.0) * height / width)
     fy = height / (2.0 * math.tan(vfov / 2.0))
-    u = width / 2.0 - left / forward * fx
-    v = height / 2.0 - up / forward * fy
+    u = width / 2.0 - left / cam_forward * fx
+    v = height / 2.0 - cam_up / cam_forward * fy
     if not (0.0 <= u <= width and 0.0 <= v <= height):
         return None
     return (u / width * 1000.0, v / height * 1000.0)
+
+
+def elevation_deg(point: Any, position_flu: Any) -> float:
+    """Elevation of ``point`` above the level camera axis, in degrees."""
+    delta = np.asarray(point, dtype=np.float64).reshape(3) - np.asarray(
+        position_flu, dtype=np.float64
+    ).reshape(3)
+    horizontal = float(math.hypot(float(delta[0]), float(delta[1])))
+    return math.degrees(math.atan2(float(delta[2]), max(horizontal, 1e-9)))
+
+
+def _pitched_camera(
+    point: Any, position_flu: Any, yaw_rad: float, intrinsics: Mapping | None,
+    world: Any,
+) -> tuple[float, tuple[float, float], float] | None:
+    """``(pitch_rad, pixel, elevation_deg)`` for a pitched read, or None.
+
+    Used only after the level projection refused: the camera is pitched
+    ``-elevation`` (nose-up for a target above the drone) so the candidate's
+    camera axis holds it. A world without pitched depth support (or a target
+    behind/beside the frame, or nearly overhead) gets None - the caller reports
+    the honest ``target_out_of_view`` instead of inventing a measurement.
+    """
+    if not getattr(world, "supports_pitched_depth", False):
+        return None
+    elevation = elevation_deg(point, position_flu)
+    if abs(elevation) > MAX_MEASUREMENT_ELEVATION_DEG:
+        return None
+    pitch_rad = -math.radians(elevation)
+    pixel = world_to_pixel(point, position_flu, yaw_rad, intrinsics, pitch_rad=pitch_rad)
+    if pixel is None:
+        return None
+    return pitch_rad, pixel, elevation
 
 
 def direction_to_pixel(
@@ -537,7 +586,13 @@ def _update_store(ctx: Any, target: CandidateTarget, measurement: dict) -> None:
         return
 
 
-def relocalize(ctx: Any, target: CandidateTarget, observation_id: str = "") -> dict:
+def relocalize(
+    ctx: Any,
+    target: CandidateTarget,
+    observation_id: str = "",
+    *,
+    allow_pitched: bool = False,
+) -> dict:
     """Re-measure the target from the current pose; returns the measurement.
 
     The candidate is projected into the current frame (from its last known point,
@@ -547,6 +602,13 @@ def relocalize(ctx: Any, target: CandidateTarget, observation_id: str = "") -> d
     target farther than ``MAX_RELOCALIZE_JUMP_M`` (a wall behind it) or that is
     not available at all is reported, not applied: ``relocalized`` stays False
     and ``reason`` says why.
+
+    With ``allow_pitched`` a level projection that lands outside the frame is
+    retried through a camera pitched at the candidate's elevation (nose-up for a
+    target above the drone) when the world serves pitched depth. A candidate
+    whose centre is 0.9 m above a 1.2 m-away camera (36.6 deg, the v8 seed7
+    geometry) therefore gets measured instead of ``target_out_of_view``; the
+    returned ``pitch_down_deg``/``elevation_deg``/``anchor`` name the read.
     """
     world = getattr(ctx, "world", None)
     here = _position(world)
@@ -568,8 +630,21 @@ def relocalize(ctx: Any, target: CandidateTarget, observation_id: str = "") -> d
         return result
 
     pixel = None
+    pitch_rad = 0.0
+    anchor = "camera_axis"
     if target.position is not None:
+        result["elevation_deg"] = round(elevation_deg(target.position, here), 1)
         pixel = world_to_pixel(target.position, here, yaw, intrinsics)
+        if pixel is None and allow_pitched:
+            pitched = _pitched_camera(target.position, here, yaw, intrinsics, world)
+            if pitched is not None:
+                pitch_rad, pixel, elevation = pitched
+                anchor = "pitched_camera"
+                result.update(
+                    anchor=anchor,
+                    pitch_down_deg=round(math.degrees(pitch_rad), 1),
+                    elevation_deg=round(float(elevation), 1),
+                )
         result["pixel"] = None if pixel is None else [round(pixel[0], 1), round(pixel[1], 1)]
         if pixel is None:
             result["reason"] = "target_out_of_view"
@@ -587,8 +662,15 @@ def relocalize(ctx: Any, target: CandidateTarget, observation_id: str = "") -> d
     depth = None
     if callable(depth_fn):
         try:
-            value = depth_fn(pixel)
+            value = (
+                depth_fn(pixel, pitch_rad=pitch_rad) if pitch_rad else depth_fn(pixel)
+            )
             depth = None if value is None else float(value)
+        except TypeError:
+            if pitch_rad:
+                result["reason"] = "pitched_depth_unsupported"
+                return result
+            depth = None
         except Exception:  # noqa: BLE001 - depth is best effort
             depth = None
     if depth is None or not math.isfinite(depth) or depth <= MIN_RANGE_M:
@@ -597,7 +679,18 @@ def relocalize(ctx: Any, target: CandidateTarget, observation_id: str = "") -> d
 
     width, height = _size(intrinsics)
     hfov = _hfov(intrinsics)
-    dx, dy, dz = pixel_to_body_offset(pixel, depth, width=width, height=height, hfov_deg=hfov)
+    dx, dy, dz = pixel_to_body_offset(
+        pixel, depth, width=width, height=height, hfov_deg=hfov
+    )
+    if pitch_rad:
+        # the pixel was projected through the pitched camera: rotate its
+        # camera-frame offset back into the body frame before the yaw rotation
+        cos_p, sin_p = math.cos(pitch_rad), math.sin(pitch_rad)
+        dx, dy, dz = (
+            dx * cos_p + dz * sin_p,
+            dy,
+            -dx * sin_p + dz * cos_p,
+        )
     point = here + np.asarray(body_delta_to_world(dx, dy, dz, yaw), dtype=np.float64)
     if target.position is not None:
         jump = float(np.linalg.norm(point - target.position))
@@ -614,6 +707,7 @@ def relocalize(ctx: Any, target: CandidateTarget, observation_id: str = "") -> d
             "position_source": "depth",
             "range_m": round(depth, 2),
             "target_distance_m": round(float(np.linalg.norm(point - here)), 2),
+            "anchor": anchor,
         }
     )
     target.position = point
@@ -635,6 +729,7 @@ __all__ = [
     "candidate_target",
     "current_intrinsics",
     "direction_to_pixel",
+    "elevation_deg",
     "plan_segment",
     "ray_point",
     "relocalize",

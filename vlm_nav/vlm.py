@@ -550,6 +550,28 @@ class MockVLM(VLMBackend):
         return raw
 
     def decide(self, frame_chw, system_prompt, user_prompt, context=None):
+        # the confirmation step asks for an identity verdict, not a tool call:
+        # a scripted model has no vision, so it confirms deterministically (the
+        # mechanism, not the mock's eyesight, is what a scripted episode tests)
+        if "identity-confirmation" in str(system_prompt or "").lower():
+            # a scripted model has no eyesight: draw the box around the pixel
+            # the candidate projects to on this view (metadata supplied by the
+            # confirmation skill), falling back to the frame centre
+            pixel = (context or {}).get("candidate_pixel") if isinstance(context, dict) else None
+            if isinstance(pixel, (list, tuple)) and len(pixel) >= 2:
+                u, v = float(pixel[0]), float(pixel[1])
+                box = [u - 40.0, v - 40.0, u + 40.0, v + 40.0]
+            else:
+                box = [450, 450, 550, 550]
+            return json.dumps({
+                "target": True,
+                "same_instance": True,
+                "attributes_match": True,
+                "relation_supported": True,
+                "box": box,
+                "confidence": 0.9,
+                "reason": "mock confirmation",
+            })
         if self.mode == "tools":
             return self._tool_reply()
         if self.mode == "script":

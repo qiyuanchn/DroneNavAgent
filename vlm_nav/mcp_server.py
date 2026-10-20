@@ -5,8 +5,10 @@ Two stdio services share one :class:`NavSession` (tool registry + runtime state
 
 - ``nav-environment`` (``--service env``): ``observe``, ``search_target``,
   ``propose_viewpoints``, ``check_path``, ``approach_candidate``,
-  ``go_to_viewpoint``, ``return_to_observation``, ``verify_goal``, ``finish``,
-  ``batch_read`` (the movement tools one per intent; the mixed-semantics
+  ``go_to_viewpoint``, ``return_to_observation``, ``verify_goal``,
+  ``confirm_candidate``, ``finish``, ``batch_read`` (the movement tools one per
+  intent; ``confirm_candidate`` upgrades arrival to an accepted instance; the
+  mixed-semantics
   ``navigate`` was retired; ``search_target`` is the search routine over the
   perception tools and may fly the drone itself; ``finish`` ends the episode
   with an outcome whose ``"success": true`` is only accepted with the episode's
@@ -51,7 +53,7 @@ returns PNG bytes (or JPEG/GIF/WebP passthrough), never a bare path::
     nav://obs/<observation_id>/image       recorded frame (image/*)
     nav://obs/<observation_id>/meta        pose / meta of one observation (json)
     nav://map/bev?size=<n>                 top-down memory map (image/png)
-    nav://map/state                        pose, target, distance, subgoal (json)
+    nav://map/state                        pose, yaw, subgoal, budget (json; no target truth)
     nav://traj/<episode_id>                flown trajectory (json)
     nav://traj/<episode_id>/segment/<i>    one trajectory chunk (json)
     nav://candidates                       candidate target evidence (json)
@@ -144,6 +146,8 @@ ENV_TOOL_NAMES = (
     "go_to_viewpoint",
     "return_to_observation",
     "verify_goal",
+    # version 2: arrival is upgraded to "arrived and confirmed the instance"
+    "confirm_candidate",
     # the completion claim (with the evidence chain) and the read-only batch are
     # part of the env vocabulary: an MCP-only client must be able to end an
     # episode with an outcome and to gather several read-only checks in one turn
@@ -431,16 +435,58 @@ TOOL_CONTRACTS: dict[str, dict[str, Any]] = {
             "required": [],
         },
     },
+    "confirm_candidate": {
+        "description": (
+            "Confirm that a reached candidate cand_N is the instructed instance: "
+            "approach to inspection distance, capture new views from a different "
+            "heading/pose, compare the candidate's attributes and the instruction's "
+            "relation anchor in each view, check the fresh depth measurement against "
+            "the candidate position, and answer verdict accepted|uncertain|rejected. "
+            "Acceptance requires at least one independent view to support and the "
+            "fresh depth measurement to agree while no decided view vetoes (an "
+            "explicit 0.0/low-confidence view blocks; a null-confidence view is "
+            "undecided); unavailable depth cannot accept. uncertain "
+            "carries missing=distance|identity|relation|path|localization and a "
+            "directed next_action (never a generic re-search); repeated confirmations "
+            "without new evidence return blocked(confirm_stalled) with a different "
+            "action. Re-using the same image does not increase the confirmation "
+            "count. Returns steps, vlm_calls and cost."
+        ),
+        "side_effects": True,
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "candidate_id": {
+                    "type": "string",
+                    "description": "cand_N to confirm (default: the current scope's candidate)",
+                },
+                "instruction": {
+                    "type": "string",
+                    "description": "what the target is, in the task's words",
+                },
+                "relation": {
+                    "type": "string",
+                    "description": "relation anchor to check (default: parsed from the instruction)",
+                },
+                "max_views": {"type": "integer", "minimum": 1, "maximum": 3},
+                "turn_deg": {"type": "number"},
+                "standoff_m": {"type": "number"},
+                "max_steps": {"type": "integer", "minimum": 1, "maximum": 16},
+                **SCOPE_PROPERTIES,
+            },
+            "required": [],
+        },
+    },
     FINISH_TOOL_NAME: {
         "description": (
             "End the episode with an explicit outcome and the evidence behind it: "
             "success=true only when this episode left the trail (a verify_goal that "
-            "returned verified=true, or a grounded candidate plus an arrival) and, "
-            "when a plan exists, every sub-task is done and the terminal "
-            "confirmation belongs to the current candidate/sub-task revision. The "
-            "answer reports verified, claim, evidence_trail, missing and "
-            "missing_subtasks (the stages still open); an unbacked success claim is "
-            "downgraded and never counted as success."
+            "returned verified=true, or a grounded candidate plus an arrival plus an "
+            "accepted confirm_candidate) and, when a plan exists, every sub-task is "
+            "done and the terminal confirmation belongs to the current "
+            "candidate/sub-task revision. The answer reports verified, claim, "
+            "evidence_trail, missing and missing_subtasks (the stages still open); an "
+            "unbacked success claim is downgraded and never counted as success."
         ),
         "side_effects": False,
         "input_schema": FINISH_SCHEMA,
@@ -1027,7 +1073,7 @@ class NavResources:
                     )
             elif category == "map":
                 out.append(ResourceInfo("nav://map/bev", "local map", "top-down memory map", IMAGE_MIME))
-                out.append(ResourceInfo("nav://map/state", "map state", "pose, target, distance, subgoal", JSON_MIME))
+                out.append(ResourceInfo("nav://map/state", "map state", "pose, yaw, subgoal, budget", JSON_MIME))
             elif category == "traj":
                 episode_id = self.session.ctx.episode_id
                 out.append(ResourceInfo(f"nav://traj/{episode_id}", "trajectory", "flown trajectory", JSON_MIME))
@@ -1155,20 +1201,13 @@ class NavResources:
             raise ValueError("no world bound to this session")
         position = _safe(lambda: [float(v) for v in np.asarray(world.position_flu).reshape(-1)[:3]])
         yaw = _safe(lambda: float(world.yaw_rad))
-        target = _safe(lambda: world.target)
+        # Agent-facing state only: the drone's own pose and the episode's own
+        # bookkeeping. Target identity/position/distance/visibility are ground
+        # truth and stay on the offline evaluator's side of the boundary.
         state = {
             "episode_id": self.session.ctx.episode_id,
             "position_flu": position,
             "yaw_deg": None if yaw is None else math.degrees(yaw),
-            "distance_to_target_m": _safe(lambda: round(float(world.distance_to_target()), 3)),
-            "target_in_fov": _safe(lambda: bool(world.target_in_fov())),
-            "target": None
-            if target is None
-            else {
-                "name": str(getattr(target, "name", "")),
-                "position_flu": _jsonable(getattr(target, "position_flu", None)),
-                "radius_m": _safe(lambda: float(getattr(target, "radius_m")), None),
-            },
             "last_subgoal": _jsonable(getattr(world, "last_subgoal", None)),
             "observation_seq": self.session.ctx.observation_seq,
             "budget": dict(self.session.ctx.budget),

@@ -78,7 +78,13 @@ An interrupted episode (budget/turns exhausted) leaves the records in the
 context; :func:`resume_plan` adopts them for the next episode of the same task,
 statuses, evidence and consumed budget included, so a re-run continues where the
 last one stopped instead of starting over. A plan whose every sub-task is done
-is *not* adopted - it belongs to the episode that finished it.
+is *not* adopted - it belongs to the episode that finished it. The first
+evidence turn of the resumed leg re-judges every restored ``done``/``claimed``
+stage (:func:`evidence_verdict`): a stage whose confirmation the new result (or
+the agent's own ledger) now rejects, or whose accepted confirmation never had an
+independent position anchor, is demoted to ``claimed_done`` and counted as a
+resume correction - the checkpoint's wrong belief is overturnable by the agent
+itself, without ground truth.
 
 Neither tool is cacheable: ``update_plan`` rewrites episode state (registered
 ``side_effects=True``, so it is serialized and never cached), and ``get_plan``
@@ -95,6 +101,7 @@ import time
 from typing import Any, Iterable, Mapping
 
 from .tools import (
+    CONFIRMATION_ACCEPTED,
     PROGRESS_TASK,
     STATUS_BLOCKED,
     STATUS_EMPTY,
@@ -110,6 +117,10 @@ from .tools import (
 
 #: ``ctx.extra`` key holding the episode's plan record.
 PLAN_KEY = "plan"
+#: the agent's own confirmation evidence, re-judged once after a resume
+CANDIDATE_STORE_KEY = "perception.candidates"
+CONFIRMATION_LEDGER_KEY = "confirmation_ledger"
+RESUME_RECHECK_KEY = "resume_recheck"
 MAX_PLAN_STEPS = 12
 MAX_STEP_CHARS = 240
 MAX_NOTE_CHARS = 200
@@ -172,7 +183,14 @@ MARK_MOVED = "moved"
 MARK_REACHED = "reached"
 MARK_VERIFIED = "verified"
 MARK_IDENTITY = "identity"
-EVIDENCE_MARKS = (MARK_REF, MARK_LOCATED, MARK_MOVED, MARK_REACHED, MARK_VERIFIED, MARK_IDENTITY)
+#: The result is an *accepted* ``confirm_candidate`` taken on a fresh frame
+#: with a location-consistent measurement. Version 2: a movement stage closes on
+#: this mark, not on ``identity`` (a grounded candidate id alone).
+MARK_CONFIRMED = "confirmed"
+EVIDENCE_MARKS = (
+    MARK_REF, MARK_LOCATED, MARK_MOVED, MARK_REACHED, MARK_VERIFIED,
+    MARK_IDENTITY, MARK_CONFIRMED,
+)
 #: What one sub-task's ``done_when`` asks the evidence to show (in report order).
 EVIDENCE_REF = "evidence_ref"
 EVIDENCE_LOCATED = "located"
@@ -302,6 +320,10 @@ DEFAULT_LOCATE_M = 2.0
 #: distance in ``done_when`` names one (the long-horizon driver's
 #: ``DEFAULT_STAGE_REACH_M``).
 DEFAULT_REACH_M = 1.5
+#: Being on the candidate's standoff shell is a reach even when the stage centre
+#: is farther than ``reach_m``: ``remaining_m`` is the distance beyond that
+#: shell (the approach skill's arrive radius).
+CANDIDATE_REACH_TOLERANCE_M = 0.35
 MAX_LOCATE_M = 1000.0
 _DISTANCE_RE = re.compile(
     r"(\d+(?:\.\d+)?)\s*(?:m(?![a-z])|米|meters?|metres?)",
@@ -707,6 +729,8 @@ def _blank_subtask(
         "_evidence_remaining": [],
         # where a movement result actually went (scopes its reach evidence)
         "_evidence_move_places": [],
+        # the standoff shell the last movement aimed at (None when unknown)
+        "_evidence_standoff": None,
         "_evidence_missing": [],
         "_evidence_weak": False,
         # the executor consumed this sub-task's static ``next_step`` once
@@ -740,6 +764,8 @@ def _copy_subtask(subtask: Mapping) -> dict:
         for point in subtask.get("_evidence_move_places") or []
         if _as_point(point) is not None
     ][-MAX_SUBTASK_PLACES:]
+    standoff = _finite_number(subtask.get("_evidence_standoff"))
+    base["_evidence_standoff"] = None if standoff is None else float(standoff)
     base["_next_step_spent"] = bool(subtask.get("_next_step_spent"))
     return base
 
@@ -1318,6 +1344,24 @@ def _identity_signal(data: Mapping) -> bool:
     return str(data.get("verdict") or "").strip().lower() in TASK_VERDICTS
 
 
+def _accepted_confirmation(event: Mapping) -> bool:
+    """True when the result is a *fresh, location-consistent* accepted identity.
+
+    A v2 acceptance needs the new-frame verdict **and** the fresh depth
+    measurement: a legacy/v7 acceptance that never ran the position check is not
+    identity-complete evidence for a movement stage.
+    """
+    if str(event.get("tool") or "") != "confirm_candidate":
+        return False
+    data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
+    if str(data.get("verdict") or "").strip().lower() != CONFIRMATION_ACCEPTED:
+        return False
+    if data.get("new_confirmation") is False:
+        return False  # a replay of an earlier verdict is not new evidence
+    checks = data.get("position_check")
+    return isinstance(checks, Mapping) and checks.get("available") is True
+
+
 def _evidence_marks(event: Mapping) -> set[str]:
     """What one tool result establishes (the evidence the executor can bind to).
 
@@ -1336,6 +1380,8 @@ def _evidence_marks(event: Mapping) -> set[str]:
         marks.add(MARK_VERIFIED)
     if _identity_signal(data):
         marks.add(MARK_IDENTITY)
+    if _accepted_confirmation(event):
+        marks.add(MARK_CONFIRMED)
     if _places_in(data) and str(event.get("tool") or "") not in _DESTINATION_TOOLS:
         marks.add(MARK_LOCATED)
     if _moved(data):
@@ -1393,10 +1439,13 @@ def evidence_requirements(subtask: Mapping) -> list[str]:
     ``done_when`` that names a placement, a movement or a confirmation adds the
     corresponding requirement. A movement stage (:func:`is_movement_subtask`)
     always asks for reach evidence, whether or not its ``done_when`` repeats a
-    reach word: ``located`` alone is not an arrival. A sub-task without
-    ``done_when`` asks for nothing beyond the reference - there is no condition
-    to check it against. The vocabulary is deliberately small and shared by both
-    languages of the plans (English schema hints, Chinese task files).
+    reach word: ``located`` alone is not an arrival. Version 2 also requires an
+    *accepted* ``confirm_candidate`` under the current candidate/revision for
+    every movement stage - the arrival proves the place, the confirmation
+    proves the instance. A sub-task without ``done_when`` asks for nothing
+    beyond the reference - there is no condition to check it against. The
+    vocabulary is deliberately small and shared by both languages of the plans
+    (English schema hints, Chinese task files).
     """
     text = str(subtask.get("done_when") or "").strip().lower()
     required = [EVIDENCE_REF]
@@ -1410,6 +1459,9 @@ def evidence_requirements(subtask: Mapping) -> list[str]:
         # movement-tool continuation is itself the movement condition
         if movement:
             required.append(EVIDENCE_REACHED)
+            # version 2: an arrival is not identity, even when the bare step
+            # does not spell the word "confirm"
+            required.append(EVIDENCE_CONFIRMATION)
         return required
     if any(word in text for word in _DONE_WHEN_LOCATE_WORDS):
         if EVIDENCE_LOCATED not in required:
@@ -1419,8 +1471,14 @@ def evidence_requirements(subtask: Mapping) -> list[str]:
     if any(word in text for word in _DONE_WHEN_REACH_WORDS):
         if EVIDENCE_REACHED not in required:
             required.append(EVIDENCE_REACHED)
-    if any(word in text for word in _DONE_WHEN_CONFIRM_WORDS):
+    if movement and EVIDENCE_CONFIRMATION not in required:
+        # every movement stage carries an identity question: the candidate the
+        # navigation approached has to be accepted by confirm_candidate under
+        # the current candidate/revision (goal.md version 2)
         required.append(EVIDENCE_CONFIRMATION)
+    if any(word in text for word in _DONE_WHEN_CONFIRM_WORDS):
+        if EVIDENCE_CONFIRMATION not in required:
+            required.append(EVIDENCE_CONFIRMATION)
     return required
 
 
@@ -1455,6 +1513,43 @@ def _locate_limit(subtask: Mapping) -> float:
     return named if named and named > 0 else DEFAULT_LOCATE_M
 
 
+def _confirmation_current(subtask: Mapping, mark_set: set[str]) -> bool:
+    """Whether the sub-task's accepted confirmation is for its current instance.
+
+    The confirmation event itself never redefines the stage's candidate: the
+    accepted record is compared with the candidate/revision of the stage's
+    grounding/movement evidence. A later candidate switch or re-grounding bumps
+    the revision and makes the earlier acceptance stale - unless the switch was
+    to a candidate within the inheritance radius, in which case
+    ``select_scope_candidate`` re-bound the acceptance to the new id/revision.
+    """
+    if MARK_CONFIRMED not in mark_set:
+        return False
+    record = subtask.get("_evidence_confirmed")
+    if not isinstance(record, Mapping):
+        return False
+    if record.get("invalidated"):
+        # the resumed-leg recheck overturned this confirmation
+        return False
+    current_candidate = str(subtask.get("_evidence_candidate") or "")
+    confirmed_candidate = str(record.get("candidate_id") or "")
+    if (
+        current_candidate
+        and confirmed_candidate
+        and current_candidate != confirmed_candidate
+    ):
+        return False
+    current_revision = subtask.get("_evidence_revision")
+    confirmed_revision = record.get("evidence_revision")
+    if current_revision is not None and confirmed_revision is not None:
+        try:
+            if int(current_revision) != int(confirmed_revision):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 def evidence_verdict(subtask: Mapping) -> dict:
     """``{ok, requirements, marks, missing, evidence_weak, ...}`` of one sub-task.
 
@@ -1473,17 +1568,27 @@ def evidence_verdict(subtask: Mapping) -> dict:
     A movement stage's ``reached`` requirement is satisfied by an arrival
     (``outcome=arrived`` / ``task_status=arrived``) or by a reported
     ``remaining_m`` inside ``reach_m`` (falling back to the ``done_when``
-    distance, then :data:`DEFAULT_REACH_M`) - and, when the sub-task has a
-    located place on record, the movement target must be inside that tolerance
-    of it. A flown leg alone no longer satisfies it, and a viewpoint elsewhere
-    is not an arrival at the object: ``located`` + ``moved`` (or a go_to
-    arrival elsewhere) stays ``claimed_done``.
+    distance, then :data:`DEFAULT_REACH_M`) - and it is scoped by the wider of
+    two geometries: the movement target inside the tolerance of the located
+    candidate (or its standoff shell) **or** inside ``reach_m`` of the declared
+    stage place. ``reach_basis`` records which one justified it. A flown leg
+    alone no longer satisfies it, and a viewpoint elsewhere is not an arrival at
+    the object: ``located`` + ``moved`` (or a go_to arrival elsewhere) stays
+    ``claimed_done``. Version 2 adds the ``confirmation`` requirement: it is
+    satisfied by an accepted ``confirm_candidate`` marked ``confirmed`` and
+    taken under the same candidate/revision as the stage's movement evidence; a
+    later candidate switch or re-grounding makes the earlier acceptance stale,
+    unless the new candidate is within
+    :data:`vlm_nav.tools.CONFIRMATION_INHERIT_RADIUS_M` of the confirmed one in
+    the same sub-task (the acceptance is inherited).
     """
     marks = [
         str(mark) for mark in subtask.get("_evidence_marks") or [] if str(mark) in EVIDENCE_MARKS
     ]
     mark_set = set(marks)
     requirements = evidence_requirements(subtask)
+    movement = is_movement_subtask(subtask)
+    confirmed = _confirmation_current(subtask, mark_set)
     goal = _position_of(subtask.get("goal_position")) or None
     limit = _locate_limit(subtask) if goal is not None else 0.0
     places = [
@@ -1513,14 +1618,28 @@ def evidence_verdict(subtask: Mapping) -> dict:
     ]
     # an arrival has to be an arrival *at the located object*: with a located
     # place on record, the movement target must be inside the reach tolerance
-    # (a go_to_viewpoint elsewhere is progress, not this stage's reach)
+    # (a go_to_viewpoint elsewhere is progress, not this stage's reach). The
+    # stage centre is the second, wider basis: it rescues an arrival that is
+    # outside the centre tolerance but on the candidate's standoff shell (and
+    # vice versa), and ``reach_basis`` says which geometry was used.
+    standoff = _finite_number(subtask.get("_evidence_standoff"))
+    candidate_limit = max(
+        reach_limit, (standoff or 0.0) + CANDIDATE_REACH_TOLERANCE_M
+    )
+    candidate_reach = bool(places) and bool(move_places) and any(
+        _distance(move, place) <= candidate_limit
+        for move in move_places
+        for place in places
+    )
+    center_reach = goal is not None and bool(move_places) and any(
+        _distance(move, goal) <= reach_limit for move in move_places
+    )
     scoped = True
-    if EVIDENCE_REACHED in requirements and places:
-        scoped = bool(move_places) and any(
-            _distance(move, place) <= reach_limit
-            for move in move_places
-            for place in places
-        )
+    if EVIDENCE_REACHED in requirements and (places or goal is not None):
+        scoped = candidate_reach or center_reach
+    reach_basis = (
+        "candidate" if candidate_reach else ("center" if center_reach else "")
+    )
     reached = (
         MARK_REACHED in mark_set
         or (nearest_remaining is not None and nearest_remaining <= reach_limit)
@@ -1536,10 +1655,22 @@ def evidence_verdict(subtask: Mapping) -> dict:
                 missing.append(EVIDENCE_LOCATED)
         elif requirement == EVIDENCE_REACHED and not reached:
             missing.append(EVIDENCE_REACHED)
-        elif requirement == EVIDENCE_CONFIRMATION and not (
-            {MARK_VERIFIED, MARK_IDENTITY} & mark_set
-        ):
-            missing.append(EVIDENCE_CONFIRMATION)
+        elif requirement == EVIDENCE_CONFIRMATION:
+            if movement:
+                # version 2: a movement stage needs the accepted
+                # confirm_candidate of the current candidate/revision
+                ok = confirmed
+            else:
+                ok = bool({MARK_VERIFIED, MARK_CONFIRMED} & mark_set) and (
+                    MARK_CONFIRMED not in mark_set or confirmed
+                )
+            if not ok:
+                missing.append(EVIDENCE_CONFIRMATION)
+    if subtask.get("_resume_recheck_failed") and EVIDENCE_CONFIRMATION not in missing:
+        # the resumed-leg recheck overturned this stage's confirmation: it
+        # stays open until a fresh accepted confirmation arrives, even when the
+        # stage's own done_when never spelled "confirm"
+        missing.append(EVIDENCE_CONFIRMATION)
     return {
         "ok": not missing,
         "requirements": requirements,
@@ -1554,7 +1685,17 @@ def evidence_verdict(subtask: Mapping) -> dict:
             None if nearest_remaining is None else round(nearest_remaining, 3)
         ),
         "reached": bool(reached) if EVIDENCE_REACHED in requirements else False,
+        "reach_basis": reach_basis if EVIDENCE_REACHED in requirements else "",
         "reach_scoped": bool(scoped) if EVIDENCE_REACHED in requirements else False,
+        "confirmed": bool(confirmed) if EVIDENCE_CONFIRMATION in requirements else False,
+        "confirmation_candidate_id": (
+            str((subtask.get("_evidence_confirmed") or {}).get("candidate_id") or "")
+            if isinstance(subtask.get("_evidence_confirmed"), Mapping) else ""
+        ),
+        "confirmation_revision": (
+            (subtask.get("_evidence_confirmed") or {}).get("evidence_revision")
+            if isinstance(subtask.get("_evidence_confirmed"), Mapping) else None
+        ),
     }
 
 
@@ -1609,6 +1750,7 @@ def _blank_outcome() -> dict:
         "failed": "",
         "budget_exceeded": [],
         "budget_with_evidence": "",
+        "resume_recheck": {},
         "active": "",
         "current": 0,
         "failure_subtask": "",
@@ -1729,6 +1871,39 @@ def _remember_event(subtask: dict, event: Mapping) -> None:
     """Record everything one tool result established on its sub-task."""
     data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
     marks = _evidence_marks(event)
+    candidate = ""
+    for key in ("candidate_id", "target_id", "object_id"):
+        candidate = str(data.get(key) or "").strip()
+        if candidate:
+            break
+    try:
+        revision = int(data.get("evidence_revision"))
+    except (TypeError, ValueError):
+        revision = None
+    if _accepted_confirmation(event):
+        # a fresh, independently anchored confirmation is the evidence the
+        # resumed-leg recheck was waiting for
+        subtask.pop("_resume_recheck_failed", None)
+        subtask["_evidence_confirmed"] = {
+            "candidate_id": candidate,
+            "evidence_revision": revision,
+            "observation_ids": [
+                str(item) for item in data.get("observation_ids") or () if item
+            ],
+            "position_delta_m": data.get("position_delta_m"),
+        }
+        # a confirmation does not redefine which candidate the stage is working
+        # on: it is judged against the identity evidence already on record
+        if candidate and not subtask.get("_evidence_candidate"):
+            subtask["_evidence_candidate"] = candidate
+    else:
+        if candidate:
+            subtask["_evidence_candidate"] = candidate
+        if revision is not None:
+            subtask["_evidence_revision"] = revision
+    standoff = _finite_number(data.get("standoff_m"))
+    if standoff is not None:
+        subtask["_evidence_standoff"] = round(standoff, 3)
     movement = bool({MARK_MOVED, MARK_REACHED} & marks) or any(
         data.get(key) not in (None, "")
         for key in ("outcome", "task_status", "remaining_m")
@@ -1834,6 +2009,177 @@ def _promote_ready(record: dict, turn: int, transitions: list[dict]) -> list[str
     return promoted
 
 
+def _resumed_confirmation_problem(
+    ctx: ToolContext, subtask: Mapping, event: Mapping
+) -> str:
+    """Why a checkpoint's accepted confirmation no longer backs its stage.
+
+    The resume path restores the agent's own belief verbatim, including a
+    confirmation that was never independently anchored (the v2 position check
+    re-projected the candidate and read delta 0.0, so every candidate passed).
+    On the first evidence turn of the resumed leg the belief is re-judged:
+    a fresh rejection of the same candidate, a candidate the agent's own ledger
+    now rejects, or a confirmation with no independent position delta
+    invalidates it. No ground truth is read here.
+    """
+    confirmed = subtask.get("_evidence_confirmed")
+    if not isinstance(confirmed, Mapping):
+        return ""
+    candidate_id = str(confirmed.get("candidate_id") or "")
+    if not candidate_id:
+        return ""
+    if confirmed.get("invalidated"):
+        return str(confirmed.get("invalidated"))
+    data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
+    if str(event.get("tool") or "") == "confirm_candidate":
+        event_candidate = str(data.get("candidate_id") or "")
+        verdict = str(data.get("verdict") or "").strip().lower()
+        if event_candidate == candidate_id and verdict == CONFIRMATION_ACCEPTED:
+            # the new evidence is a fresh accepted confirmation of this
+            # candidate: it supersedes the checkpoint record
+            return ""
+        if event_candidate == candidate_id and verdict != CONFIRMATION_ACCEPTED:
+            return "confirmation_rejected_by_new_evidence"
+    extra = _extra(ctx)
+    store = extra.get(CANDIDATE_STORE_KEY)
+    candidate = store.get(candidate_id) if isinstance(store, Mapping) else None
+    if isinstance(candidate, Mapping):
+        status = str(
+            candidate.get("status") or candidate.get("confirmation_status") or ""
+        ).strip().lower()
+        if status == "rejected":
+            return "candidate_rejected"
+    ledger = extra.get(CONFIRMATION_LEDGER_KEY)
+    entry = ledger.get(candidate_id) if isinstance(ledger, Mapping) else None
+    if isinstance(entry, Mapping) and str(entry.get("last_verdict") or "").lower() == "rejected":
+        return "candidate_rejected"
+    if confirmed.get("position_delta_m") is None:
+        # accepted without an independent positional anchor: the current
+        # contract cannot treat it as identity evidence
+        return "confirmation_not_independently_anchored"
+    return ""
+
+
+def _invalidate_resumed_candidate(ctx: ToolContext, candidate_id: str, reason: str) -> None:
+    """Record the agent-side rejection of a checkpoint's accepted candidate."""
+    if not candidate_id:
+        return
+    extra = _extra(ctx)
+    note = f"resume_recheck:{reason}"[:200]
+    store = extra.get(CANDIDATE_STORE_KEY)
+    if not isinstance(store, dict):
+        store = {}
+        extra[CANDIDATE_STORE_KEY] = store
+    candidate = store.get(candidate_id)
+    if not isinstance(candidate, dict):
+        candidate = {"id": candidate_id}
+        store[candidate_id] = candidate
+    candidate["status"] = "rejected"
+    candidate["confirmation_status"] = "rejected"
+    candidate["confirmation_reason"] = note
+    candidate["confirmation_missing"] = ["localization"]
+    ledger = extra.get(CONFIRMATION_LEDGER_KEY)
+    if not isinstance(ledger, dict):
+        ledger = {}
+        extra[CONFIRMATION_LEDGER_KEY] = ledger
+    entry = ledger.get(candidate_id)
+    if not isinstance(entry, dict):
+        entry = {}
+        ledger[candidate_id] = entry
+    entry["last_verdict"] = "rejected"
+    entry["missing"] = ["localization"]
+    entry["reason"] = note
+
+
+def _recheck_resumed_beliefs(
+    ctx: ToolContext, record: dict, event: Mapping, turn: int,
+    transitions: list[dict],
+) -> dict:
+    """Re-judge the checkpoint's done/claimed stages on the first resumed turn.
+
+    ``resume_plan`` restores the statuses verbatim. The first evidence turn
+    re-runs :func:`evidence_verdict` over every done/claimed stage; a stage whose
+    evidence no longer holds - or whose confirmation is invalidated by the new
+    result / the agent's own ledger / the missing independent position anchor -
+    is demoted to ``claimed_done`` and counted as a resume correction. The
+    correction lives on the plan record and in the confirmation ledger, so the
+    offline checkpoint score sees the same agent-side overturn.
+    """
+    state = record.get(RESUME_RECHECK_KEY)
+    if not isinstance(state, dict) or not state.get("pending"):
+        return {}
+    checked: list[str] = []
+    corrected: list[str] = []
+    details: list[dict] = []
+    for position, subtask in enumerate(record.get("subtasks") or [], 1):
+        if not isinstance(subtask, dict):
+            continue
+        status = str(subtask.get("status") or "")
+        if status not in (SUBTASK_DONE, SUBTASK_CLAIMED_DONE):
+            continue
+        subtask_id = str(subtask.get("id") or f"st_{position}")
+        checked.append(subtask_id)
+        verdict = evidence_verdict(subtask)
+        problem = _resumed_confirmation_problem(ctx, subtask, event)
+        if verdict.get("ok") and not problem:
+            details.append(
+                {"id": subtask_id, "status": status, "corrected": False, "reason": ""}
+            )
+            continue
+        missing = list(verdict.get("missing") or [])
+        confirmed = subtask.get("_evidence_confirmed")
+        if not problem and status != SUBTASK_DONE:
+            # the stage was already open (``claimed_done``): re-judging it
+            # confirms it still owes evidence, but nothing was overturned
+            subtask["_evidence_missing"] = missing
+            details.append(
+                {
+                    "id": subtask_id,
+                    "status": status,
+                    "corrected": False,
+                    "reason": "already_open:" + (",".join(missing) or "evidence_insufficient"),
+                    "missing": missing,
+                }
+            )
+            continue
+        if problem:
+            if isinstance(confirmed, dict):
+                confirmed["invalidated"] = problem
+            candidate_id = (
+                str(confirmed.get("candidate_id") or "")
+                if isinstance(confirmed, Mapping) else ""
+            )
+            _invalidate_resumed_candidate(ctx, candidate_id, problem)
+            if "confirmation" not in missing:
+                missing.append("confirmation")
+        reason = "resume_recheck:" + (
+            problem or ",".join(missing) or "evidence_insufficient"
+        )
+        _transition(
+            record, subtask, SUBTASK_CLAIMED_DONE, reason, turn, transitions
+        )
+        subtask["_resume_recheck_failed"] = True
+        subtask["_evidence_missing"] = missing
+        corrected.append(subtask_id)
+        details.append(
+            {
+                "id": subtask_id,
+                "status": status,
+                "corrected": True,
+                "reason": problem or "evidence_insufficient",
+                "missing": missing,
+            }
+        )
+    state.update(
+        pending=False,
+        turn=int(turn),
+        checked=checked,
+        corrected=corrected,
+        details=details,
+    )
+    return dict(state)
+
+
 def executor_step(ctx: ToolContext, event: Mapping | None) -> dict:
     """Advance the sub-task records from one finished tool call (P4).
 
@@ -1893,6 +2239,11 @@ def executor_step(ctx: ToolContext, event: Mapping | None) -> dict:
     outcome["charged"] = str(subtask.get("id") or "")
     before = (index, str(subtask.get("id") or ""))
     transitions: list[dict] = []
+    # a resumed plan is re-judged once, on its first evidence turn: the
+    # checkpoint's done/claimed statuses are the agent's belief, not a verdict
+    recheck = _recheck_resumed_beliefs(ctx, record, event, turn, transitions)
+    if recheck:
+        outcome["resume_recheck"] = recheck
     data = event.get("data") if isinstance(event.get("data"), Mapping) else {}
     named = any(_clean_id(data.get(key)) for key in ("subtask_id", "step_id", "plan_step_id"))
     if (
@@ -2631,6 +2982,16 @@ def resume_plan(ctx: ToolContext, episode_id: str, instruction: str | None = Non
     record["resumed_from"] = str(record.get("episode_id") or "")
     record["resume_count"] = int(record.get("resume_count", 0)) + 1
     record["episode_id"] = episode_id
+    # the checkpoint's statuses are adopted verbatim; the first evidence turn
+    # of the resumed leg re-judges them (a wrong done must be overturnable)
+    record[RESUME_RECHECK_KEY] = {
+        "pending": True,
+        "from": str(record.get("resumed_from") or ""),
+        "turn": None,
+        "checked": [],
+        "corrected": [],
+        "details": [],
+    }
     record["executor"] = {
         "last_turn": 0,
         "transitions": list((record.get("executor") or {}).get("transitions") or []),

@@ -267,7 +267,11 @@ class ToolStateTest(unittest.TestCase):
 
     def test_a_verified_goal_leads_with_the_completion_check_and_finish(self):
         ctx = make_context(FakeWorld(position=(2.2, 0.0, 0.0)))  # at the target
-        navigation_module._tool_verify_goal(ctx, {"reason": "check"})
+        # version 3: the completion check uses the agent's own estimate
+        ctx.extra["candidate_positions"] = {"cand_1": [2.2, 0.0, 0.0]}
+        navigation_module._tool_verify_goal(
+            ctx, {"reason": "check", "candidate_id": "cand_1"}
+        )
         state = tool_state(ctx.extra)
         self.assertEqual(state.name, TOOL_STATE_VERIFIED)
         order = state.priority()
@@ -588,6 +592,15 @@ def arrival_record(outcome="arrived"):
     }
 
 
+def confirmation_record(verdict="accepted", candidate="cand_1"):
+    return {
+        "tool": "confirm_candidate",
+        "status": STATUS_OK,
+        "data": {"verdict": verdict, "candidate_id": candidate},
+        "evidence": [EvidenceRef("observation", "obs_9", "confirmation view").to_dict()],
+    }
+
+
 class CompletionEvidenceTest(unittest.TestCase):
     """The chain behind ``success: true``: verification, or identity + arrival."""
 
@@ -600,11 +613,30 @@ class CompletionEvidenceTest(unittest.TestCase):
         self.assertEqual(chain["evidence_trail"],
                          [{"kind": "observation", "ref": "obs_7", "note": "verification"}])
 
-    def test_a_candidate_plus_an_arrival_is_evidence_too(self):
-        chain = completion_evidence([candidate_record(), arrival_record()])
+    def test_a_candidate_plus_an_arrival_and_confirmation_is_evidence(self):
+        chain = completion_evidence(
+            [candidate_record(), arrival_record(), confirmation_record()]
+        )
         self.assertTrue(chain["verified"])
         self.assertEqual(chain["kind"], "identity+arrival")
         self.assertEqual(chain["candidate_ids"], ["cand_1"])
+        self.assertTrue(chain["confirmation_ok"])
+
+    def test_a_candidate_arrival_without_confirmation_is_not_evidence(self):
+        """Version 2: ground -> approach share one position, so arrival alone
+        cannot prove the instance."""
+        chain = completion_evidence([candidate_record(), arrival_record()])
+        self.assertFalse(chain["verified"])
+        self.assertTrue(chain["confirmation_required"])
+        self.assertFalse(chain["confirmation_ok"])
+        self.assertIn("identity confirmation", " ".join(chain["missing"]))
+
+    def test_a_candidate_arrival_with_a_rejected_confirmation_is_not_evidence(self):
+        chain = completion_evidence(
+            [candidate_record(), arrival_record(), confirmation_record("rejected")]
+        )
+        self.assertFalse(chain["verified"])
+        self.assertTrue(chain["confirmation_required"])
 
     def test_an_unmet_verification_does_not_count(self):
         chain = completion_evidence([verify_record(verified=False), candidate_record()])
@@ -652,7 +684,12 @@ class FinishClaimTest(unittest.TestCase):
         self.assertTrue(result.data["hint"])
 
     def test_a_verified_trail_backs_the_claim(self):
-        self.registry.call("verify_goal", {"reason": "check"}, self.ctx)
+        # version 3: the verification needs a self-measured reference, so the
+        # episode's own candidate estimate is seeded (no scene target is read)
+        self.ctx.extra["candidate_positions"] = {"cand_1": [2.2, 0.0, 0.0]}
+        self.registry.call(
+            "verify_goal", {"reason": "check", "candidate_id": "cand_1"}, self.ctx
+        )
         result = self.registry.call("finish", {"reason": "done", "success": True}, self.ctx)
         self.assertIs(result.data["success"], True)
         self.assertEqual(result.data["claim"], "verified")
@@ -667,7 +704,10 @@ class FinishClaimTest(unittest.TestCase):
         self.assertEqual(result.data["claim"], "give_up")
 
     def test_the_evidence_pack_records_verifications_and_arrivals(self):
-        self.registry.call("verify_goal", {"reason": "check"}, self.ctx)
+        self.ctx.extra["candidate_positions"] = {"cand_1": [2.2, 0.0, 0.0]}
+        self.registry.call(
+            "verify_goal", {"reason": "check", "candidate_id": "cand_1"}, self.ctx
+        )
         pack = evidence_pack(self.ctx)
         self.assertTrue(pack["verifications"])
         self.assertIs(self.ctx.extra[EVIDENCE_PACK_KEY]["verifications"][0]["verified"], True)
@@ -687,8 +727,11 @@ class RuntimeClaimTest(unittest.TestCase):
 
         registry = full_registry()
         world = FakeWorld(position=(2.2, 0.0, 0.0))
+        ctx = make_context(
+            world, extra={"candidate_positions": {"cand_1": [2.2, 0.0, 0.0]}}
+        )
         log = AgentRuntime(registry, world, None, scripted_vlm(script), budget=8,
-                           max_turns=6).run("reach it")
+                           max_turns=6, tool_context=ctx).run("reach it")
         return log
 
     def test_an_unbacked_success_claim_is_not_counted_as_success(self):
@@ -704,7 +747,8 @@ class RuntimeClaimTest(unittest.TestCase):
 
     def test_a_verified_episode_carries_the_evidence_trail(self):
         log = self._run([
-            {"tool": "verify_goal", "args": {"reason": "check"}},
+            {"tool": "verify_goal", "args": {"reason": "check",
+                                             "candidate_id": "cand_1"}},
             {"tool": "finish", "args": {"reason": "verified", "success": True}},
         ])
         self.assertIs(log.success, True)
@@ -874,10 +918,12 @@ class RunnerDispatchTest(unittest.TestCase):
 
         return Recording()
 
-    def _run(self, out_dir, script, **kwargs):
+    def _run(self, out_dir, script, *, ctx_extra=None, **kwargs):
         vlm = self._vlm(script)
-        summary = self.runner.run_episode(self._world(), vlm, self._args(out_dir, **kwargs),
-                                          out_dir, episode_id="ep_dispatch")
+        summary = self.runner.run_episode(
+            self._world(), vlm, self._args(out_dir, **kwargs), out_dir,
+            episode_id="ep_dispatch", ctx_extra=ctx_extra,
+        )
         return summary, vlm
 
     def test_the_prompt_carries_the_state_catalogue_whole(self):
@@ -994,11 +1040,16 @@ class RunnerDispatchTest(unittest.TestCase):
 
     def test_a_verified_chain_is_recorded_in_the_summary(self):
         out_dir = self.tmp / "verified"
-        summary, _ = self._run(out_dir, [
-            {"tool": "observe", "args": {"mode": "forward"}},
-            {"tool": "verify_goal", "args": {"reason": "check"}},
-            {"tool": "finish", "args": {"reason": "verified", "success": True}},
-        ])
+        summary, _ = self._run(
+            out_dir,
+            [
+                {"tool": "observe", "args": {"mode": "forward"}},
+                {"tool": "verify_goal", "args": {"reason": "check",
+                                                 "candidate_id": "cand_1"}},
+                {"tool": "finish", "args": {"reason": "verified", "success": True}},
+            ],
+            ctx_extra={"candidate_positions": {"cand_1": [2.0, 0.5, 0.0]}},
+        )
         self.assertTrue(summary["success"], summary)
         self.assertTrue(summary["completion"]["verified"])
         self.assertTrue(summary["completion"]["evidence_trail"])

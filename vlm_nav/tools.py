@@ -56,11 +56,12 @@ Two further contracts live here because both adapters share them:
   a batch of n read-only calls costs n, not n+1.
 - the completion evidence chain: ``finish`` with ``"success": true`` is only
   accepted when the episode's own trail backs it - a ``verify_goal`` that
-  returned ``verified: true``, or a grounded candidate plus an arrival
-  (``completion_evidence``). The trail is recorded in the episode's evidence
-  pack (``ctx.extra["evidence_pack"]``) by the tools that produce it, so the
-  runtime, the runner and an MCP client judge one pack the same way: an unbacked
-  claim is downgraded to an *unverified* claim and is never counted as success.
+  returned ``verified: true``, or a grounded candidate plus an arrival plus an
+  accepted ``confirm_candidate`` (``completion_evidence``). The trail is
+  recorded in the episode's evidence pack (``ctx.extra["evidence_pack"]``) by
+  the tools that produce it, so the runtime, the runner and an MCP client judge
+  one pack the same way: an unbacked claim is downgraded to an *unverified*
+  claim and is never counted as success.
 - the task scope (``task_scope``): every result carries
   ``{task_id, subtask_id, candidate_id, evidence_revision}`` under ``scope``.
   A confirmation/arrival belongs to one sub-task and candidate instance; a
@@ -74,6 +75,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
 import time
 from typing import Any, Callable, Mapping
 
@@ -158,19 +160,19 @@ TOOL_STATE_PRIORITY: dict[str, tuple[str, ...]] = {
     ),
     TOOL_STATE_CANDIDATE: (
         "compare_candidates", "ground_target", "approach_candidate", "verify_goal",
-        "propose_viewpoints", "check_path", "observe", "query_memory", "batch_read",
-        "inspect_region", "task_status", "cancel_task", "update_plan", "get_plan",
-        "finish",
+        "confirm_candidate", "propose_viewpoints", "check_path", "observe",
+        "query_memory", "batch_read", "inspect_region", "task_status", "cancel_task",
+        "update_plan", "get_plan", "finish",
     ),
     TOOL_STATE_MOVING: (
-        "task_status", "cancel_task", "observe", "verify_goal", "batch_read",
-        "compare_candidates", "propose_viewpoints", "ground_target", "inspect_region",
-        "query_memory", "check_path", "search_target", "update_plan", "get_plan",
-        "finish",
+        "task_status", "cancel_task", "observe", "verify_goal", "confirm_candidate",
+        "batch_read", "compare_candidates", "propose_viewpoints", "ground_target",
+        "inspect_region", "query_memory", "check_path", "search_target", "update_plan",
+        "get_plan", "finish",
     ),
     TOOL_STATE_VERIFIED: (
-        "finish", "verify_goal", "task_status", "cancel_task", "observe",
-        "batch_read", "query_memory", "compare_candidates", "ground_target",
+        "finish", "verify_goal", "confirm_candidate", "task_status", "cancel_task",
+        "observe", "batch_read", "query_memory", "compare_candidates", "ground_target",
         "inspect_region", "propose_viewpoints", "check_path", "search_target",
         "update_plan", "get_plan",
     ),
@@ -180,7 +182,8 @@ TOOL_STATE_PRIORITY: dict[str, tuple[str, ...]] = {
 #: state-specific head so the ranking of a name no state mentions is stable.
 TOOL_TAIL_ORDER = (
     "approach_candidate", "batch_read", "cancel_task", "check_path",
-    "compare_candidates", "finish", "get_plan", "go_to_viewpoint", "ground_target",
+    "compare_candidates", "confirm_candidate", "finish", "get_plan",
+    "go_to_viewpoint", "ground_target",
     "inspect_region", "navigate", "observe", "propose_viewpoints", "query_memory",
     "return_to_observation", "search_target", "task_status", "update_plan",
     "verify_goal",
@@ -208,8 +211,9 @@ CATALOG_DISPATCH_NOTE = (
     "serial with its own task_id. A repeated request for a place already reached "
     "answers already_done (nothing flies again). finish with success=true is only "
     "counted with the evidence trail it reports (a verify_goal that returned "
-    "verified=true, or a grounded candidate plus an arrival) and, when a plan "
-    "exists, every sub-task done; the answer lists the open stages."
+    "verified=true, or a grounded candidate plus an arrival, plus an accepted "
+    "confirm_candidate for a reached candidate) and, when a plan exists, every "
+    "sub-task done; the answer lists the open stages."
 )
 #: Default character budget of a state-aware catalogue: enough for the state's
 #: own tools with their full arguments plus every other tool's name. The
@@ -272,6 +276,8 @@ def tool_state(extra: Mapping | None = None, ctx: Any = None) -> ToolState:
     store = extra.get(CANDIDATE_STORE_KEY)
     if isinstance(store, Mapping):
         for key, record in store.items():
+            if isinstance(record, Mapping) and str(record.get("status") or "") == "rejected":
+                continue  # a rejected instance is not offered for another approach
             candidate_id = ""
             if isinstance(record, Mapping):
                 candidate_id = str(record.get("id") or "")
@@ -314,6 +320,32 @@ def tool_state(extra: Mapping | None = None, ctx: Any = None) -> ToolState:
                     continue
             verified = True
             break
+        if not verified:
+            # an accepted instance confirmation is the version-2 task signal
+            for item in pack.get("confirmations") or ():
+                if not isinstance(item, Mapping):
+                    continue
+                if str(item.get("verdict") or "") != CONFIRMATION_ACCEPTED:
+                    continue
+                candidate = str(scope.get("candidate_id") or "")
+                if candidate and str(item.get("candidate_id") or "") != candidate:
+                    continue
+                if candidate:
+                    current = (extra.get(CANDIDATE_STORE_KEY) or {}).get(candidate)
+                    if isinstance(current, Mapping) and str(
+                        current.get("status") or ""
+                    ) == "rejected":
+                        continue
+                revision = item.get("evidence_revision")
+                if revision is not None and scope:
+                    try:
+                        stale = int(revision) != int(scope.get("evidence_revision", 0))
+                    except (TypeError, ValueError):
+                        stale = True
+                    if stale:
+                        continue
+                verified = True
+                break
 
     observations = _count(extra.get("observations")) or _count(extra.get(OBSERVATION_STORE_KEY))
     viewpoints = _count(extra.get("viewpoints_by_id")) or _count(extra.get("viewpoints"))
@@ -326,7 +358,10 @@ def tool_state(extra: Mapping | None = None, ctx: Any = None) -> ToolState:
         )
     elif verified:
         name = TOOL_STATE_VERIFIED
-        hint = "a completion check of this episode passed (verify_goal verified=true)"
+        hint = (
+            "a completion check of this episode passed (verify_goal verified=true "
+            "or an accepted confirm_candidate)"
+        )
     elif candidates:
         name = TOOL_STATE_CANDIDATE
         hint = "{} grounded candidate(s): {}".format(
@@ -811,6 +846,26 @@ MISSING_VERIFICATION = "no verify_goal call of this episode returned verified=tr
 MISSING_ARRIVAL = "no arrival evidence (a movement call with outcome=arrived)"
 MISSING_IDENTITY = "no grounded candidate (cand_N from ground_target/search_target)"
 MISSING_REFERENCE = "the evidence carries no reference (kind:ref)"
+#: A movement stage is not confirmed by reaching a candidate alone: the
+#: candidate instance has to be accepted by ``confirm_candidate`` from a new
+#: view/measurement, under the current scope revision.
+MISSING_CONFIRMATION = (
+    "no accepted confirm_candidate for the current candidate/evidence revision "
+    "(identity confirmation missing)"
+)
+
+#: Verdict vocabulary of ``confirm_candidate``.
+CONFIRMATION_ACCEPTED = "accepted"
+CONFIRMATION_UNCERTAIN = "uncertain"
+CONFIRMATION_REJECTED = "rejected"
+CONFIRMATION_VERDICTS = (
+    CONFIRMATION_ACCEPTED,
+    CONFIRMATION_UNCERTAIN,
+    CONFIRMATION_REJECTED,
+)
+#: What an ``uncertain`` verdict still needs, and therefore which directed
+#: recovery the caller should take (never a generic re-search).
+CONFIRMATION_MISSING = ("distance", "identity", "relation", "path", "localization")
 
 # ---------------------------------------------------------------------------
 # task scope: one identity for every call and every result (goal.md v1)
@@ -834,6 +889,9 @@ MISSING_SCOPE_MISMATCH = "the finish call declares a task scope that is not curr
 SCOPE_CANDIDATE_TOOLS = ("verify_goal", "approach_candidate")
 #: Outcomes of ``compare_candidates`` that resolve an identity question.
 SCOPE_IDENTITY_RESOLVED = ("same", "match", "identical", "confirmed")
+#: A re-grounding that mints a new candidate this close to the confirmed one is
+#: the same instance seen again: the acceptance is inherited, not invalidated.
+CONFIRMATION_INHERIT_RADIUS_M = 1.5
 
 
 def _plan_identity(ctx: ToolContext) -> tuple[str, str]:
@@ -912,24 +970,182 @@ def scope_active(ctx: ToolContext, scope: Mapping | None = None) -> bool:
         return False
 
 
+def _scope_candidate_position(ctx: ToolContext, candidate_id: str) -> list[float] | None:
+    """World position of one candidate record, or None when it has none."""
+    if not candidate_id or not isinstance(ctx.extra, dict):
+        return None
+    store = ctx.extra.get(CANDIDATE_STORE_KEY)
+    record = store.get(candidate_id) if isinstance(store, Mapping) else None
+    if not isinstance(record, Mapping):
+        return None
+    for key in ("position_flu", "position", "world_flu", "pos"):
+        value = record.get(key)
+        if value is None:
+            continue
+        try:
+            point = [float(item) for item in list(value)[:3]]
+        except (TypeError, ValueError):
+            continue
+        if len(point) == 3 and all(math.isfinite(item) for item in point):
+            return point
+    return None
+
+
+def _inherit_confirmation(
+    ctx: ToolContext,
+    old_candidate: str,
+    new_candidate: str,
+    revision: int,
+    old_revision: int | None = None,
+) -> bool:
+    """Transfer the current sub-task's acceptance to a nearby new candidate.
+
+    A re-grounding inside the same sub-task often mints a fresh ``cand_N`` for
+    the same physical object (a new view, a slightly different box). When the
+    two positions are within :data:`CONFIRMATION_INHERIT_RADIUS_M` the accepted
+    confirmation is re-bound to the new id and revision instead of becoming
+    stale. A far candidate is a different instance and is left stale.
+    """
+    if not old_candidate or not new_candidate or old_candidate == new_candidate:
+        return False
+    old_position = _scope_candidate_position(ctx, old_candidate)
+    new_position = _scope_candidate_position(ctx, new_candidate)
+    if old_position is None or new_position is None:
+        return False
+    gap = math.dist(old_position, new_position)
+    if gap > CONFIRMATION_INHERIT_RADIUS_M:
+        return False
+    try:
+        from .tool_impl_task import current_subtask
+
+        subtask = current_subtask(ctx)
+    except Exception:  # noqa: BLE001 - a foreign context may not carry a plan
+        return False
+    if not isinstance(subtask, dict):
+        return False
+    record = subtask.get("_evidence_confirmed")
+    if not isinstance(record, dict) or record.get("invalidated"):
+        return False
+    if str(record.get("candidate_id") or "") != old_candidate:
+        return False
+    previous = int(revision) - 1 if old_revision is None else int(old_revision)
+    try:
+        confirmed_revision = int(record.get("evidence_revision"))
+    except (TypeError, ValueError):
+        return False
+    if confirmed_revision != previous:
+        return False
+    record["candidate_id"] = new_candidate
+    record["evidence_revision"] = int(revision)
+    record["inherited_from"] = old_candidate
+    record["inherited_distance_m"] = round(gap, 3)
+    # the episode's own records follow the inherited identity: the evidence
+    # pack (read by finish), the confirmation ledger and the candidate mirror
+    pack = ctx.extra.get(EVIDENCE_PACK_KEY)
+    if isinstance(pack, dict):
+        for item in pack.get("confirmations") or ():
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("candidate_id") or "") != old_candidate:
+                continue
+            if str(item.get("verdict") or "") != "accepted":
+                continue
+            item_revision = item.get("evidence_revision")
+            if item_revision is not None:
+                try:
+                    if int(item_revision) != previous:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+            item["candidate_id"] = new_candidate
+            item["evidence_revision"] = int(revision)
+            item["inherited_from"] = old_candidate
+    ledger = ctx.extra.get("confirmation_ledger")
+    if isinstance(ledger, dict):
+        old_entry = ledger.get(old_candidate)
+        if isinstance(old_entry, dict) and str(
+            old_entry.get("last_verdict") or ""
+        ) == "accepted":
+            try:
+                accepted_revision = int(old_entry.get("accepted_revision") or -1)
+            except (TypeError, ValueError):
+                accepted_revision = -1
+            if accepted_revision == previous:
+                new_entry = ledger.get(new_candidate)
+                if not isinstance(new_entry, dict):
+                    new_entry = {
+                        "evidence_keys": [],
+                        "observation_ids": [],
+                        "accepted": 0,
+                        "attempts": 0,
+                        "attempts_since_accept": 0,
+                        "no_progress_streak": 0,
+                        "last_verdict": "",
+                        "accepted_revision": None,
+                        "revision": None,
+                        "stalled": False,
+                    }
+                    ledger[new_candidate] = new_entry
+                new_entry["accepted"] = max(
+                    int(new_entry.get("accepted", 0) or 0),
+                    int(old_entry.get("accepted", 1) or 1),
+                )
+                new_entry["last_verdict"] = "accepted"
+                new_entry["accepted_revision"] = int(revision)
+                new_entry["revision"] = int(revision)
+                new_entry["attempts_since_accept"] = 0
+                new_entry["no_progress_streak"] = 0
+                new_entry["stalled"] = False
+                new_entry["inherited_from"] = old_candidate
+    store = ctx.extra.get(CANDIDATE_STORE_KEY)
+    new_record = store.get(new_candidate) if isinstance(store, Mapping) else None
+    if isinstance(new_record, dict):
+        new_record["confirmation_status"] = "accepted"
+        new_record["confirmation_revision"] = int(revision)
+        new_record["confirmation_missing"] = []
+        new_record["inherited_from"] = old_candidate
+    return True
+
+
+def _sync_scope_subtask(ctx: ToolContext, candidate: str, revision: int) -> None:
+    """Keep the live sub-task's current candidate/revision in step with the scope."""
+    try:
+        from .tool_impl_task import current_subtask
+
+        subtask = current_subtask(ctx)
+    except Exception:  # noqa: BLE001 - a foreign context may not carry a plan
+        return
+    if isinstance(subtask, dict):
+        subtask["_evidence_candidate"] = candidate
+        subtask["_evidence_revision"] = int(revision)
+
+
 def select_scope_candidate(ctx: ToolContext, candidate_id: Any, *, reground: bool = False) -> dict:
     """Bind ``candidate_id`` to the current scope, bumping the revision on change.
 
     A switch to another candidate instance, or a fresh grounding of the same
     one (``reground=True``), increments ``evidence_revision``; every
     confirmation recorded against the previous revision then stops being
-    accepted by ``finish``.
+    accepted by ``finish`` - unless the new candidate sits within
+    :data:`CONFIRMATION_INHERIT_RADIUS_M` of the confirmed one in the same
+    sub-task, in which case the acceptance is inherited.
     """
     scope = task_scope(ctx)
     candidate = str(candidate_id or "")
     if not candidate:
         return scope
     revision = int(scope.get("evidence_revision", 0))
-    if candidate != str(scope.get("candidate_id") or ""):
+    old_candidate = str(scope.get("candidate_id") or "")
+    if candidate != old_candidate:
         scope["candidate_id"] = candidate
         scope["evidence_revision"] = revision + 1
+        _inherit_confirmation(
+            ctx, old_candidate, candidate, scope["evidence_revision"], revision
+        )
+        _sync_scope_subtask(ctx, candidate, scope["evidence_revision"])
     elif reground:
         scope["evidence_revision"] = revision + 1
+        _sync_scope_subtask(ctx, candidate, scope["evidence_revision"])
     ctx.extra[TASK_SCOPE_KEY] = scope
     return scope
 
@@ -990,6 +1206,8 @@ def stamp_result_scope(
     the MCP call return the same four fields. A successful grounding/re-grounding
     selects the candidate and bumps the revision; a candidate-selecting call
     binds its candidate; a resolved identity comparison bumps the revision too.
+    A switch to a candidate within :data:`CONFIRMATION_INHERIT_RADIUS_M` of the
+    confirmed one transfers that acceptance (``select_scope_candidate``).
     A replayed (cached) result is stamped with the *current* scope but never
     changes it - a replay is not new evidence.
     """
@@ -1038,7 +1256,8 @@ FINISH_SCHEMA = {
             "type": "boolean",
             "description": (
                 "true only with evidence (a verify_goal that returned verified=true, "
-                "or a grounded candidate plus an arrival) and, when a plan exists, "
+                "or a grounded candidate plus an arrival, plus an accepted "
+                "confirm_candidate for a reached candidate) and, when a plan exists, "
                 "every sub-task done; false is the honest give-up"
             ),
         },
@@ -1067,7 +1286,7 @@ def evidence_pack(ctx: ToolContext) -> dict:
     if not isinstance(pack, dict):
         pack = {}
         ctx.extra[EVIDENCE_PACK_KEY] = pack
-    for key in ("verifications", "arrivals", "candidates"):
+    for key in ("verifications", "arrivals", "candidates", "confirmations"):
         if not isinstance(pack.get(key), list):
             pack[key] = []
     return pack
@@ -1165,6 +1384,44 @@ def record_arrival(
     return _append_pack(evidence_pack(ctx), "arrivals", record)
 
 
+def record_confirmation(
+    ctx: ToolContext, *, candidate_id: str, verdict: str,
+    observation_ids: Any = (), source_observation_ids: Any = (),
+    position_delta_m: Any = None, position_tolerance_m: Any = None,
+    missing: Any = (), reason: str = "", checks: Any = None,
+    evidence: Any = (), call: int | None = None,
+) -> dict:
+    """Record one ``confirm_candidate`` verdict in the episode's pack.
+
+    The record carries the scope it was taken under (candidate, task, sub-task,
+    evidence revision), the *new* observations the verdict was based on and the
+    position deviation between the fresh measurement and the candidate. Only an
+    ``accepted`` record can back a ``finish`` claim; the attempts are kept so a
+    later turn can see what was already checked.
+    """
+    record = {
+        "candidate_id": str(candidate_id or ""),
+        "verdict": str(verdict or ""),
+        "observation_ids": [str(item) for item in observation_ids or () if item],
+        "source_observation_ids": [
+            str(item) for item in source_observation_ids or () if item
+        ],
+        "position_delta_m": (
+            None if position_delta_m is None else round(float(position_delta_m), 3)
+        ),
+        "position_tolerance_m": (
+            None if position_tolerance_m is None else round(float(position_tolerance_m), 3)
+        ),
+        "missing": [str(item) for item in missing or () if item],
+        "reason": str(reason or "")[:200],
+        "checks": dict(checks) if isinstance(checks, Mapping) else {},
+        "evidence": _ref_dicts(evidence),
+        **_scope_fields_of(ctx, candidate_id),
+        "call": int(call if call is not None else len(getattr(ctx, "log", []) or ()) + 1),
+    }
+    return _append_pack(evidence_pack(ctx), "confirmations", record)
+
+
 def evidence_records_from_pack(pack: Any) -> list[dict]:
     """The pack as the record shape :func:`completion_evidence` judges."""
     if not isinstance(pack, Mapping):
@@ -1181,6 +1438,26 @@ def evidence_records_from_pack(pack: Any) -> list[dict]:
                      "task_id": item.get("task_id", ""),
                      "subtask_id": item.get("subtask_id", ""),
                      "candidate_id": item.get("candidate_id", ""),
+                     "evidence_revision": item.get("evidence_revision")},
+            "evidence": list(item.get("evidence") or []),
+            "call": item.get("call"),
+        })
+    for item in pack.get("confirmations") or ():
+        if not isinstance(item, Mapping):
+            continue
+        records.append({
+            "tool": "confirm_candidate",
+            "status": STATUS_OK,
+            "data": {"verdict": item.get("verdict", ""),
+                     "candidate_id": item.get("candidate_id", ""),
+                     "observation_ids": list(item.get("observation_ids") or []),
+                     "source_observation_ids": list(
+                         item.get("source_observation_ids") or []
+                     ),
+                     "position_delta_m": item.get("position_delta_m"),
+                     "missing": list(item.get("missing") or []),
+                     "task_id": item.get("task_id", ""),
+                     "subtask_id": item.get("subtask_id", ""),
                      "evidence_revision": item.get("evidence_revision")},
             "evidence": list(item.get("evidence") or []),
             "call": item.get("call"),
@@ -1245,26 +1522,43 @@ def evidence_records_from_trace(entries: Any) -> list[dict]:
 
 
 def _chain_of(records: list[dict]) -> dict:
-    """One completion chain (verification, or identity + arrival) or an empty one."""
+    """One completion chain (verification, or identity + arrival) or an empty one.
+
+    Version 2: an arrival of an ``approach_candidate`` shares its position with
+    the grounding that proposed it, so it is not completion evidence on its own.
+    Such a chain is marked ``confirmation_required`` and only counts when an
+    accepted ``confirm_candidate`` for the same candidate is on the trail.
+    Arrivals at viewpoints / recalled camera poses carry no object identity and
+    keep the version-1 rule.
+    """
     chain = {"kind": "", "evidence_trail": [], "candidate_ids": [], "arrivals": 0,
-             "verifications": 0}
+             "verifications": 0, "confirmations": 0, "confirmation_ids": [],
+             "confirmation_required": False, "confirmation_ok": True}
+    verification_refs: list[dict] | None = None
+    verification_candidate = ""
+    candidate_ids: list[str] = []
+    candidate_refs: list[dict] = []
+    confirmation_refs: list[dict] = []
+    arrivals: list[dict] = []
+    approach_arrivals: list[str] = []
     for record in records:
         tool = str(record.get("tool") or "")
         data = record.get("data") if isinstance(record.get("data"), Mapping) else {}
         refs = _ref_dicts(record.get("evidence") or ())
+        if tool == "confirm_candidate" and str(data.get("verdict") or "") == CONFIRMATION_ACCEPTED:
+            chain["confirmations"] += 1
+            candidate_id = str(data.get("candidate_id") or "")
+            if candidate_id and candidate_id not in chain["confirmation_ids"]:
+                chain["confirmation_ids"].append(candidate_id)
+            confirmation_refs.extend(refs)
         if tool == "verify_goal":
             chain["verifications"] += 1
             if data.get("verified") is True:
-                chain["kind"] = COMPLETION_VERIFICATION
-                chain["evidence_trail"] = refs
-                return chain
-    candidate_ids: list[str] = []
-    candidate_refs: list[dict] = []
-    arrivals: list[dict] = []
-    for record in records:
-        tool = str(record.get("tool") or "")
-        data = record.get("data") if isinstance(record.get("data"), Mapping) else {}
-        refs = _ref_dicts(record.get("evidence") or ())
+                # the *latest* passing verification is the terminal claim: a
+                # long episode has one per stage, and only the last one speaks
+                # for the candidate the finish is about
+                verification_refs = refs
+                verification_candidate = str(data.get("candidate_id") or "")
         if tool in IDENTITY_TOOLS:
             candidate_id = str(data.get("candidate_id") or "")
             if not candidate_id:
@@ -1278,14 +1572,52 @@ def _chain_of(records: list[dict]) -> dict:
                 candidate_refs.extend(refs)
         if tool in ARRIVAL_TOOLS and str(data.get("outcome") or "") in ARRIVAL_OUTCOMES:
             arrivals.append({"refs": refs})
+            if tool == "approach_candidate" or str(
+                data.get("intent") or ""
+            ) == "approach_candidate":
+                approach_arrivals.append(
+                    str(data.get("candidate_id") or data.get("target_id") or "")
+                )
         elif tool == "task_status" and data.get("completed") and data.get("arrived"):
             arrivals.append({"refs": refs or _ref_dicts(data.get("arrival_evidence") or ())})
     chain["candidate_ids"] = candidate_ids
     chain["arrivals"] = len(arrivals)
-    if candidate_ids and arrivals:
+    if verification_refs is not None:
+        chain["kind"] = COMPLETION_VERIFICATION
+        # a verification with no reference of its own is not a chain, even when
+        # a confirmation is also on the trail
+        chain["evidence_trail"] = (
+            verification_refs + confirmation_refs if verification_refs else []
+        )
+    elif candidate_ids and arrivals:
         chain["kind"] = "identity+arrival"
-        chain["evidence_trail"] = candidate_refs + [ref for item in arrivals
-                                                    for ref in item["refs"]]
+        chain["evidence_trail"] = (
+            candidate_refs
+            + confirmation_refs
+            + [ref for item in arrivals for ref in item["refs"]]
+        )
+    # Which arrivals are part of the *selected* chain? A passing verification is
+    # about one candidate: an earlier stage's arrival of another candidate is
+    # not the claim's evidence (and cannot demand its confirmation). The
+    # identity+arrival chain, on the other hand, is the arrival itself.
+    if verification_refs is not None:
+        relevant_arrivals = [
+            candidate for candidate in approach_arrivals
+            if not verification_candidate or not candidate
+            or candidate == verification_candidate
+        ]
+    else:
+        relevant_arrivals = list(approach_arrivals)
+    if relevant_arrivals:
+        chain["confirmation_required"] = True
+        # the confirmation has to belong to the candidate whose arrival is on
+        # the chain; with no candidate id on the arrival records, any grounded
+        # candidate is the best available binding
+        arrival_ids = {candidate for candidate in relevant_arrivals if candidate}
+        scope_ids = arrival_ids or set(candidate_ids)
+        chain["confirmation_ok"] = bool(chain["confirmation_ids"]) and (
+            not scope_ids or bool(set(chain["confirmation_ids"]) & scope_ids)
+        )
     return chain
 
 
@@ -1295,15 +1627,24 @@ def completion_evidence(records: Any) -> dict:
     Returns ``{verified, kind, evidence_trail, missing, ...}``: ``verified`` is
     true when the trail holds a verification that passed, or a grounded
     candidate *and* an arrival - and the chosen chain carries at least one
-    evidence reference, because a claim has to point at something. Everything
-    else is reported in ``missing``, so the caller can say what to do instead.
+    evidence reference, because a claim has to point at something. Version 2
+    adds one requirement: an approach arrival is only counted when an accepted
+    ``confirm_candidate`` for the same instance is on the trail (reaching the
+    place grounding proposed does not prove the instance). Everything else is
+    reported in ``missing``, so the caller can say what to do instead.
     """
     records = [record for record in (records or ()) if isinstance(record, Mapping)]
     chain = _chain_of(records)
-    verified = bool(chain["kind"]) and bool(chain["evidence_trail"])
+    verified = (
+        bool(chain["kind"])
+        and bool(chain["evidence_trail"])
+        and bool(chain["confirmation_ok"])
+    )
     missing: list[str] = []
     if chain["kind"] and not chain["evidence_trail"]:
         missing.append(MISSING_REFERENCE)
+    if chain["confirmation_required"] and not chain["confirmation_ok"]:
+        missing.append(MISSING_CONFIRMATION)
     if not chain["kind"]:
         if not chain["verifications"]:
             missing.append(MISSING_VERIFICATION)
@@ -1327,6 +1668,10 @@ def completion_evidence(records: Any) -> dict:
         "candidate_ids": list(chain["candidate_ids"]),
         "arrivals": int(chain["arrivals"]),
         "verifications": int(chain["verifications"]),
+        "confirmations": int(chain["confirmations"]),
+        "confirmation_ids": list(chain["confirmation_ids"]),
+        "confirmation_required": bool(chain["confirmation_required"]),
+        "confirmation_ok": bool(chain["confirmation_ok"]),
     }
 
 

@@ -193,9 +193,14 @@ MAX_EXECUTOR_AUTO_STEPS = 3
 #: ``TurnRecord.raw_reply`` of a call the executor issued on its own (there is
 #: no model reply to quote).
 AUTO_STEP_REPLY = "[executor]"
-#: Tools the executor never issues on its own: closing the episode and plan
-#: bookkeeping are the model's decisions, not a plan step.
-AUTO_STEP_EXCLUDED_TOOLS = ("finish", "update_plan", "get_plan", "task_status", "cancel_task")
+#: Tools the executor never issues on its own: closing the episode, plan
+#: bookkeeping and the identity confirmation are the model's decisions, not a
+#: plan step (``confirm_candidate`` chooses new views and spends model calls; a
+#: scripted/experiment flow must be able to place it deliberately).
+AUTO_STEP_EXCLUDED_TOOLS = (
+    "finish", "update_plan", "get_plan", "task_status", "cancel_task",
+    "confirm_candidate",
+)
 #: Prompt text carried with the STATE block once a plan exists: the executor's
 #: deterministic stepping has no source unless the plan itself spells one out.
 PLAN_CALL_HINT = (
@@ -353,6 +358,9 @@ BAD_OUTCOMES = (
 RECOVERY_VIEW_TOOLS = ("observe", "inspect_region", "query_memory")
 RECOVERY_SEARCH_TOOLS = ("propose_viewpoints", "go_to_viewpoint")
 RECOVERY_GROUND_TOOLS = ("ground_target", "compare_candidates")
+#: Identity is settled by confirming the current candidate instance from a new
+#: view - not by a global re-search that forgets which instance is in question.
+RECOVERY_CONFIRM_TOOL = "confirm_candidate"
 #: The multi-view sweep the search skill registers: when a place is searched out,
 #: one call of it sweeps and grounds somewhere new instead of re-observing.
 RECOVERY_SWEEP_TOOL = "search_target"
@@ -637,6 +645,71 @@ def recovery_advice(
                 "views and grounds them in one call"
             )
 
+    # (b0) an unresolved candidate range: confirmation cannot fix geometry
+    elif _norm_token(reason) in (
+        "candidate_distance_uncertain", "candidate_distance_conflict",
+    ) or (
+        tool == RECOVERY_CONFIRM_TOOL
+        and _norm_token(data.get("distance_source")) == "conflict"
+    ):
+        advice = [
+            "the candidate's position is not trusted: its depth reading and the "
+            "model's range estimate disagree, and another confirmation cannot "
+            "resolve a range"
+        ]
+        if view_tools:
+            advice.append(
+                f"change the viewpoint first: {', '.join(view_tools)}"
+            )
+        if "propose_viewpoints" in names and "go_to_viewpoint" in names:
+            advice.append(
+                "or move to a viewpoint the candidate has not been seen from "
+                "(propose_viewpoints, then go_to_viewpoint)"
+            )
+        if ground_tools:
+            advice.append(
+                f"then re-ground the target from the new view with {ground_tools[0]}"
+            )
+        advice.append(
+            "do not call confirm_candidate again on this candidate until it has "
+            "been re-grounded"
+        )
+
+    # (c0) an inconclusive identity check: confirm the instance, not the task
+    elif (
+        _norm_token(data.get("verified")) == "uncertain"
+        or (tool == RECOVERY_CONFIRM_TOOL and _norm_token(data.get("verdict")) == "uncertain")
+    ) and RECOVERY_CONFIRM_TOOL in names:
+        candidate = str(data.get("candidate_id") or (args or {}).get("candidate_id") or "")
+        declared_missing = data.get("missing")
+        if isinstance(declared_missing, str):
+            declared_missing = [declared_missing]
+        missing = {str(item) for item in (declared_missing or ())}
+        advice = [
+            "the identity check is inconclusive"
+            + (f" ({reason})" if reason else "")
+            + ": do not fall back to a generic search"
+        ]
+        advice.append(
+            f"{RECOVERY_CONFIRM_TOOL}("
+            + (f'candidate_id="{candidate}"' if candidate else "")
+            + ") from a *different* heading/pose: the same image cannot settle it"
+        )
+        if "relation" in missing:
+            advice.append(
+                "the relation anchor is missing: take a view that holds both the "
+                "candidate and the anchor object"
+            )
+        if "distance" in missing:
+            advice.append(
+                "close the remaining distance first (approach_candidate), then confirm"
+            )
+        if "path" in missing:
+            advice.append(
+                "keep the candidate identity and change the route "
+                "(propose_viewpoints / go_to_viewpoint), do not re-ground elsewhere"
+            )
+
     # (c) an identity conflict between candidates
     elif data.get("conflicts") or _norm_token(data.get("verdict")) in (
         "different", "uncertain", "conflict", "mismatch"
@@ -644,6 +717,15 @@ def recovery_advice(
         advice = [
             "the candidates disagree about the target: do not approach either yet"
         ]
+        candidate = str(data.get("candidate_id") or (args or {}).get("candidate_id") or "")
+        if RECOVERY_CONFIRM_TOOL in names and candidate:
+            advice.insert(
+                0,
+                f"settle the current instance first: {RECOVERY_CONFIRM_TOOL}"
+                f"(candidate_id=\"{candidate}\") takes a new view and judges the "
+                "attributes/relation anchor - a global re-search would forget which "
+                "instance is in question",
+            )
         if "compare_candidates" in names:
             advice.append(
                 "collect one more piece of evidence (a new view or a magnified "
