@@ -248,6 +248,7 @@ REASON_ABORTED = "aborted"
 #: A field the episode does not know yet says ``n/a`` - the block never drops a
 #: label, so the model can rely on where each fact is.
 STATE_LABELS = (
+    "identity_anchor",
     "subgoal",
     "candidate",
     "evidence",
@@ -2137,6 +2138,7 @@ class AgentRuntime:
         else:
             budget = f"{self._budget_left()} tool calls"
         return {
+            "identity_anchor": self._identity_anchor_text(),
             "subgoal": subgoal,
             "candidate": self._candidate_text(),
             "evidence": (
@@ -2727,6 +2729,51 @@ class AgentRuntime:
         if 1 <= current <= len(steps):
             return _truncate(steps[current - 1], MAX_STATE_CHARS)
         return "n/a"
+
+    def _identity_anchor_text(self) -> str:
+        """The confirmed instance and its relation anchor, before anything else.
+
+        This is the STATE half of the long-horizon memory priority: which
+        object was confirmed (verdict/revision) and the phrase that makes it
+        findable again ("next to the wooden door") lead the block, because a
+        delayed revisit has to re-identify the instance before it can move.
+        Only the agent's own records are read - no scene truth.
+        """
+        memory = getattr(self.ctx, "memory", None)
+        identities = getattr(memory, "identities", None) if memory is not None else None
+        if identities is None:
+            return "n/a"
+        parts: list[str] = []
+        try:
+            entries = identities.all(limit=3)
+        except Exception:  # noqa: BLE001 - the layer is optional
+            entries = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            candidate = str(entry.get("candidate_id") or "")
+            if not candidate:
+                continue
+            verdict = str(entry.get("verdict") or "")
+            if verdict not in ("accepted", "rejected", "uncertain"):
+                continue
+            detail = f"{candidate}[{verdict}"
+            if entry.get("revision") is not None:
+                detail += f" rev={entry['revision']}"
+            detail += "]"
+            if entry.get("anchor"):
+                detail += f" anchor={entry['anchor']}"
+            parts.append(detail)
+        try:
+            anchors = identities.anchors(limit=2)
+        except Exception:  # noqa: BLE001
+            anchors = []
+        for anchor in anchors:
+            if anchor and not any(anchor in part for part in parts):
+                parts.append(f"anchor={anchor}")
+        if not parts:
+            return "n/a"
+        return _truncate(" | ".join(parts), MAX_STATE_CHARS)
 
     def _candidate_text(self) -> str:
         """The newest grounded candidate and how much of it is known.

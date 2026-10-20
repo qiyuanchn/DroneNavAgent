@@ -3217,6 +3217,8 @@ CHECKPOINT_SOURCES = (
     "open_questions",
     "evidence_pack",
     "last_observation_id",
+    "identities",
+    "anchors",
 )
 
 
@@ -3280,12 +3282,25 @@ def build_runtime_checkpoint(
         "open_questions": None,
         "evidence_pack": {},
         "last_observation_id": "",
+        "identities": [],
+        "anchors": [],
     }
     for key in CHECKPOINT_SOURCES:
         value = extra.get(key)
         if value is None:
             continue
         checkpoint[key] = copy.deepcopy(jsonable(value))
+    # the identity layer lives on the memory store, not in ctx.extra: save its
+    # fingerprints/anchors verbatim so a resumed brief can say which instance was
+    # confirmed without consulting the scene
+    memory = getattr(ctx, "memory", None) if ctx is not None else None
+    identities = getattr(memory, "identities", None) if memory is not None else None
+    if identities is not None:
+        try:
+            checkpoint["identities"] = copy.deepcopy(jsonable(identities.all()))
+            checkpoint["anchors"] = copy.deepcopy(jsonable(identities.anchors()))
+        except Exception:  # noqa: BLE001 - a foreign memory may not fit the layer
+            pass
     if not checkpoint["beliefs"] and checkpoint["hypotheses"]:
         checkpoint["beliefs"] = copy.deepcopy(checkpoint["hypotheses"])
     return jsonable(checkpoint)
@@ -3443,27 +3458,22 @@ def resume_brief(leg: LegResult, task: TaskSpec | None = None, *, limit: int = 1
         "These are YOUR OWN records from the interrupted leg, loaded from its "
         "checkpoint without any evaluator correction:",
     ]
-    if subtasks:
-        for position, subtask in enumerate(subtasks, 1):
-            if not isinstance(subtask, Mapping):
-                continue
-            index = _subtask_number(subtask, position)
-            status = str(subtask.get("status") or "pending")
-            goal = str(subtask.get("goal") or "")
-            detail = f"sub-task {subtask.get('id') or f'st_{index}'} (stage {index}): {status}"
-            if goal:
-                detail += f" — {goal}"
-            evidence = [str(item) for item in subtask.get("evidence") or () if item]
-            if evidence:
-                detail += "; evidence: " + ", ".join(evidence[:4])
-            if status != "done":
-                detail += " (NOT done)"
-            lines.append(f"  - {detail}")
-    elif plan.get("steps"):
+    # the four long-horizon priorities lead, in order: object identity, relation
+    # anchor, open questions, interrupted sub-task (the helper reads only the
+    # checkpoint; the scene is never consulted)
+    try:
+        from vlm_nav.tool_impl_task import resume_brief_sections
+
+        sections = resume_brief_sections(checkpoint, limit=limit)
+    except Exception:  # noqa: BLE001 - an older environment without the helper
+        sections = {"text": "", "sections": {}}
+    if sections.get("text"):
+        lines.append(sections["text"])
+    elif not subtasks and plan.get("steps"):
         for index, step in enumerate(plan.get("steps") or [], 1):
             mark = "done" if index in (plan.get("done") or []) else "open"
             lines.append(f"  - step {index} (stage {index}): {mark} — {step}")
-    else:
+    elif not subtasks:
         lines.append("  - no plan was recorded before the interruption")
     ledger = checkpoint.get("confirmation_ledger") or {}
     if isinstance(ledger, Mapping) and ledger:
@@ -3504,9 +3514,6 @@ def resume_brief(leg: LegResult, task: TaskSpec | None = None, *, limit: int = 1
             place = _as_position(record.get("position_flu"))
             if place is not None:
                 places.append([float(place[0]), float(place[1]), float(place[2])])
-    open_questions = checkpoint.get("open_questions")
-    if open_questions:
-        lines.append(f"Your open questions: {open_questions}")
     pose = _as_position((checkpoint.get("pose") or {}).get("position_flu"))
     if pose is None:
         pose = _as_position(leg.entries[-1].get("pose_after")) if leg.entries else None

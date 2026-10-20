@@ -1258,6 +1258,7 @@ class ObservationRepositoryTest(unittest.TestCase):
 
 #: The ten labels of the per-turn STATE block, in the order it must render.
 EXPECTED_STATE_LABELS = (
+    "identity_anchor",
     "subgoal",
     "candidate",
     "evidence",

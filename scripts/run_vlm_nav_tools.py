@@ -178,7 +178,7 @@ import re
 import time
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 import torch
@@ -297,10 +297,11 @@ SYSTEM_CHARS = 16000
 #: The search *skill* (a routine over the perception tools, not a tool of its own
 #: vocabulary): ``--search-skill off`` keeps it out of the registry.
 SEARCH_SKILL_TOOL = "search_target"
-#: The two memory layers, by the names the memory implementation uses for its
-#: own constructor parameters (``spatial_memory`` / ``episodic_memory``). The
-#: CLI spells them ``--memory-spatial`` / ``--memory-episodic``.
-MEMORY_SWITCHES = ("spatial_memory", "episodic_memory")
+#: The three memory layers, by the names the memory implementation uses for its
+#: own constructor parameters (``spatial_memory`` / ``episodic_memory`` /
+#: ``identity_memory``). The CLI spells them ``--memory-spatial`` /
+#: ``--memory-episodic`` / ``--memory-identity``.
+MEMORY_SWITCHES = ("spatial_memory", "episodic_memory", "identity_memory")
 
 #: The finish contract of this round, appended to the tool doc of both runtimes.
 #: The runtime counts a completion claim only when the finish declares it (a bare
@@ -515,6 +516,7 @@ def switch_report(args: argparse.Namespace) -> dict:
         "search_skill": switch_token(getattr(args, "search_skill", DEFAULT_SWITCH)),
         "spatial_memory": switch_token(getattr(args, "memory_spatial", DEFAULT_SWITCH)),
         "episodic_memory": switch_token(getattr(args, "memory_episodic", DEFAULT_SWITCH)),
+        "identity_memory": switch_token(getattr(args, "memory_identity", DEFAULT_SWITCH)),
     }
 
 
@@ -1004,6 +1006,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "store (sightings with frames, stored frames, scoped "
                              "negatives); off: it is built with episodic_memory=False "
                              "(no evidence is kept; capture records remain)")
+    parser.add_argument("--memory-identity", type=str, default=DEFAULT_SWITCH,
+                        dest="memory_identity", choices=list(SWITCH_CHOICES),
+                        help="on (default): the memory keeps object identities and "
+                             "relation anchors (fingerprints, confirm verdicts, "
+                             "anchors); off: those fields are removed while frames, "
+                             "sightings, places and questions stay (identity ablation)")
     parser.add_argument("--scan-views", type=int, default=8,
                         help="views rendered by observe(mode=lookaround)")
     parser.add_argument("--scan-pitch-deg", type=float, default=50.0)
@@ -1271,15 +1279,58 @@ def _register_module_tools(registry: ToolRegistry, module: Any,
     return None
 
 
+def seed_memory_identities(memory: Any, extra: Mapping | None) -> int:
+    """Load checkpoint identities/anchors into a freshly built memory store.
+
+    A resumed episode restores the identity layer the interrupted leg saved:
+    fingerprints, verdicts/revisions and relation anchors are replayed through
+    the layer's own ``remember`` (merging, not replacing), so a retrieval in the
+    resumed leg ranks the same instance first. An extra without identities, or
+    a memory without the layer, is a no-op.
+    """
+    if not isinstance(extra, Mapping):
+        return 0
+    identities = getattr(memory, "identities", None)
+    remember = getattr(identities, "remember", None)
+    if not callable(remember):
+        return 0
+    entries = extra.get("identities")
+    if isinstance(entries, Mapping):
+        entries = entries.get("identities")
+    count = 0
+    for entry in entries or []:
+        if not isinstance(entry, Mapping):
+            continue
+        remember(
+            str(entry.get("candidate_id") or ""),
+            target=str(entry.get("target") or ""),
+            box=entry.get("box"), position=entry.get("position_flu"),
+            anchor=str(entry.get("anchor") or ""),
+            anchor_source=str(entry.get("anchor_source") or ""),
+            verdict=str(entry.get("verdict") or ""),
+            revision=entry.get("revision"),
+            observation_ids=entry.get("observation_ids") or (),
+            subtask_id=str(entry.get("subtask_id") or ""),
+            task_id=str(entry.get("task_id") or ""),
+            confidence=entry.get("confidence"),
+            note=str(entry.get("note") or ""),
+        )
+        count += 1
+    return count
+
+
 def build_memory(modules: dict[str, Any], world: Any, out_dir: Path,
                  episode_id: str, spatial_memory: bool = True,
-                 episodic_memory: bool = True) -> tuple[Any, str, str | None]:
-    """The episode memory, built with the two layer switches.
+                 episodic_memory: bool = True,
+                 identity_memory: bool = True) -> tuple[Any, str, str | None]:
+    """The episode memory, built with the three layer switches.
 
     ``spatial_memory`` / ``episodic_memory`` are the memory implementation's own
-    constructor parameters (the decision-loop memory arms); a memory whose
-    signature does not accept them is still built, it simply cannot attest the
-    layer (``_construct`` passes only what the factory accepts).
+    constructor parameters (the decision-loop memory arms); ``identity_memory``
+    is the identity/anchor layer (off in the identity ablation arm - frames,
+    sightings, places and questions stay). A memory whose signature does not
+    accept them is still built, it simply cannot attest the layer (``_construct``
+    passes only what the factory accepts).
     """
     module = modules.get("memory")
     detail = None
@@ -1299,6 +1350,7 @@ def build_memory(modules: dict[str, Any], world: Any, out_dir: Path,
                     episode_id=episode_id,
                     spatial_memory=bool(spatial_memory),
                     episodic_memory=bool(episodic_memory),
+                    identity_memory=bool(identity_memory),
                 ), "modules", name
             except Exception as exc:
                 detail = f"{name}: {type(exc).__name__}: {exc}"
@@ -2728,7 +2780,9 @@ def run_episode(world: Any, vlm: Any, args: argparse.Namespace, out_dir: Path,
         modules, world, out_dir, prompt_id,
         spatial_memory=switch_enabled(requested["spatial_memory"]),
         episodic_memory=switch_enabled(requested["episodic_memory"]),
+        identity_memory=switch_enabled(requested["identity_memory"]),
     )
+    seed_memory_identities(memory, ctx_extra)
     if registry_factory is not None:
         built = registry_factory(modules, vlm)
         if isinstance(built, tuple):

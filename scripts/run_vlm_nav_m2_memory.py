@@ -157,12 +157,14 @@ from vlm_nav.tools import STATUS_OK, ToolResult  # noqa: E402
 from vlm_nav.vlm import MockVLM  # noqa: E402
 from vlm_nav.world import SplatWorldCPU, SplatWorldHiGS, TargetSpec  # noqa: E402
 
-MODES = ("memory", "memory_no_evidence", "basic",
+MODES = ("memory", "memory_no_evidence", "memory_no_identity", "basic",
          "memory_spatial_only", "memory_text_only")
 #: the retrieval arms run the *same* catalogue; ``memory_no_evidence`` ablates
-#: the archive, the two layer arms ablate one memory layer each (that is what
-#: makes them controls)
-MODE_TOOLSET = {"memory": "memory", "memory_no_evidence": "memory", "basic": "basic",
+#: the archive, ``memory_no_identity`` removes exactly the identity/anchor
+#: fields (frames, sightings, places and questions stay), the two layer arms
+#: ablate one memory layer each (that is what makes them controls)
+MODE_TOOLSET = {"memory": "memory", "memory_no_evidence": "memory",
+                "memory_no_identity": "memory", "basic": "basic",
                 "memory_spatial_only": "memory", "memory_text_only": "memory"}
 #: the layer each arm pins, by the M2 CLI switch it pins (the other switches of
 #: the arm stay the caller's, so ``--memory-spatial on`` still reaches the
@@ -174,9 +176,11 @@ MODE_TOOLSET = {"memory": "memory", "memory_no_evidence": "memory", "basic": "ba
 MODE_SWITCH_OVERRIDES = {
     "memory_spatial_only": {"memory_episodic": "off"},
     "memory_text_only": {"recall_images": "off"},
+    "memory_no_identity": {"memory_identity": "off"},
 }
 #: the arms whose tool set carries the retrieval tool
-EVIDENCE_MODES = ("memory", "memory_no_evidence", "memory_spatial_only", "memory_text_only")
+EVIDENCE_MODES = ("memory", "memory_no_evidence", "memory_no_identity",
+                  "memory_spatial_only", "memory_text_only")
 #: the arm that removes the evidence the M2 claim rests on
 ABLATED_MODE = "memory_no_evidence"
 LOSS_TRIGGERS = ("auto", "model", "evidence", "capture", "relation")
@@ -2528,6 +2532,10 @@ def run_trial(mode: str, scenario: Scenario, args: argparse.Namespace, out_dir: 
         "done_dist": float(scenario.success_dist_m) + float(scenario.target_radius),
         "success_dist_m": float(scenario.success_dist_m),
         "loss_mode": trigger,
+        # the relation phrase this task names the instance by ("next to the
+        # bright lamp"); the memory store records it with each sighting so a
+        # delayed revisit can retrieve *which* instance, not only where
+        "identity_anchor": str(getattr(args, "identity_anchor", "") or "").strip(),
     }
     if backend is not None:
         ctx_extra["perception.vlm"] = backend  # ground_target stays usable in the loop
@@ -2556,6 +2564,7 @@ def run_trial(mode: str, scenario: Scenario, args: argparse.Namespace, out_dir: 
         "requested": {
             "spatial_memory": getattr(mode_args, "memory_spatial", DEFAULT_SWITCH),
             "episodic_memory": getattr(mode_args, "memory_episodic", DEFAULT_SWITCH),
+            "identity_memory": getattr(mode_args, "memory_identity", DEFAULT_SWITCH),
         },
         "applied": (summary.get("switches") or {}).get("applied"),
     }
@@ -2991,6 +3000,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "exactly the property under test moved")
     # --- agent loop ---
     parser.add_argument("--instruction", type=str, default=DEFAULT_INSTRUCTION)
+    parser.add_argument("--identity-anchor", type=str, default="",
+                        help="relation phrase the task names the instance by "
+                             "(\"next to the bright lamp\"); recorded with each "
+                             "grounded sighting and any confirmation, so the "
+                             "identity layer carries an anchor even without a "
+                             "task plan")
     parser.add_argument("--backend", type=str, default="mock",
                         help="mock | hf | openai")
     parser.add_argument("--model-path", type=str, default=None)
@@ -3022,6 +3037,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "(pose, heading, step, no image) and the spatial and "
                              "working layers stay on - the memory_spatial_only arm "
                              "pins this")
+    parser.add_argument("--memory-identity", type=str, default=DEFAULT_SWITCH,
+                        dest="memory_identity", choices=list(SWITCH_CHOICES),
+                        help="on (default): the memory keeps object identities and "
+                             "relation anchors (fingerprints, confirm verdicts, "
+                             "anchors); off: those fields are removed while frames, "
+                             "sightings, places and questions stay - the "
+                             "memory_no_identity arm pins this")
     parser.add_argument("--recall-images", type=str, default=DEFAULT_SWITCH,
                         dest="recall_images", choices=list(SWITCH_CHOICES),
                         help="on (default): the frames a query_memory result "

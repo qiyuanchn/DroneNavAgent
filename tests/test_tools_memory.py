@@ -572,6 +572,100 @@ class WorkingMemoryTest(unittest.TestCase):
         self.assertEqual(memory.describe(), "no working memory")
 
 
+class IdentityMemoryTest(unittest.TestCase):
+    """Layer 2b: object identities and relation anchors survive a revisit."""
+
+    def test_fingerprint_merges_by_candidate_and_keeps_the_verdict(self):
+        from vlm_nav.memory import IdentityMemory
+
+        memory = IdentityMemory(clock=lambda: 1.0)
+        first = memory.remember(
+            "cand_1", target="red box", box=[100, 100, 300, 300],
+            position=[2.0, 1.0, 0.5], anchor="next to the wooden door",
+            anchor_source="subtask.expected_observation", observation_ids=["obs_1"],
+        )
+        self.assertEqual(first["verdict"], "unconfirmed")
+        self.assertEqual(first["anchor"], "next to the wooden door")
+        self.assertEqual(first["box"], [100, 100, 300, 300])
+        merged = memory.remember(
+            "cand_1", verdict="accepted", revision=2,
+            observation_ids=["obs_4"], confidence=0.9,
+        )
+        self.assertEqual(merged["identity_id"], first["identity_id"])
+        self.assertEqual(merged["verdict"], "accepted")
+        self.assertEqual(merged["revision"], 2)
+        self.assertEqual(merged["observation_ids"], ["obs_1", "obs_4"])
+        self.assertEqual(merged["anchor"], "next to the wooden door")
+        # an older acceptance never overwrites a newer rejection
+        newer = memory.confirm("cand_1", "rejected", revision=3)
+        self.assertEqual(newer["verdict"], "rejected")
+        self.assertEqual(newer["revision"], 3)
+        self.assertEqual(len(memory), 1)
+
+    def test_a_same_looking_object_elsewhere_is_a_second_instance(self):
+        from vlm_nav.memory import IdentityMemory
+
+        memory = IdentityMemory(merge_radius_m=0.5)
+        memory.remember("", target="red box", box=[0, 0, 10, 10], position=[0, 0, 0])
+        memory.remember("", target="red box", box=[0, 0, 10, 10], position=[3, 0, 0])
+        self.assertEqual(len(memory), 2)
+
+    def test_query_ranks_accepted_and_anchored_first(self):
+        from vlm_nav.memory import IdentityMemory
+
+        memory = IdentityMemory()
+        memory.remember("cand_1", target="red box", position=[1, 0, 0])
+        memory.remember(
+            "cand_2", target="red box", position=[2, 0, 0],
+            anchor="next to the wooden door", verdict="accepted", revision=1,
+        )
+        rows = memory.query("red box")
+        self.assertEqual([row["candidate_id"] for row in rows], ["cand_2", "cand_1"])
+        self.assertEqual(rows[0]["verdict"], "accepted")
+        self.assertEqual(memory.anchors(), ["next to the wooden door"])
+        json.dumps(jsonable(memory.snapshot()))
+
+    def test_a_sighting_feeds_the_identity_layer_and_can_be_ablated(self):
+        from vlm_nav.memory import ObservationLog
+
+        log = ObservationLog(clock=lambda: 1.0)
+        obs_id = log.record(
+            None, pose=[1.0, 2.0, 0.5], yaw=0.0, goal_target="red box",
+            sighting={
+                "candidate": "cand_1", "box": [100, 100, 300, 300],
+                "basis": "ground_target", "target": "red box",
+                "anchor": "next to the wooden door", "position_flu": [1.0, 2.0, 0.5],
+                "image": "obs_1",
+            },
+        )
+        identity = log.identities.get("cand_1")
+        self.assertIsNotNone(identity)
+        self.assertEqual(identity["anchor"], "next to the wooden door")
+        self.assertEqual(log.working.anchors()[0]["anchor"], "next to the wooden door")
+        confirmed = log.confirm_identity("cand_1", "accepted", revision=0)
+        self.assertEqual(confirmed["verdict"], "accepted")
+        entry = log.get(obs_id)
+        self.assertEqual(entry["identity"]["verdict"], "accepted")
+        self.assertEqual(entry["anchor"], "next to the wooden door")
+        self.assertTrue(log.switches()["identity_memory"])
+
+        ablated = ObservationLog(identity_memory=False, clock=lambda: 1.0)
+        ablated.record(
+            None, pose=[1.0, 2.0, 0.5], yaw=0.0, goal_target="red box",
+            sighting={
+                "candidate": "cand_1", "box": [100, 100, 300, 300],
+                "basis": "ground_target", "target": "red box",
+                "anchor": "next to the wooden door", "position_flu": [1.0, 2.0, 0.5],
+                "image": "obs_1",
+            },
+        )
+        self.assertIsNone(ablated.identities)
+        self.assertFalse(ablated.switches()["identity_memory"])
+        entry = ablated.recent(1)[0]
+        self.assertNotIn("identity", entry)
+        self.assertNotIn("anchor", entry)
+
+
 class ViewScopeTest(unittest.TestCase):
     """Negative memory is bound to a viewpoint, a heading and a field of view."""
 
@@ -809,8 +903,9 @@ class EpisodicEvidenceTest(_LogCase):
         log = self._log()
         self.assertEqual(
             log.switches(),
-            {"spatial_memory": True, "episodic_memory": True, "merge_duplicates": True,
-             "working_memory": True, "max_frames_per_event": log.max_frames_per_event},
+            {"spatial_memory": True, "episodic_memory": True, "identity_memory": True,
+             "merge_duplicates": True, "working_memory": True,
+             "max_frames_per_event": log.max_frames_per_event},
         )
         self.assertIsInstance(log.working, WorkingMemory)
         self.assertIsInstance(log.spatial, SpatialMemory)

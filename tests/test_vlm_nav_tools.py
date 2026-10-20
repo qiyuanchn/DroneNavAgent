@@ -1054,7 +1054,8 @@ class MechanismSwitchTest(unittest.TestCase):
 
         self.assertEqual(
             {"recovery": "off", "state_block": "off", "search_skill": "off",
-             "spatial_memory": "on", "episodic_memory": "on"},
+             "spatial_memory": "on", "episodic_memory": "on",
+             "identity_memory": "on"},
             summary["switches"]["requested"],
         )
         applied = summary["switches"]["applied"]
@@ -1073,7 +1074,8 @@ class MechanismSwitchTest(unittest.TestCase):
                                      episode_id="ep_on")
         self.assertEqual(
             {"recovery": "on", "state_block": "on", "search_skill": "on",
-             "spatial_memory": "on", "episodic_memory": "on"},
+             "spatial_memory": "on", "episodic_memory": "on",
+             "identity_memory": "on"},
             summary["switches"]["requested"],
         )
         applied = summary["switches"]["applied"]
@@ -1151,7 +1153,8 @@ class MemoryLayerSwitchTest(unittest.TestCase):
         self.assertEqual("on", args.memory_episodic)
         off = _runner_args(self.tmp / "out", memory_spatial="off", memory_episodic="off")
         report = RUNNER.switch_report(off)
-        self.assertEqual({"spatial_memory": "off", "episodic_memory": "off"},
+        self.assertEqual({"spatial_memory": "off", "episodic_memory": "off",
+                          "identity_memory": "on"},
                          {name: report[name] for name in RUNNER.MEMORY_SWITCHES})
 
     def test_build_memory_hands_the_layer_switches_to_the_memory_module(self):
@@ -2246,15 +2249,18 @@ class M2LayerArmTest(unittest.TestCase):
     def test_the_arms_pin_their_own_switch(self):
         switches = self.comparison["comparison"]["switches"]
         self.assertEqual(
-            {"spatial_memory": "on", "episodic_memory": "on"},
+            {"spatial_memory": "on", "episodic_memory": "on",
+             "identity_memory": "on"},
             switches["requested"]["memory"],
         )
         self.assertEqual(
-            {"spatial_memory": "on", "episodic_memory": "off"},
+            {"spatial_memory": "on", "episodic_memory": "off",
+             "identity_memory": "on"},
             switches["requested"]["memory_spatial_only"],
         )
         self.assertEqual(
-            {"spatial_memory": "on", "episodic_memory": "on"},
+            {"spatial_memory": "on", "episodic_memory": "on",
+             "identity_memory": "on"},
             switches["requested"]["memory_text_only"],
         )
         self.assertEqual({"memory": "on", "memory_spatial_only": "on",

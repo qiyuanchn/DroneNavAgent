@@ -380,6 +380,16 @@ def _as_bool(value) -> bool:
     return str(value or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _as_int(value, default=None):
+    """An int, or ``default`` when the value is absent/not a whole number."""
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _as_float(value, default=None):
     try:
         out = float(value)
@@ -515,6 +525,7 @@ def normalize_sighting(value, *, image=None, strict: bool = False) -> tuple[dict
         "candidate": candidate,
         "box": box,
         "pixel": pixel,
+        "anchor": str(data.get("anchor") or data.get("relation") or "").strip()[:DEFAULT_MAX_CONTENT_CHARS],
         "confidence": confidence,
         "attributes": attributes,
         "position_flu": _as_optional_position(data.get("position_flu")),
@@ -537,6 +548,7 @@ def sighting_text(sighting: Mapping | None) -> str:
         str(sighting.get("basis") or ""),
         str(sighting.get("candidate") or ""),
         str(sighting.get("image") or ""),
+        str(sighting.get("anchor") or ""),
         str(sighting.get("note") or ""),
         " ".join(str(key) + " " + str(value) for key, value in (sighting.get("attributes") or {}).items()),
     ]
@@ -648,13 +660,20 @@ class WorkingMemory:
         self._candidates: list[dict] = []
         self._questions: list[dict] = []
         self._failures: list[dict] = []
+        self._anchors: list[dict] = []
         self._seq = 0
         self._updated_t = 0.0
 
     # ---------------- writing ----------------
 
-    def set_subgoal(self, text, *, step: int | None = None, evidence=None, note: str = "") -> dict | None:
-        """Replace the current subgoal (``None``/empty clears it)."""
+    def set_subgoal(self, text, *, step: int | None = None, evidence=None, note: str = "",
+                    anchor: str = "") -> dict | None:
+        """Replace the current subgoal (``None``/empty clears it).
+
+        ``anchor`` is the sub-task's relation phrase ("next to the wooden
+        door"). It is a *persistent* field, not prompt decoration: a recovery
+        or resume re-grounding reads it back (see :meth:`anchors`).
+        """
         resolved = str(text or "").strip()[: self.max_content_chars]
         if not resolved:
             self._subgoal = None
@@ -664,6 +683,7 @@ class WorkingMemory:
             "text": resolved,
             "step": step,
             "note": str(note or "")[: self.max_content_chars],
+            "anchor": str(anchor or "").strip()[: self.max_content_chars],
             "updated_t": round(self._updated_t, 3),
             "evidence": normalize_evidence(evidence),
         }
@@ -680,8 +700,16 @@ class WorkingMemory:
         step: int | None = None,
         evidence=None,
         note: str = "",
+        anchor: str = "",
+        identity=None,
     ) -> dict:
-        """Remember a candidate place; the same id merges into one entry."""
+        """Remember a candidate place; the same id merges into one entry.
+
+        ``anchor`` and ``identity`` are the identity-layer fields: the relation
+        phrase the instance was found under and the fingerprint/verdict record
+        that says *which* instance it is. They persist with the candidate so a
+        retrieval or a resume brief can name both.
+        """
         key = str(candidate or "").strip()
         if not key:
             key = "candidate"
@@ -699,6 +727,8 @@ class WorkingMemory:
                 "first_t": round(self._updated_t, 3),
                 "evidence": [],
                 "note": "",
+                "anchor": "",
+                "identity": None,
             }
             self._candidates.append(entry)
         if position is not None:
@@ -713,12 +743,73 @@ class WorkingMemory:
             entry["sources"].append(source)
         if note:
             entry["note"] = str(note)[: self.max_content_chars]
+        if anchor:
+            entry["anchor"] = str(anchor).strip()[: self.max_content_chars]
+            self._remember_anchor(anchor, target=target, candidate_id=key, step=step)
+        if isinstance(identity, Mapping):
+            entry["identity"] = dict(identity)
         entry["step"] = step
         entry["updates"] = int(entry.get("updates", 0)) + 1
         entry["updated_t"] = round(self._updated_t, 3)
         _merge_evidence(entry["evidence"], normalize_evidence(evidence))
         self._evict(self._candidates, self.max_candidates)
         return dict(entry)
+
+    def remember_anchor(
+        self, anchor, *, target: str = "", candidate_id: str = "", source: str = "",
+        step: int | None = None, evidence=None,
+    ) -> dict:
+        """Persist a relation anchor independently of a candidate entry."""
+        text = str(anchor or "").strip()[: self.max_content_chars]
+        self._remember_anchor(
+            text, target=target, candidate_id=candidate_id, source=source,
+            step=step, evidence=evidence,
+        )
+        return {
+            "anchor": text,
+            "target": str(target or "")[: self.max_content_chars],
+            "candidate_id": str(candidate_id or ""),
+            "source": str(source or ""),
+        }
+
+    def _remember_anchor(self, anchor, *, target: str = "", candidate_id: str = "",
+                         source: str = "", step: int | None = None,
+                         evidence=None) -> None:
+        text = str(anchor or "").strip()[: self.max_content_chars]
+        if not text:
+            return
+        self._updated_t = self._clock()
+        entry = next((item for item in self._anchors if item["anchor"] == text), None)
+        if entry is None:
+            entry = {
+                "anchor": text,
+                "target": "",
+                "candidate_ids": [],
+                "source": "",
+                "updates": 0,
+                "evidence": [],
+                "updated_t": round(self._updated_t, 3),
+            }
+            self._anchors.append(entry)
+        if target:
+            entry["target"] = str(target).strip()[: self.max_content_chars]
+        candidate_id = str(candidate_id or "").strip()
+        if candidate_id and candidate_id not in entry["candidate_ids"]:
+            entry["candidate_ids"].append(candidate_id)
+        if source:
+            entry["source"] = str(source)[:64]
+        entry["step"] = step
+        entry["updates"] = int(entry.get("updates", 0)) + 1
+        entry["updated_t"] = round(self._updated_t, 3)
+        _merge_evidence(entry["evidence"], normalize_evidence(evidence))
+        del self._anchors[:-self.max_questions]
+
+    def anchors(self, limit: int | None = None) -> list[dict]:
+        """The relation anchors this task has recorded, newest first."""
+        ordered = sorted(self._anchors, key=lambda item: item["updated_t"], reverse=True)
+        if limit is not None:
+            ordered = ordered[: max(0, int(limit))]
+        return [dict(item) for item in ordered]
 
     def open_question(self, question, *, about: str = "", step: int | None = None, evidence=None) -> dict:
         """Register an open question (same text: counted, not duplicated)."""
@@ -833,6 +924,7 @@ class WorkingMemory:
         self._candidates.clear()
         self._questions.clear()
         self._failures.clear()
+        self._anchors.clear()
 
     # ---------------- reading ----------------
 
@@ -874,10 +966,19 @@ class WorkingMemory:
         for question in snapshot["open_questions"][: max(1, int(limit))]:
             lines.append(f"open {question['id']}: {question['text']}")
         for candidate in snapshot["candidates"][: max(1, int(limit))]:
-            lines.append(
+            line = (
                 f"candidate {candidate['id']} at {candidate.get('position_flu')}"
                 f"{'' if not candidate.get('target') else ' for ' + candidate['target']}"
             )
+            if candidate.get("anchor"):
+                line += f" anchor={candidate['anchor']}"
+            lines.append(line)
+        for anchor in self.anchors(limit=max(1, int(limit))):
+            if anchor["anchor"]:
+                lines.append(
+                    f"anchor {anchor['anchor']}"
+                    + (f" for {anchor['target']}" if anchor.get("target") else "")
+                )
         for failure in snapshot["failures"][: max(1, int(limit))]:
             lines.append(
                 f"failed {failure['count']}x: {failure['what']} ({failure['reason']})"
@@ -1347,6 +1448,346 @@ class SpatialMemory:
             self._evicted_places += 1
 
 
+# ---------------------------------------------------------------------------
+# identity and anchor memory (layer 2b): the object, not just its place
+# ---------------------------------------------------------------------------
+
+#: The four values a confirmation can record. ``unconfirmed`` is the state a
+#: sighting leaves until ``confirm_candidate``/``verify_goal`` judges it.
+IDENTITY_ACCEPTED = "accepted"
+IDENTITY_REJECTED = "rejected"
+IDENTITY_UNCERTAIN = "uncertain"
+IDENTITY_UNCONFIRMED = "unconfirmed"
+IDENTITY_VERDICTS = (
+    IDENTITY_ACCEPTED,
+    IDENTITY_REJECTED,
+    IDENTITY_UNCERTAIN,
+    IDENTITY_UNCONFIRMED,
+)
+
+
+class IdentityMemory:
+    """Object identities and relation anchors - the memory a revisit needs.
+
+    A place record answers "where was it"; this layer answers "which one was
+    it". One entry per object instance merges a sighting fingerprint (target
+    description, box, position, relation phrase) with the confirmation verdict
+    and evidence revision taken under it, so a delayed revisit can re-identify
+    the *same instance* among decoys instead of trusting a bare position.
+
+    The fingerprint merges by candidate id. Without one, two records merge only
+    when the target and box agree and the positions are within
+    ``merge_radius_m``; a same-looking object elsewhere is a second instance,
+    not an update. Verdicts are the latest by ``revision`` (an earlier
+    acceptance never overwrites a newer rejection), and an ``anchor`` is a
+    persistent field: "the cabinet next to the wooden door" is what makes the
+    instance findable when its own appearance is ambiguous.
+    """
+
+    def __init__(
+        self,
+        *,
+        merge_radius_m: float = 0.75,
+        max_identities: int = 24,
+        max_content_chars: int = DEFAULT_MAX_CONTENT_CHARS,
+        clock=time.time,
+    ):
+        self.merge_radius_m = max(0.01, float(merge_radius_m))
+        self.max_identities = max(1, int(max_identities))
+        self.max_content_chars = max(32, int(max_content_chars))
+        self._clock = clock
+        self._items: list[dict] = []
+        self._seq = 0
+
+    # ---------------- writing ----------------
+
+    def remember(
+        self,
+        candidate_id: str = "",
+        *,
+        target: str = "",
+        box=None,
+        position=None,
+        anchor: str = "",
+        anchor_source: str = "",
+        verdict: str = "",
+        revision=None,
+        observation_ids=(),
+        subtask_id: str = "",
+        task_id: str = "",
+        confidence=None,
+        note: str = "",
+        step=None,
+        evidence=None,
+    ) -> dict:
+        """Record (or merge into) one object identity; returns its entry."""
+        key = str(candidate_id or "").strip()
+        box_value = _as_box(box)
+        position_value = _as_optional_position(position)
+        entry = self._find(key, target=target, box=box_value, position=position_value)
+        now = float(self._clock())
+        if entry is None:
+            self._seq += 1
+            entry = {
+                "identity_id": f"id_{self._seq}",
+                "seq": self._seq,
+                "candidate_id": key,
+                "target": "",
+                "box": None,
+                "position_flu": None,
+                "anchor": "",
+                "anchor_source": "",
+                "verdict": IDENTITY_UNCONFIRMED,
+                "revision": None,
+                "observation_ids": [],
+                "subtask_id": "",
+                "task_id": "",
+                "confidence": None,
+                "note": "",
+                "updates": 0,
+                "first_t": round(now, 3),
+                "updated_t": round(now, 3),
+                "step": None,
+                "evidence": [],
+            }
+            self._items.append(entry)
+        if key:
+            entry["candidate_id"] = key
+        if target:
+            entry["target"] = str(target).strip()[: self.max_content_chars]
+        if box_value is not None:
+            entry["box"] = box_value
+        if position_value is not None:
+            entry["position_flu"] = position_value
+        anchor_text = str(anchor or "").strip()
+        if anchor_text:
+            entry["anchor"] = anchor_text[: self.max_content_chars]
+            entry["anchor_source"] = str(anchor_source or "").strip()[:64]
+        if subtask_id:
+            entry["subtask_id"] = str(subtask_id)[:64]
+        if task_id:
+            entry["task_id"] = str(task_id)[:64]
+        confidence = _as_float(confidence)
+        if confidence is not None:
+            entry["confidence"] = round(min(max(confidence, 0.0), 1.0), 2)
+        if note:
+            entry["note"] = str(note)[: self.max_content_chars]
+        solved = self._verdict(verdict)
+        incoming_revision = _as_int(revision, None)
+        if solved is not None:
+            known_revision = _as_int(entry.get("revision"), None)
+            if (
+                known_revision is None
+                or incoming_revision is None
+                or incoming_revision >= known_revision
+            ):
+                entry["verdict"] = solved
+                if incoming_revision is not None:
+                    entry["revision"] = incoming_revision
+        for observation_id in _as_str_list(observation_ids):
+            if observation_id not in entry["observation_ids"]:
+                entry["observation_ids"].append(observation_id)
+        del entry["observation_ids"][:-8]
+        if step is not None:
+            entry["step"] = step
+        entry["updates"] = int(entry.get("updates", 0)) + 1
+        entry["updated_t"] = round(now, 3)
+        _merge_evidence(entry["evidence"], normalize_evidence(evidence))
+        self._evict()
+        return self.get(entry["identity_id"]) or dict(entry)
+
+    def confirm(
+        self,
+        candidate_id: str,
+        verdict: str,
+        *,
+        revision=None,
+        observation_ids=(),
+        anchor: str = "",
+        note: str = "",
+        evidence=None,
+    ) -> dict | None:
+        """Merge one confirm verdict/revision into the candidate's identity."""
+        entry = self._find(str(candidate_id or "").strip())
+        if entry is None:
+            return None
+        return self.remember(
+            candidate_id, verdict=verdict, revision=revision,
+            observation_ids=observation_ids, anchor=anchor, note=note,
+            evidence=evidence,
+        )
+
+    def remember_anchor(
+        self, anchor: str, *, candidate_id: str = "", target: str = "",
+        source: str = "", subtask_id: str = "", step=None,
+    ) -> dict | None:
+        """Persist a relation anchor even when the candidate id is not known yet."""
+        if not str(anchor or "").strip():
+            return None
+        return self.remember(
+            candidate_id, target=target, anchor=anchor, anchor_source=source,
+            subtask_id=subtask_id, step=step,
+        )
+
+    # ---------------- reading ----------------
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def get(self, identity_id: str) -> dict | None:
+        key = str(identity_id or "")
+        for entry in self._items:
+            if entry["identity_id"] == key or (entry["candidate_id"] and entry["candidate_id"] == key):
+                return self._entry(entry)
+        return None
+
+    def all(self, limit: int | None = None) -> list[dict]:
+        ordered = sorted(self._items, key=lambda item: (item["updated_t"], item["seq"]), reverse=True)
+        if limit is not None:
+            ordered = ordered[: _clamp_limit(limit, DEFAULT_MAX_LIMIT * 4)]
+        return [self._entry(entry) for entry in ordered]
+
+    def query(self, q: str | dict, limit: int | None = DEFAULT_QUERY_LIMIT) -> list[dict]:
+        """Identities matching a question, ranked identity-and-anchor first.
+
+        A query that names a target matches its description and its relation
+        anchor. An accepted confirmation outranks a rejected/uncertain one, and
+        an entry with an anchor outranks one without: the four facts the
+        long-horizon memory is supposed to keep are what the order is made of.
+        """
+        spec = {"text": q} if isinstance(q, str) else dict(q or {})
+        limit = _resolve_limit(limit, spec.get("limit"), DEFAULT_MAX_LIMIT * 4)
+        tokens = _tokenize(spec.get("text") or spec.get("keywords") or "")
+        candidate = str(spec.get("candidate", spec.get("candidate_id") or "")).strip()
+        rows = []
+        for entry in self._items:
+            if candidate and candidate not in (entry["candidate_id"], entry["identity_id"]):
+                continue
+            haystack = " ".join(
+                [entry["identity_id"], entry["candidate_id"], entry["target"],
+                 entry["anchor"], entry["note"], *entry["observation_ids"]]
+            ).lower()
+            score = 0.0
+            if tokens:
+                hits = sum(1 for token in tokens if token in haystack)
+                if hits == 0:
+                    continue
+                score += hits / len(tokens)
+            if entry["verdict"] == IDENTITY_ACCEPTED:
+                score += 1.0
+            elif entry["verdict"] == IDENTITY_UNCERTAIN:
+                score += 0.25
+            if entry["anchor"]:
+                score += 0.5
+            rows.append((score, entry))
+        rows.sort(key=lambda row: (row[0], row[1]["updated_t"], row[1]["seq"]), reverse=True)
+        return [self._entry(entry, score=score) for score, entry in rows[:limit]]
+
+    def anchors(self, limit: int | None = None) -> list[str]:
+        """The distinct persistent relation anchors (newest first)."""
+        seen: list[str] = []
+        for entry in self.all():
+            anchor = str(entry.get("anchor") or "")
+            if anchor and anchor not in seen:
+                seen.append(anchor)
+        return seen if limit is None else seen[: max(0, int(limit))]
+
+    def describe(self, limit: int = 5) -> str:
+        lines = []
+        for entry in self.all(limit=limit):
+            line = f"{entry['identity_id']} {entry.get('candidate_id') or '?'}"
+            if entry.get("target"):
+                line += f" target={entry['target']}"
+            if entry.get("verdict"):
+                line += f" [{entry['verdict']}]"
+            if entry.get("revision") is not None:
+                line += f" rev={entry['revision']}"
+            if entry.get("anchor"):
+                line += f" anchor={entry['anchor']}"
+            lines.append(line)
+        return "\n".join(lines) if lines else "no identities"
+
+    def snapshot(self) -> dict:
+        return {
+            "identities": self.all(),
+            "anchors": self.anchors(),
+            "counts": {
+                "identities": len(self._items),
+                "anchors": len(self.anchors()),
+                "confirmed": sum(
+                    1 for item in self._items if item["verdict"] == IDENTITY_ACCEPTED
+                ),
+            },
+        }
+
+    def stats(self) -> dict:
+        return {
+            "layer": "identity",
+            "identities": len(self._items),
+            "anchors": len(self.anchors()),
+            "confirmed": sum(1 for item in self._items if item["verdict"] == IDENTITY_ACCEPTED),
+            "rejected": sum(1 for item in self._items if item["verdict"] == IDENTITY_REJECTED),
+        }
+
+    # ---------------- internals ----------------
+
+    def _find(self, key: str = "", *, target: str = "", box=None, position=None) -> dict | None:
+        if key:
+            for entry in self._items:
+                if entry["candidate_id"] == key:
+                    return entry
+            return None
+        normalized_target = _normalize_text(target)
+        for entry in self._items:
+            if normalized_target and _normalize_text(entry["target"]) != normalized_target:
+                continue
+            if box is not None and entry["box"] is not None and list(box) != list(entry["box"]):
+                continue
+            if position is not None and entry["position_flu"] is not None:
+                if _distance(position, entry["position_flu"]) > self.merge_radius_m:
+                    continue
+            if normalized_target or box is not None or position is not None:
+                return entry
+        return None
+
+    @staticmethod
+    def _verdict(value) -> str | None:
+        text = str(value or "").strip().lower()
+        return text if text in IDENTITY_VERDICTS else None
+
+    def _entry(self, entry: dict, score: float | None = None) -> dict:
+        out = {
+            "identity_id": entry["identity_id"],
+            "candidate_id": entry["candidate_id"],
+            "target": entry["target"],
+            "box": list(entry["box"]) if entry["box"] is not None else None,
+            "position_flu": (
+                list(entry["position_flu"]) if entry["position_flu"] is not None else None
+            ),
+            "anchor": entry["anchor"],
+            "anchor_source": entry["anchor_source"],
+            "verdict": entry["verdict"],
+            "revision": entry["revision"],
+            "observation_ids": list(entry["observation_ids"]),
+            "subtask_id": entry["subtask_id"],
+            "task_id": entry["task_id"],
+            "confidence": entry["confidence"],
+            "note": entry["note"],
+            "updates": entry["updates"],
+            "step": entry["step"],
+            "updated_t": round(entry["updated_t"], 3),
+            "evidence": list(entry["evidence"]),
+        }
+        if score is not None:
+            out["score"] = round(float(score), 3)
+        return out
+
+    def _evict(self) -> None:
+        while len(self._items) > self.max_identities:
+            oldest = min(self._items, key=lambda item: (item["updated_t"], item["seq"]))
+            self._items.remove(oldest)
+
+
 def _distance(a, b) -> float:
     return float(np.linalg.norm(np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64)))
 
@@ -1477,6 +1918,7 @@ class ObservationLog:
         clock=time.time,
         spatial_memory: bool = True,
         episodic_memory: bool = True,
+        identity_memory: bool = True,
         merge_duplicates: bool = True,
         max_frames_per_event: int = DEFAULT_MAX_FRAMES_PER_EVENT,
         spatial: "SpatialMemory | None" = None,
@@ -1496,12 +1938,19 @@ class ObservationLog:
         # layer 2 and 3 switches (the ablation arms) + the layers themselves
         self.spatial_memory = bool(spatial_memory)
         self.episodic_memory = bool(episodic_memory)
+        self.identity_memory = bool(identity_memory)
         self.merge_duplicates = bool(merge_duplicates)
         self.max_frames_per_event = max(1, int(max_frames_per_event))
         self.working = working if working is not None else WorkingMemory(clock=clock)
         self.spatial = spatial if spatial is not None else (
             SpatialMemory(clock=clock) if self.spatial_memory else None
         )
+        #: object identities + relation anchors: the layer that answers "which
+        #: instance was it" after a delayed revisit. It is not the episodic
+        #: evidence layer - turning it off removes exactly those fields while
+        #: frames, sightings, places and questions stay (the identity/anchor
+        #: ablation arm).
+        self.identities = IdentityMemory(clock=clock) if self.identity_memory else None
         self._observations: list[Observation] = []
         self._by_id: dict[str, Observation] = {}
         #: ids folded into a canonical entry by the duplicate merge: the model
@@ -1527,6 +1976,7 @@ class ObservationLog:
         return {
             "spatial_memory": bool(self.spatial_memory and self.spatial is not None),
             "episodic_memory": bool(self.episodic_memory),
+            "identity_memory": bool(self.identity_memory and self.identities is not None),
             "merge_duplicates": bool(self.merge_duplicates and self.episodic_memory),
             "working_memory": self.working is not None,
             "max_frames_per_event": self.max_frames_per_event,
@@ -1546,6 +1996,7 @@ class ObservationLog:
             "layer": LAYER_EPISODIC,
             "episodic": "on" if self.episodic_memory else "off",
             "spatial": "on" if self.spatial is not None else "off",
+            "identity": "on" if self.identities is not None else "off",
             "working": "on" if self.working is not None else "off",
             "entries": len(self._observations),
             "sightings": sum(1 for obs in self._observations if obs.sightings),
@@ -1554,8 +2005,99 @@ class ObservationLog:
             "events_over_capacity": self._evicted_for_events,
             "covered_sectors": spatial.get("covered_sectors", 0),
             "places": spatial.get("places", 0),
+            "identities": 0 if self.identities is None else len(self.identities),
             "open_questions": working.get("open_questions", 0),
         }
+
+    # ---------------- identity / anchor writes ----------------
+
+    def remember_identity(
+        self,
+        candidate_id: str = "",
+        *,
+        target: str = "",
+        box=None,
+        position=None,
+        anchor: str = "",
+        anchor_source: str = "",
+        verdict: str = "",
+        revision=None,
+        observation_ids=(),
+        subtask_id: str = "",
+        task_id: str = "",
+        confidence=None,
+        note: str = "",
+        step=None,
+        evidence=None,
+    ) -> dict | None:
+        """Save one object fingerprint (and its anchor/verdict) in the layer.
+
+        This is the public write path of the identity layer: sightings feed it
+        automatically (:meth:`_fan_out_sightings`), and a confirmation merges
+        its verdict/revision into the same entry through :meth:`confirm_identity`.
+        A store built without the layer answers ``None`` - that is the
+        identity/anchor ablation, not an error.
+        """
+        if self.identities is None:
+            return None
+        entry = self.identities.remember(
+            candidate_id, target=target, box=box, position=position,
+            anchor=anchor, anchor_source=anchor_source, verdict=verdict,
+            revision=revision, observation_ids=observation_ids,
+            subtask_id=subtask_id, task_id=task_id, confidence=confidence,
+            note=note, step=step, evidence=evidence,
+        )
+        if anchor:
+            # the relation anchor is also a persistent task fact: keep it on the
+            # working layer so a resume brief can carry it even if the candidate
+            # entry was evicted
+            self.working.remember_anchor(
+                anchor, target=target or entry.get("target", ""),
+                source=anchor_source, step=step,
+                evidence=EvidenceRef("identity", entry["identity_id"], "relation anchor"),
+            )
+        return entry
+
+    def confirm_identity(
+        self,
+        candidate_id: str,
+        verdict: str,
+        *,
+        revision=None,
+        observation_ids=(),
+        anchor: str = "",
+        target: str = "",
+        box=None,
+        position=None,
+        subtask_id: str = "",
+        task_id: str = "",
+        note: str = "",
+        evidence=None,
+    ) -> dict | None:
+        """Merge a confirm verdict/revision into memory (not only the ledger)."""
+        if self.identities is None:
+            return None
+        existing = self.identities.get(str(candidate_id or "").strip())
+        if existing is None:
+            return self.remember_identity(
+                candidate_id, target=target, box=box, position=position,
+                anchor=anchor, verdict=verdict, revision=revision,
+                observation_ids=observation_ids, subtask_id=subtask_id,
+                task_id=task_id, note=note, evidence=evidence,
+            )
+        entry = self.identities.remember(
+            candidate_id, verdict=verdict, revision=revision,
+            observation_ids=observation_ids, anchor=anchor, note=note,
+            evidence=evidence,
+        )
+        if anchor:
+            self.working.remember_anchor(
+                anchor, target=target or existing.get("target", ""),
+                candidate_id=str(candidate_id or ""),
+                source="confirm_candidate",
+                evidence=EvidenceRef("identity", entry["identity_id"], "relation anchor"),
+            )
+        return entry
 
     # ---------------- writing ----------------
 
@@ -1958,7 +2500,19 @@ class ObservationLog:
         for sighting in sightings:
             target = sighting.get("target") or obs.goal_target or ""
             candidate = sighting.get("candidate")
+            anchor = str(sighting.get("anchor") or "")
             source = f"sighting:{obs.obs_id}"
+            identity = None
+            if self.identities is not None:
+                identity = self.identities.remember(
+                    candidate or f"obs:{obs.obs_id}", target=target,
+                    box=sighting.get("box"), position=sighting.get("position_flu"),
+                    anchor=anchor, anchor_source="sighting" if anchor else "",
+                    confidence=sighting.get("confidence"),
+                    observation_ids=[obs.obs_id], step=obs.step,
+                    evidence=EvidenceRef("observation", obs.obs_id, "identity sighting"),
+                )
+                layers["identity"] = "ok:remember_identity"
             if self.spatial is not None:
                 position = sighting.get("position_flu")
                 if position is not None:
@@ -1979,6 +2533,7 @@ class ObservationLog:
                     self.working.note_candidate(
                         candidate, sighting.get("position_flu"), target=target,
                         confidence=sighting.get("confidence"), source=source, step=obs.step,
+                        anchor=anchor, identity=identity,
                         evidence=EvidenceRef("observation", obs.obs_id, "sighting"),
                     )
                     layers["working"] = "ok:note_candidate"
@@ -2340,6 +2895,28 @@ class ObservationLog:
             entry["sightings"] = [jsonable(item) for item in obs.sightings]
         # the field is always present: "no sighting here" is information too
         entry["sighting"] = jsonable(obs.sightings[-1]) if obs.sightings else None
+        if self.identities is not None and obs.sightings:
+            # identity/anchor of the instance this frame showed: retrieval ranks
+            # a hit by them, so they travel with the hit (a store built without
+            # the identity layer simply has neither field)
+            for sighting in reversed(obs.sightings):
+                candidate = str(sighting.get("candidate") or "")
+                identity = self.identities.get(candidate) if candidate else None
+                if identity is None and candidate:
+                    continue
+                if identity is not None:
+                    entry["identity"] = {
+                        "identity_id": identity["identity_id"],
+                        "candidate_id": identity["candidate_id"],
+                        "target": identity["target"],
+                        "verdict": identity["verdict"],
+                        "revision": identity["revision"],
+                        "observation_ids": list(identity["observation_ids"]),
+                    }
+                    if identity["anchor"]:
+                        entry["anchor"] = identity["anchor"]
+                        entry["anchor_source"] = identity["anchor_source"]
+                    break
         if obs.negative:
             entry["negative"] = jsonable(obs.negative)
         if obs.visibility:
@@ -2385,6 +2962,7 @@ def build_memory(
     *,
     spatial_memory: bool = True,
     episodic_memory: bool = True,
+    identity_memory: bool = True,
     merge_duplicates: bool = True,
     max_frames_per_event: int = DEFAULT_MAX_FRAMES_PER_EVENT,
     **kwargs,
@@ -2392,11 +2970,15 @@ def build_memory(
     """The archive with its layers wired - the factory a runner builds memory with.
 
     ``spatial_memory`` / ``episodic_memory`` are the switches of the ablation
-    arms; ``switches()`` reports what came out of the call, so a report can say
-    which layers an episode really ran with. ``episodic_memory=False`` builds
-    the store without its evidence layer: no frame, sighting or null result is
-    written or returned while the spatial layer (places, candidate positions,
-    coverage) and the working layer stay on - see the module docstring.
+    arms; ``identity_memory=False`` removes exactly the identity/anchor fields
+    (object fingerprints, confirm verdicts, relation anchors) while the frames,
+    sightings, places and questions stay: an identity ablation, not a wiped
+    archive. ``switches()`` reports what came out of the call, so a report can
+    say which layers an episode really ran with. ``episodic_memory=False``
+    builds the store without its evidence layer: no frame, sighting or null
+    result is written or returned while the spatial layer (places, candidate
+    positions, coverage) and the working layer stay on - see the module
+    docstring.
     """
     return ObservationLog(
         image_dir=image_dir,
@@ -2405,6 +2987,7 @@ def build_memory(
         episode_id=episode_id,
         spatial_memory=spatial_memory,
         episodic_memory=episodic_memory,
+        identity_memory=identity_memory,
         merge_duplicates=merge_duplicates,
         max_frames_per_event=max_frames_per_event,
         **kwargs,

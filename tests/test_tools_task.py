@@ -53,6 +53,7 @@ from vlm_nav.tool_impl_task import (
     plan_text,
     register_task_tools,
     resume_plan,
+    resume_brief_sections,
     subtask_failure_branch,
     subtask_progress,
 )
@@ -2991,6 +2992,65 @@ class TypedDoneWhenTest(unittest.TestCase):
         )
         errors = plan_structure_errors(plan_state(ctx))
         self.assertTrue(any("unknown done_when_type" in error for error in errors))
+
+
+class ResumeBriefSectionsTest(unittest.TestCase):
+    """The resume brief leads with identity, anchor, questions, then the stage."""
+
+    def test_sections_are_ordered_and_read_only_the_checkpoint(self):
+        checkpoint = {
+            "identities": [{
+                "identity_id": "id_1", "candidate_id": "cand_1",
+                "target": "red box", "box": [100, 100, 300, 300],
+                "position_flu": [1.0, 2.0, 0.5], "anchor": "next to the wooden door",
+                "anchor_source": "subtask.expected_observation",
+                "verdict": "accepted", "revision": 2,
+                "observation_ids": ["obs_1", "obs_4"],
+            }],
+            "anchors": ["next to the wooden door"],
+            "open_questions": [
+                {"id": "q_1", "text": "is the second red box the same one?", "status": "open"},
+                {"id": "q_2", "text": "old resolved question", "status": "resolved"},
+            ],
+            "plan": {
+                "subtasks": [
+                    {"id": "st_1", "status": "done", "goal": "find the door"},
+                    {"id": "st_2", "status": "active", "goal": "find the red box",
+                     "expected_observation": "next to the wooden door"},
+                ],
+            },
+        }
+        out = resume_brief_sections(checkpoint)
+        self.assertEqual(out["order"],
+                         ["identity", "anchor", "open_questions", "interrupted_subtask"])
+        text = out["text"]
+        positions = [
+            text.index("OBJECT IDENTITIES"),
+            text.index("RELATION ANCHORS"),
+            text.index("OPEN QUESTIONS"),
+            text.index("INTERRUPTED SUB-TASK"),
+        ]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn("cand_1", text)
+        self.assertIn("verdict=accepted rev=2", text)
+        self.assertIn("next to the wooden door", text)
+        self.assertIn("is the second red box the same one?", text)
+        self.assertNotIn("old resolved question", text)
+        self.assertIn("stage 2", text)
+        self.assertIn("NOT done", text)
+        json.dumps(out)
+
+    def test_an_identity_ablation_checkpoint_keeps_the_later_sections(self):
+        checkpoint = {
+            "identities": [], "anchors": [],
+            "open_questions": [{"id": "q_1", "text": "which instance?", "status": "open"}],
+            "plan": {"subtasks": [{"id": "st_1", "status": "active", "goal": "find it"}]},
+        }
+        out = resume_brief_sections(checkpoint)
+        self.assertNotIn("identity", out["sections"])
+        self.assertNotIn("anchor", out["sections"])
+        self.assertIn("which instance?", out["text"])
+        self.assertIn("INTERRUPTED SUB-TASK", out["text"])
 
 
 if __name__ == "__main__":

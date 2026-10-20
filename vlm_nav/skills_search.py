@@ -996,6 +996,11 @@ def _ground_summary(result: ToolResult) -> dict:
         summary["repeated_grounding"] = True
     if isinstance(data.get("grounding_retry"), Mapping):
         summary["grounding_retry"] = dict(data["grounding_retry"])
+    if isinstance(data.get("tighten_retry"), Mapping):
+        tighten = data["tighten_retry"]
+        summary["tighten_retry"] = _kept(
+            tighten, ("attempted", "accepted", "vlm_calls")
+        )
     if isinstance(data.get("strategy_change"), Mapping):
         summary["strategy_change"] = dict(data["strategy_change"])
     candidates = data.get("candidates") or []

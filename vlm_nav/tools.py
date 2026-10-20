@@ -1419,7 +1419,59 @@ def record_confirmation(
         **_scope_fields_of(ctx, candidate_id),
         "call": int(call if call is not None else len(getattr(ctx, "log", []) or ()) + 1),
     }
-    return _append_pack(evidence_pack(ctx), "confirmations", record)
+    record = _append_pack(evidence_pack(ctx), "confirmations", record)
+    _remember_identity_verdict(ctx, record)
+    return record
+
+
+def _remember_identity_verdict(ctx: ToolContext, record: Mapping) -> None:
+    """Mirror a confirm verdict/revision into long-term memory.
+
+    The confirmation ledger alone dies with the episode's ``ctx.extra``; the
+    identity layer keeps the instance fingerprint, the relation anchor and the
+    verdict together, so a delayed revisit can say *which* object was confirmed
+    and under which revision. Memory is optional (and switched off in the
+    identity ablation arm) - a missing layer is not an error.
+    """
+    memory = getattr(ctx, "memory", None)
+    confirm = getattr(memory, "confirm_identity", None)
+    if not callable(confirm):
+        return
+    candidate_id = str(record.get("candidate_id") or "")
+    if not candidate_id:
+        return
+    extra = ctx.extra if isinstance(ctx.extra, dict) else {}
+    store = extra.get(CANDIDATE_STORE_KEY)
+    candidate = store.get(candidate_id) if isinstance(store, Mapping) else None
+    candidate = candidate if isinstance(candidate, Mapping) else {}
+    anchor = ""
+    try:
+        from .tool_impl_task import current_subtask
+
+        subtask = current_subtask(ctx)
+    except Exception:  # noqa: BLE001 - a context without the task module
+        subtask = None
+    if isinstance(subtask, Mapping):
+        anchor = str(subtask.get("expected_observation") or "").strip()
+    if not anchor:
+        anchor = str(extra.get("identity_anchor") or "").strip()
+    try:
+        confirm(
+            candidate_id,
+            str(record.get("verdict") or ""),
+            revision=record.get("evidence_revision"),
+            observation_ids=record.get("observation_ids"),
+            anchor=anchor,
+            target=str(candidate.get("target") or candidate.get("instruction") or ""),
+            box=candidate.get("box"),
+            position=candidate.get("position_flu"),
+            subtask_id=str(record.get("subtask_id") or ""),
+            task_id=str(record.get("task_id") or ""),
+            note=str(record.get("reason") or ""),
+            evidence=record.get("evidence"),
+        )
+    except Exception:  # noqa: BLE001 - memory must never break a tool result
+        return
 
 
 def evidence_records_from_pack(pack: Any) -> list[dict]:

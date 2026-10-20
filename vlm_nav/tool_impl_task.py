@@ -1189,6 +1189,169 @@ def subtask_ground_instruction(ctx: ToolContext) -> str:
     return " - ".join(parts)[:MAX_STEP_CHARS]
 
 
+#: The resume brief's section order: object identity, relation anchor, open
+#: questions, then the interrupted sub-task. This is the priority goal.md asks
+#: long-term memory to keep - the rest (ledger, candidate places, pose) follows.
+RESUME_BRIEF_ORDER = ("identity", "anchor", "open_questions", "interrupted_subtask")
+
+RESUME_BRIEF_TITLES = {
+    "identity": "OBJECT IDENTITIES (which instance you established, and your verdict):",
+    "anchor": "RELATION ANCHORS (phrases that locate each instance):",
+    "open_questions": "OPEN QUESTIONS (unresolved, answer these before assuming):",
+    "interrupted_subtask": "INTERRUPTED SUB-TASK (where the plan stopped):",
+}
+
+
+def _checkpoint_identities(checkpoint: Mapping) -> list[dict]:
+    raw = checkpoint.get("identities")
+    entries = raw.get("identities") if isinstance(raw, Mapping) else raw
+    return [dict(item) for item in entries or [] if isinstance(item, Mapping)]
+
+
+def _stage_index(subtask: Mapping, position: int) -> int:
+    """The stage a sub-task id names (``st_2`` -> 2), else its position."""
+    match = re.search(r"(\d+)\s*$", str(subtask.get("id") or ""))
+    return int(match.group(1)) if match else int(position)
+
+
+def _checkpoint_anchors(checkpoint: Mapping, identities: list[dict]) -> list[dict]:
+    raw = checkpoint.get("anchors")
+    anchors = raw.get("anchors") if isinstance(raw, Mapping) else raw
+    rows: list[dict] = []
+    for item in anchors or []:
+        if isinstance(item, str):
+            rows.append({"anchor": item, "target": "", "candidate_id": ""})
+        elif isinstance(item, Mapping) and item.get("anchor"):
+            rows.append(dict(item))
+    for entry in identities:
+        anchor = str(entry.get("anchor") or "")
+        if anchor and not any(row.get("anchor") == anchor for row in rows):
+            rows.append({
+                "anchor": anchor,
+                "target": entry.get("target") or "",
+                "candidate_id": entry.get("candidate_id") or "",
+                "source": entry.get("anchor_source") or "",
+            })
+    return rows
+
+
+def resume_brief_sections(checkpoint: Mapping | None, *, limit: int = 1200) -> dict:
+    """The priority-ordered resume blocks, from the checkpoint alone.
+
+    The order is fixed by :data:`RESUME_BRIEF_ORDER`. Nothing here reads the
+    scene: identities, anchors, questions and plan statuses are the agent's own
+    records, so a wrong "done" or a wrong identity verdict survives the restart
+    and has to be corrected by the agent. An empty section is omitted (an
+    identity/anchor ablation checkpoint still yields questions and the stage).
+    """
+    checkpoint = checkpoint if isinstance(checkpoint, Mapping) else {}
+    sections: dict[str, list[str]] = {}
+    identities = _checkpoint_identities(checkpoint)
+    ledger = checkpoint.get("confirmation_ledger") or {}
+    ledger = ledger if isinstance(ledger, Mapping) else {}
+    identity_lines: list[str] = []
+    for entry in identities:
+        candidate = str(entry.get("candidate_id") or entry.get("identity_id") or "?")
+        detail = f"  - {candidate}"
+        if entry.get("target"):
+            detail += f": {entry['target']}"
+        box = entry.get("box")
+        if isinstance(box, (list, tuple)) and len(box) >= 4:
+            detail += " box=(" + ", ".join(f"{float(v):.0f}" for v in box[:4]) + ")"
+        place = entry.get("position_flu")
+        if isinstance(place, (list, tuple)) and len(place) >= 3:
+            detail += " at (" + ", ".join(f"{float(v):.2f}" for v in place[:3]) + ")"
+        verdict = str(entry.get("verdict") or "")
+        if verdict:
+            detail += f" verdict={verdict}"
+            if entry.get("revision") is not None:
+                detail += f" rev={entry['revision']}"
+        observations = [str(item) for item in entry.get("observation_ids") or () if item]
+        if observations:
+            detail += "; observed in " + ", ".join(observations[:4])
+        identity_lines.append(detail)
+    known = {
+        str(entry.get("candidate_id") or "") for entry in identities
+    }
+    for candidate, entry in ledger.items():
+        if str(candidate) in known or not isinstance(entry, Mapping):
+            continue
+        detail = f"  - {candidate}: {entry.get('last_verdict') or 'unconfirmed'}"
+        if entry.get("accepted_revision", entry.get("revision")) is not None:
+            detail += f" (revision {entry.get('accepted_revision', entry.get('revision'))})"
+        identity_lines.append(detail)
+    if identity_lines:
+        sections["identity"] = identity_lines
+    anchor_lines = []
+    for row in _checkpoint_anchors(checkpoint, identities):
+        detail = f"  - \"{row.get('anchor')}\""
+        if row.get("target"):
+            detail += f" for {row['target']}"
+        if row.get("candidate_id"):
+            detail += f" ({row['candidate_id']})"
+        if row.get("source"):
+            detail += f" from {row['source']}"
+        anchor_lines.append(detail)
+    if anchor_lines:
+        sections["anchor"] = anchor_lines
+    raw_questions = checkpoint.get("open_questions")
+    question_lines: list[str] = []
+    if isinstance(raw_questions, str) and raw_questions.strip():
+        question_lines.append(f"  - {raw_questions.strip()}")
+    elif isinstance(raw_questions, Mapping):
+        raw_questions = raw_questions.get("open_questions") or raw_questions.get("questions")
+    if isinstance(raw_questions, (list, tuple)):
+        for item in raw_questions:
+            if isinstance(item, Mapping):
+                if str(item.get("status") or "open") != "open":
+                    continue
+                detail = f"  - {item.get('id') or '?'}: {item.get('text') or ''}".rstrip()
+                if item.get("about"):
+                    detail += f" (about {item['about']})"
+                if item.get("step") is not None:
+                    detail += f" step={item['step']}"
+                question_lines.append(detail)
+            elif str(item or "").strip():
+                question_lines.append(f"  - {item}")
+    if question_lines:
+        sections["open_questions"] = question_lines
+    plan = checkpoint.get("plan") if isinstance(checkpoint.get("plan"), Mapping) else {}
+    subtasks = plan.get("subtasks") or []
+    subtask_lines: list[str] = []
+    for position, subtask in enumerate(subtasks, 1):
+        if not isinstance(subtask, Mapping):
+            continue
+        index = _stage_index(subtask, position)
+        status = str(subtask.get("status") or "pending")
+        detail = (
+            f"  - sub-task {subtask.get('id') or f'st_{index}'} (stage {index}): {status}"
+        )
+        if subtask.get("goal"):
+            detail += f" — {subtask['goal']}"
+        anchor = str(subtask.get("expected_observation") or "").strip()
+        if anchor:
+            detail += f"; anchor: {anchor}"
+        evidence = [str(item) for item in subtask.get("evidence") or () if item]
+        if evidence:
+            detail += "; evidence: " + ", ".join(evidence[:4])
+        if status != "done":
+            detail += " (NOT done)"
+        subtask_lines.append(detail)
+    if subtask_lines:
+        sections["interrupted_subtask"] = subtask_lines
+    lines: list[str] = []
+    for name in RESUME_BRIEF_ORDER:
+        if not sections.get(name):
+            continue
+        lines.append(RESUME_BRIEF_TITLES[name])
+        lines.extend(sections[name])
+    return {
+        "order": list(RESUME_BRIEF_ORDER),
+        "sections": sections,
+        "text": "\n".join(lines)[:limit],
+    }
+
+
 def mark_next_step_spent(
     ctx: ToolContext, origin: str = "subtask_next_step", subtask: dict | None = None
 ) -> bool:

@@ -19,6 +19,7 @@ import torch
 from vlm_nav.tool_impl_perception import (
     CANDIDATE_STORE_KEY,
     IMAGE_STORE_KEY,
+    TIGHTEN_SYSTEM_PROMPT,
     TRIANGULATION_REJECTIONS_KEY,
     _remember_rejected_triangulation,
     latest_observation,
@@ -1045,12 +1046,17 @@ class CandidatePositionTest(unittest.TestCase):
         )
         ctx = make_ctx(world)
         observed = observe(ctx, {"mode": "forward"})
+        vlm = FakeVLM(
+            '{"candidates": [{"box": [480, 100, 950, 500], "distance_m": 3.0}]}'
+        )
+        # this case fixes the box and tests the depth-selection geometry; the
+        # tight-box retry (which would ask for a smaller box inside a crop) is
+        # a separate mechanism and is covered by TightenLargeBoxTest
+        vlm.allow_box_retry = False
         result = ground_target(
             ctx,
             {"instruction": "bookshelf", "observation_id": observed.data["observation_id"]},
-            vlm=FakeVLM(
-                '{"candidates": [{"box": [480, 100, 950, 500], "distance_m": 3.0}]}'
-            ),
+            vlm=vlm,
         )
 
         candidate = result.data["candidates"][0]
@@ -1072,12 +1078,14 @@ class CandidatePositionTest(unittest.TestCase):
         )
         ctx = make_ctx(world)
         observed = observe(ctx, {"mode": "forward"})
+        vlm = FakeVLM(
+            '{"candidates": [{"box": [470, 100, 950, 500], "distance_m": 3.0}]}'
+        )
+        vlm.allow_box_retry = False  # fixed-box measurement, not box refinement
         result = ground_target(
             ctx,
             {"instruction": "bookshelf", "observation_id": observed.data["observation_id"]},
-            vlm=FakeVLM(
-                '{"candidates": [{"box": [470, 100, 950, 500], "distance_m": 3.0}]}'
-            ),
+            vlm=vlm,
         )
 
         candidate = result.data["candidates"][0]
@@ -1421,6 +1429,9 @@ class CandidatePositionTest(unittest.TestCase):
         vlm = FakeVLM(
             '{"candidates": [{"box": [480, 0, 999, 400], "distance_m": 3.0}]}'
         )
+        # count grounding calls only: the tight-box retry adds one crop call per
+        # large box and is covered separately
+        vlm.allow_box_retry = False
         args = {
             "instruction": "bookshelf",
             "observation_id": observed.data["observation_id"],
@@ -1496,6 +1507,123 @@ class CandidatePositionTest(unittest.TestCase):
         candidate = result.data["candidates"][0]
         self.assertEqual(candidate["position_source"], "pose_unknown")
         self.assertNotIn("position_flu", candidate)
+
+
+class TightenLargeBoxTest(unittest.TestCase):
+    """The large-box fix: crop the box, ask for a tight box inside the crop.
+
+    The classroom v5 failure was a *bearing* error: the box [480, 0, 999, 400]
+    covered the bookshelf and the wall next to it, so its centre pointed at the
+    wall and a 3.5 m model range put the candidate >10 m from the shelf. The
+    fix has to move the box centre onto the object, not merely re-measure the
+    same centre.
+    """
+
+    class TwoStageVLM(FakeVLM):
+        def __init__(self, first, second):
+            super().__init__(None)
+            self.replies = [first, second]
+
+        def decide(self, frames, system_prompt, user_prompt, context=None):
+            self.calls.append(
+                {"frames": frames, "system_prompt": system_prompt,
+                 "user_prompt": user_prompt, "context": context}
+            )
+            return self.replies.pop(0)
+
+    def _run(self, world, first, second):
+        ctx = make_ctx(world)
+        observed = observe(ctx, {"mode": "forward"})
+        vlm = self.TwoStageVLM(first, second)
+        result = ground_target(
+            ctx,
+            {"instruction": "bookshelf", "observation_id": observed.data["observation_id"]},
+            vlm=vlm,
+        )
+        return result, vlm, ctx
+
+    @staticmethod
+    def _bearing(position) -> float:
+        return math.degrees(math.atan2(float(position[1]), float(position[0])))
+
+    def test_tight_box_moves_the_bearing_from_the_wall_onto_the_shelf(self):
+        """A crop that contains wall + shelf: the second reply boxes only the
+        shelf, and the candidate bearing error drops from ~14 deg to <1 deg."""
+        world = FakeWorld(
+            width=200, height=100, position=(0.0, 0.0, 0.0), yaw_deg=0.0,
+            depth=lambda pixel: 3.4 if 760.0 <= float(pixel[0]) <= 840.0 else 15.0,
+            hfov_deg=90.0,
+        )
+        result, vlm, ctx = self._run(
+            world,
+            # the v5-like box: shelf on the right plus the wall to its left
+            '{"candidates": [{"box": [300, 0, 999, 600], "distance_m": 3.4}]}',
+            # crop-local box around the shelf only (x 680-760 of the 285-1000
+            # crop maps to ~771-828 in the source frame)
+            '{"candidates": [{"box": [680, 300, 760, 640], "confidence": 0.9}]}',
+        )
+
+        self.assertEqual(result.status, "ok", result.data)
+        self.assertEqual(result.data["vlm_calls"], 2)
+        self.assertEqual(len(vlm.calls), 2)
+        self.assertEqual(vlm.calls[1]["system_prompt"], TIGHTEN_SYSTEM_PROMPT)
+        self.assertIn("tight box", vlm.calls[1]["user_prompt"])
+        # the second call sees a crop, not the full frame
+        record = resolve_observation(ctx, result.data["observation_id"])
+        self.assertNotEqual(
+            tuple(vlm.calls[1]["frames"][0].shape[-2:]),
+            tuple(record.frame.shape[-2:]),
+        )
+
+        retry = result.data["tighten_retry"]
+        self.assertEqual(retry["attempted"], 1)
+        self.assertEqual(retry["accepted"], 1)
+        self.assertEqual(retry["vlm_calls"], 1)
+        candidate = result.data["candidates"][0]
+        self.assertIs(candidate["tighten_retry"]["accepted"], True)
+        self.assertEqual(candidate["position_source"], "depth")
+        self.assertEqual(candidate["distance_source"], "depth_center")
+        self.assertAlmostEqual(candidate["range_m"], 3.4, places=3)
+        # the tight box centre is the shelf's pixel (~800), not the old centre
+        self.assertAlmostEqual(candidate["box"][0], 771.2, delta=1.0)
+        self.assertAlmostEqual(candidate["box"][2], 828.4, delta=1.0)
+        self.assertGreater(candidate["box"][0], 700.0)
+
+        tightened_bearing = self._bearing(candidate["position_flu"])
+        original_bearing = -math.degrees(math.atan2((649.5 - 500.0) / 500.0, 1.0))
+        target_bearing = -math.degrees(math.atan2((800.0 - 500.0) / 500.0, 1.0))
+        original_error = abs(original_bearing - target_bearing)
+        tightened_error = abs(tightened_bearing - target_bearing)
+        self.assertLess(tightened_error, 5.0)
+        self.assertGreater(original_error, 10.0)
+        self.assertLess(tightened_error, original_error / 3.0)
+
+    def test_a_tight_box_that_still_touches_the_border_keeps_the_original(self):
+        """Item 2: a reply that covers the whole crop (and the border) is not a
+        tightening; the candidate keeps the original box and the existing
+        uncertain/second-view handling."""
+        world = FakeWorld(
+            width=200, height=100, position=(0.0, 0.0, 0.0), yaw_deg=0.0,
+            depth=lambda pixel: 15.0, hfov_deg=90.0,
+        )
+        result, vlm, _observed = self._run(
+            world,
+            '{"candidates": [{"box": [480, 0, 999, 400], "distance_m": 3.0}]}',
+            '{"candidates": [{"box": [0, 0, 1000, 1000]}]}',
+        )
+
+        self.assertEqual(result.status, "ok", result.data)
+        self.assertEqual(len(vlm.calls), 2)
+        retry = result.data["tighten_retry"]
+        self.assertEqual(retry["attempted"], 1)
+        self.assertEqual(retry["accepted"], 0)
+        self.assertEqual(retry["candidates"][0]["reason"], "still_border")
+        candidate = result.data["candidates"][0]
+        self.assertEqual(candidate["box"], [480.0, 0.0, 999.0, 400.0])
+        self.assertIs(candidate["border_large_box"], True)
+        self.assertEqual(candidate["distance_source"], "conflict")
+        self.assertIs(candidate["distance_uncertain"], True)
+        self.assertTrue(candidate["border_second_view"])
 
 
 class CompareCandidatesTest(unittest.TestCase):
@@ -2266,6 +2394,39 @@ class QueryMemoryEvidencePackTest(unittest.TestCase):
         self.assertEqual(image["quality"]["level"], "strong")
         self.assertEqual(pack["quality"], {"strong": 1, "moderate": 0, "weak": 0})
         self.assertIn("sighting", pack["note"])
+
+    def test_identity_and_anchor_hits_lead_the_retrieval(self):
+        log, world, ctx = self._scene()
+        observed = observe(ctx, {"mode": "forward"})
+        self._ground(ctx, observed.data["observation_id"], json.dumps({"candidates": [
+            {"box": [100, 100, 300, 300], "confidence": 0.9},
+        ]}))
+        first = log.identities.get("cand_1")
+        self.assertIsNotNone(first)
+        log.confirm_identity(
+            first["candidate_id"], "accepted", revision=0,
+            anchor="next to the wooden door",
+        )
+        # a second, unconfirmed instance of the same-looking object: the
+        # confirmed one must still lead the retrieved hits
+        log.record(
+            None, pose=[3.0, 1.0, 0.5], yaw=math.radians(90),
+            goal_target="red object",
+            sighting={
+                "candidate": "cand_2", "box": [500, 100, 700, 300],
+                "basis": "ground_target", "target": "red object",
+                "position_flu": [3.0, 1.0, 0.5], "image": "obs_2",
+            },
+        )
+        hits = query_memory(ctx, {"target": "red object", "limit": 5})
+        self.assertEqual(hits.data["hits"][0]["identity"]["candidate_id"], "cand_1")
+        self.assertEqual(hits.data["hits"][0]["anchor"], "next to the wooden door")
+        self.assertEqual(hits.data["identities"][0]["candidate_id"], "cand_1")
+        self.assertEqual(hits.data["identities"][0]["verdict"], "accepted")
+        self.assertIn("next to the wooden door", hits.data["anchors"])
+        self.assertEqual(hits.data["identity_priority_hits"], 2)
+        self.assertTrue(hits.data["working"]["anchors"])
+        json.dumps(hits.data)
 
     def test_suggested_use_covers_compare_verify_and_localize(self):
         log, world, ctx = self._scene()

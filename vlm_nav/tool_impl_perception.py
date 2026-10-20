@@ -360,6 +360,29 @@ BORDER_SECOND_VIEW_MIN_DEG = 30.0
 BORDER_SECOND_VIEW_MAX_DEG = 45.0
 BORDER_SECOND_VIEW_STEP_M = 1.5
 
+#: Tight-box retry for a large/border box. The first box can mix the target with
+#: the wall behind it (classroom v5: [480, 0, 999, 400], the shelf plus a wall),
+#: and asking again for the same-sized box on the same frame cannot separate
+#: them. The box region is cropped, the model is asked for a box around *only*
+#: the described object inside that crop, and the reply is mapped back into the
+#: source frame before the candidate is measured.
+TIGHTEN_TRIGGER_FRACTION = BORDER_LARGE_FRACTION
+#: at most this many tight-box calls per grounding (a reply may carry several
+#: large candidates; the cost of the retry is one model call each)
+TIGHTEN_MAX_CANDIDATES = 2
+#: padding of the crop around the detected box, normalized 0-1000 units, so the
+#: crop does not cut the object's own silhouette
+TIGHTEN_CROP_PAD = 15.0
+#: a tight box is accepted only when it is no longer large by the trigger
+#: measure, no longer touches the frame border, and has really shrunk
+TIGHTEN_MAX_FRACTION = BORDER_LARGE_FRACTION
+TIGHTEN_MAX_RELATIVE_AREA = 0.65
+#: a tightened bearing whose model-range point lands this far from an already
+#: trusted measurement of the same target (and this many degrees off the
+#: trusted bearing) is not the same instance: the candidate becomes a conflict
+TIGHTEN_SANITY_ANGLE_DEG = 10.0
+TIGHTEN_SANITY_DISTANCE_M = 2.5
+
 
 #: Two grounded views triangulate one candidate only when the rays are a real
 #: stereo pair: a baseline and an angle large enough that the intersection is
@@ -444,6 +467,32 @@ BOX_ONLY_USER_PROMPT = (
     "Your previous answer contained no usable bounding box. Look at the same "
     "frame again and return only the box of the most likely instance of the "
     "instruction (normalized 0-1000, corner form)."
+)
+
+#: The tight-box retry for a large/border box: the attached frame is an enlarged
+#: crop of the detected region, and the only question is which part of it is the
+#: object itself. Asking in the crop (instead of drawing the old box on the full
+#: frame and asking again) lets the model return a *smaller* box; the reply is
+#: mapped back into the source frame (see ``_map_box_from_region``).
+TIGHTEN_SYSTEM_PROMPT = (
+    "You are the target-grounding module of a drone navigation agent. The "
+    "attached image is an enlarged crop of one detected region. Return ONE "
+    "JSON object and nothing else: "
+    '{"candidates": [{"box": [x1, y1, x2, y2], "confidence": 0.0}]}. '
+    "box is a corner box [x1, y1, x2, y2] in this crop's normalized 0-1000 "
+    "coordinates (x1, y1 = top-left, x2, y2 = bottom-right). Box ONLY the "
+    "described object itself: exclude the wall, floor, ceiling and any other "
+    "background or furniture that is also visible in the crop. The box must be "
+    "tight around the object's visible silhouette. Return "
+    '{"candidates": []} only when the object is not visible in this crop.'
+)
+
+TIGHTEN_USER_PROMPT = (
+    "Instruction: {instruction}\n"
+    "The attached image is an enlarged crop of a region detected as a possible "
+    "instance of the instruction, but the earlier box around it also included "
+    "the wall/background. Return the tight box around only the instructed "
+    "object inside this crop (normalized 0-1000, corner form)."
 )
 
 GROUND_SYSTEM_PROMPT = (
@@ -1444,6 +1493,230 @@ def _map_box_from_region(box: list[float], region: list[float]) -> list[float] |
         round(u + x2 / 1000.0 * w, 3),
         round(v + y2 / 1000.0 * h, 3),
     ]
+
+
+def _tighten_region(box: Box) -> list[float]:
+    """The crop region of a box, with a small pad, as ``[u, v, w, h]``."""
+    x1 = max(0.0, box.x1 - TIGHTEN_CROP_PAD)
+    y1 = max(0.0, box.y1 - TIGHTEN_CROP_PAD)
+    x2 = min(1000.0, box.x2 + TIGHTEN_CROP_PAD)
+    y2 = min(1000.0, box.y2 + TIGHTEN_CROP_PAD)
+    return [round(x1, 1), round(y1, 1), round(x2 - x1, 1), round(y2 - y1, 1)]
+
+
+def _tighten_trigger(box: Box) -> bool:
+    """Whether a box is large or touches the border (the tight-box retry gate)."""
+    geometry = _box_geometry(box)
+    return bool(
+        geometry["area_fraction"] > TIGHTEN_TRIGGER_FRACTION
+        or geometry["border_touching"]
+    )
+
+
+def _tight_box_acceptable(original: Box, tight: Box) -> tuple[bool, str]:
+    """Whether a mapped tight box is a real tightening of ``original``.
+
+    A reply that covers the whole crop, still runs into the frame border, or
+    hardly shrank is not new evidence: the original box is kept (and its
+    existing uncertain/second-view handling runs), rather than replacing a
+    large box with a differently wrong one.
+    """
+    if tight.width <= 0.0 or tight.height <= 0.0:
+        return False, "degenerate"
+    geometry = _box_geometry(tight)
+    if geometry["border_touching"]:
+        return False, "still_border"
+    if geometry["area_fraction"] > TIGHTEN_MAX_FRACTION:
+        return False, "still_large"
+    original_area = _box_geometry(original)["area_fraction"]
+    if geometry["area_fraction"] > original_area * TIGHTEN_MAX_RELATIVE_AREA:
+        return False, "not_tightened"
+    return True, ""
+
+
+def _tighten_bearing_conflict(
+    ctx: ToolContext,
+    record: PerceptionObservation,
+    candidate: dict,
+    box: Box,
+    distance_m: float | None,
+) -> dict | None:
+    """A tightened bearing placed at the model range must not contradict a
+    trusted measurement of the same target.
+
+    The fix this implements is a *bearing* fix: the tight box's centre replaces
+    a centre that sat on the wall. If the new bearing, combined with the model's
+    range, lands far from a position already measured (trusted depth) or
+    triangulated for the same stage/target and points more than
+    :data:`TIGHTEN_SANITY_ANGLE_DEG` away from it, the tight box is probably a
+    different instance or a background patch - the candidate is marked a
+    conflict instead of being placed there with confidence.
+    """
+    if distance_m is None or not (MIN_RANGE_M < float(distance_m) <= MAX_RANGE_M):
+        return None
+    origin = record.position_flu
+    if origin is None:
+        return None
+    point, _problem = _project_pixel(ctx, record, box.center, float(distance_m))
+    ray = _pixel_ray(ctx, record, box.center)
+    if point is None or ray is None:
+        return None
+    bearing = _as_float(ray.get("bearing_deg"), None)
+    if bearing is None:
+        return None
+    store = _candidate_store(ctx)
+    subtask_key = str(candidate.get("subtask_key") or "")
+    instruction = str(candidate.get("instruction") or "")
+    for other in store.values():
+        if not isinstance(other, Mapping) or other is candidate:
+            continue
+        if str(other.get("id") or "") == str(candidate.get("id") or ""):
+            continue
+        source = str(other.get("distance_source") or "")
+        if source not in TRUSTED_DEPTH_SOURCES and source != DISTANCE_TRIANGULATED:
+            continue
+        if other.get("distance_uncertain") is True:
+            continue
+        position = other.get("position_flu")
+        if not isinstance(position, (list, tuple)) or len(position) < 3:
+            continue
+        same_stage = bool(subtask_key) and str(other.get("subtask_key") or "") == subtask_key
+        if not same_stage and not _same_target_instruction(
+            str(other.get("instruction") or ""), instruction
+        ):
+            continue
+        try:
+            target = np.asarray([float(value) for value in position[:3]], dtype=np.float64)
+            here = np.asarray([float(value) for value in origin[:3]], dtype=np.float64)
+        except (TypeError, ValueError):
+            continue
+        separation = float(np.linalg.norm(target - here))
+        if separation <= TIGHTEN_SANITY_DISTANCE_M:
+            continue
+        direction = target - here
+        trusted_bearing = math.degrees(math.atan2(float(direction[1]), float(direction[0])))
+        delta = abs((trusted_bearing - float(bearing) + 180.0) % 360.0 - 180.0)
+        if delta <= TIGHTEN_SANITY_ANGLE_DEG:
+            continue
+        projected = np.asarray([float(value) for value in point[:3]], dtype=np.float64)
+        gap = float(np.linalg.norm(projected - target))
+        if gap <= TIGHTEN_SANITY_DISTANCE_M:
+            continue
+        return {
+            "model_m": round(float(distance_m), 3),
+            "depth_center_m": None,
+            "depth_ground_m": None,
+            "ratio": None,
+            "difference_m": round(gap, 3),
+            "samples": [],
+            "resolved": False,
+            "resolution": "tight_box_sanity",
+            "trusted_candidate": str(other.get("id") or ""),
+            "trusted_distance_source": source,
+            "trusted_position_flu": list(target),
+            "angle_deg": round(delta, 2),
+            "separation_m": round(gap, 3),
+            "why": (
+                "the tightened box's bearing, placed at the model's range, points "
+                "away from a trusted measurement of the same target: the tight box "
+                "is probably another instance or background, not the target"
+            ),
+        }
+    return None
+
+
+def _tighten_large_candidates(
+    record: PerceptionObservation,
+    instruction: str,
+    candidates: list[dict],
+    ask,
+) -> tuple[dict | None, int]:
+    """Ask the model for a tight box inside each large/border candidate's crop.
+
+    The existing box retry draws the old box on the full frame and asks for the
+    same box again; this one crops the detected region and asks for a *smaller*
+    box around only the described object (the shelf, not the wall). An accepted
+    reply replaces ``candidate["box"]`` before the candidate is measured, so its
+    centre/bottom edge determine the bearing and the range. Rejected replies
+    keep the original box (the caller's uncertain/second-view handling runs) and
+    are recorded with the reason.
+
+    Returns ``(retry_record, vlm_calls)``.
+    """
+    attempts: list[dict] = []
+    calls = 0
+    for candidate in candidates:
+        if len(attempts) >= TIGHTEN_MAX_CANDIDATES:
+            break
+        box, _reason = parse_box(candidate.get("box"), box_format=BOX_FORMAT_XYXY)
+        if box is None or not _tighten_trigger(box):
+            continue
+        geometry = _box_geometry(box)
+        region = _tighten_region(box)
+        crop, _size, _upscale, _origin = _crop_frame(record.frame, region)
+        info: dict = {
+            "candidate": candidate.get("id"),
+            "original_box": box.to_list(),
+            "original_area_fraction": geometry["area_fraction"],
+            "original_border_touching": geometry["border_touching"],
+            "region": list(region),
+            "vlm_calls": 0,
+            "accepted": False,
+            "reason": "",
+        }
+        items = None
+        try:
+            reply = ask(
+                TIGHTEN_SYSTEM_PROMPT,
+                TIGHTEN_USER_PROMPT.format(instruction=instruction),
+                [crop],
+            )
+            info["vlm_calls"] = 1
+            calls += 1
+            items = _candidate_items(
+                _extract_json(reply if isinstance(reply, str) else str(reply))
+            )
+        except Exception:  # noqa: BLE001 - a failed retry keeps the original box
+            items = None
+        tight = None
+        if items:
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                local, _local_reason = parse_box(
+                    item.get("box", item.get("bbox", item.get("region")))
+                )
+                if local is None:
+                    continue
+                mapped = _map_box_from_region(local.to_list(), region)
+                if mapped is None:
+                    continue
+                tight, _tight_reason = parse_box(mapped, box_format=BOX_FORMAT_XYXY)
+                if tight is not None:
+                    break
+        if tight is None:
+            info["reason"] = "no_box"
+        else:
+            acceptable, reason = _tight_box_acceptable(box, tight)
+            info["tight_box"] = tight.to_list()
+            info["tight_area_fraction"] = _box_geometry(tight)["area_fraction"]
+            if acceptable:
+                info["accepted"] = True
+                candidate["box"] = tight.to_list()
+                candidate["box_uvwh"] = tight.to_uvwh()
+            else:
+                info["reason"] = reason
+                info["rejected_box"] = tight.to_list()
+        attempts.append(info)
+        candidate["tighten_retry"] = info
+    if not attempts:
+        return None, 0
+    return {
+        "attempted": len(attempts),
+        "accepted": sum(1 for item in attempts if item.get("accepted")),
+        "vlm_calls": calls,
+        "candidates": attempts,
+    }, calls
 
 
 def _retry_hint_box(
@@ -3990,13 +4263,16 @@ def _strategy_change(ctx: ToolContext, record: PerceptionObservation, kind: str)
     return chosen
 
 
-def _sighting_of_candidate(candidate: dict, instruction: str, record: PerceptionObservation) -> dict:
+def _sighting_of_candidate(candidate: dict, instruction: str, record: PerceptionObservation,
+                           anchor: str = "") -> dict:
     """The sighting a grounded candidate *is*: image, candidate and basis.
 
     What ``ground_target`` knows that a plain capture does not: which frame,
     which candidate id, the box the grounding model wrote and the attributes it
     read. That is the judgement basis a later ``query_memory`` cites, so the
-    sighting is stored with it instead of a bare target name.
+    sighting is stored with it instead of a bare target name. ``anchor`` is the
+    relation phrase the caller knows from its task plan (``ctx.extra``); it is
+    only stored when non-empty, so a task without a relation adds no field.
     """
     attributes = candidate.get("attrs") if isinstance(candidate.get("attrs"), dict) else {}
     basis = (
@@ -4011,7 +4287,7 @@ def _sighting_of_candidate(candidate: dict, instruction: str, record: Perception
         )
     if candidate.get("position_source"):
         basis += f" position_source={candidate['position_source']}"
-    return {
+    sighting = {
         "target": instruction,
         "image": record.observation_id,
         "candidate": candidate.get("id"),
@@ -4025,6 +4301,9 @@ def _sighting_of_candidate(candidate: dict, instruction: str, record: Perception
         "note": candidate.get("uncertainty") or "",
         "step": record.metadata.get("step"),
     }
+    if str(anchor or "").strip():
+        sighting["anchor"] = str(anchor).strip()
+    return sighting
 
 
 def _stagnant_result(
@@ -4366,11 +4645,39 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
         candidate["source"] = "ground_target"
         candidate["instruction"] = instruction[:120]
         candidate["subtask_key"] = subtask_key
+    # a large/border box is very likely the target plus the wall behind it; the
+    # full-frame retry only draws that same box again, so the region is cropped
+    # and the model is asked for a tight box inside the crop. The box is replaced
+    # before measurement, which is what moves the bearing off the wall.
+    tighten_retry: dict | None = None
+    if getattr(backend, "allow_box_retry", True):
+        tighten_retry, tighten_calls = _tighten_large_candidates(
+            record, instruction, candidates, ask
+        )
+        vlm_calls += tighten_calls
+    for candidate in candidates:
         box = parse_box(candidate["box"], box_format=BOX_FORMAT_XYXY)[0]
         if box is not None:
             candidate.update(
                 _candidate_location(ctx, record, box, candidate["distance_m"], depth_fn, depth_reason)
             )
+            tightened = candidate.get("tighten_retry")
+            if (
+                isinstance(tightened, Mapping)
+                and tightened.get("accepted")
+                and candidate.get("position_source") == POSITION_MODEL_DISTANCE
+            ):
+                # the tightened bearing, placed at the model's range, must not
+                # point away from a trusted depth/triangulated position of the
+                # same target: if it does, this tight box is not that instance
+                sanity = _tighten_bearing_conflict(
+                    ctx, record, candidate, box, candidate.get("distance_m")
+                )
+                if sanity is not None:
+                    tightened["bearing_sanity"] = "conflict"
+                    candidate["distance_source"] = DISTANCE_CONFLICT
+                    candidate["distance_conflict"] = sanity
+                    candidate["distance_uncertain"] = True
             advice = candidate.get("view_change_advice")
             if isinstance(advice, dict) and isinstance(advice.get("args"), dict):
                 if advice["args"].get("instruction") is None:
@@ -4445,9 +4752,12 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
     # every candidate is a sighting of *this* frame: image + candidate + basis,
     # which is what makes a later "where did I see it" answer evidence instead
     # of a frame that merely inherited the task's target name
+    extra = ctx.extra if isinstance(ctx.extra, dict) else {}
+    identity_anchor = str(extra.get("identity_anchor") or "").strip()
     sighting_write = _MemoryBridge(ctx.memory).add_sighting(
         record.observation_id,
-        [_sighting_of_candidate(candidate, instruction, record) for candidate in candidates],
+        [_sighting_of_candidate(candidate, instruction, record, anchor=identity_anchor)
+         for candidate in candidates],
         step=record.metadata.get("step"),
     )
     data = {
@@ -4464,6 +4774,14 @@ def ground_target(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
     }
     if retry is not None:
         data["grounding_retry"] = retry
+    if tighten_retry is not None:
+        data["tighten_retry"] = tighten_retry
+        if tighten_retry.get("accepted"):
+            data["tighten_accepted_candidates"] = [
+                str(item.get("candidate"))
+                for item in tighten_retry.get("candidates") or []
+                if item.get("accepted")
+            ]
     if conflict_ids:
         data["distance_conflict_candidates"] = conflict_ids
         data["hint"] = (
@@ -4676,7 +4994,8 @@ def compare_candidates(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolRes
 # reference - a recalled frame the model cannot address or navigate back to is
 # not evidence
 _POSITION_KEYS = ("position_flu", "pose", "position", "world_flu", "target_flu")
-_SUMMARY_TEXTS = ("hyp_id", "id", "kind", "status", "content", "note", "target_name", "event")
+_SUMMARY_TEXTS = ("hyp_id", "id", "kind", "status", "content", "note", "target_name", "event",
+                  "anchor", "anchor_source")
 _SUMMARY_LISTS = ("events", "labels", "reasons")
 _SUMMARY_NUMBERS = ("step", "t", "time_s", "score")
 _SUMMARY_LIST_CAP = 8
@@ -4796,6 +5115,11 @@ def _hit_summary(hit: dict) -> dict:
     negative = hit.get("negative")
     if isinstance(negative, Mapping):
         entry["negative"] = _memory_jsonable(dict(negative))
+    identity = hit.get("identity")
+    if isinstance(identity, Mapping):
+        entry["identity"] = _memory_jsonable(dict(identity))
+        if not entry.get("anchor") and identity.get("anchor"):
+            entry["anchor"] = str(identity.get("anchor"))
     visibility = hit.get("visibility")
     if isinstance(visibility, Mapping):
         entry["visibility"] = _memory_jsonable(dict(visibility))
@@ -5109,7 +5433,30 @@ def _places_of(ctx: ToolContext, query, limit: int = 3) -> list[dict] | None:
         places = fn(text, limit=limit) if text else fn({}, limit=limit)
     except Exception:  # noqa: BLE001 - the spatial layer is optional
         return []
-    return [_memory_jsonable(place) for place in (places or []) if isinstance(place, Mapping)]
+    index = _identity_index(ctx)
+    out = []
+    for place in places or []:
+        if not isinstance(place, Mapping):
+            continue
+        item = _memory_jsonable(dict(place))
+        for candidate in item.get("candidates") or []:
+            identity = index.get(str(candidate))
+            if identity is None:
+                continue
+            item["identity"] = {
+                "identity_id": identity.get("identity_id"),
+                "candidate_id": identity.get("candidate_id"),
+                "target": identity.get("target"),
+                "verdict": identity.get("verdict"),
+                "revision": identity.get("revision"),
+            }
+            if identity.get("anchor"):
+                item["anchor"] = identity.get("anchor")
+            item["identity_priority"] = identity.get("verdict") == "accepted"
+            break
+        out.append(item)
+    out.sort(key=lambda item: 0 if item.get("identity") else (1 if item.get("anchor") else 2))
+    return out
 
 
 def _working_state(ctx: ToolContext, limit: int = 3) -> dict | None:
@@ -5125,15 +5472,152 @@ def _working_state(ctx: ToolContext, limit: int = 3) -> dict | None:
         return None
     if not isinstance(state, Mapping):
         return None
-    return _memory_jsonable(
-        {
-            "subgoal": state.get("subgoal"),
-            "open_questions": list(state.get("open_questions") or [])[:limit],
-            "failures": list(state.get("failures") or [])[:limit],
-            "candidates": list(state.get("candidates") or [])[:limit],
-            "counts": state.get("counts"),
+    identity_rows = []
+    identities = getattr(memory, "identities", None) if memory is not None else None
+    if identities is not None:
+        all_fn = getattr(identities, "all", None)
+        if callable(all_fn):
+            try:
+                identity_rows = list(all_fn(limit))[:limit]
+            except Exception:  # noqa: BLE001 - the layer is optional
+                identity_rows = []
+    extra = {
+        "open_questions": list(state.get("open_questions") or [])[:limit],
+        "anchors": [
+            dict(item) for item in (getattr(working, "anchors", lambda limit=None: [])(limit=limit) or [])
+            if isinstance(item, Mapping)
+        ],
+        "identities": identity_rows,
+        "subgoal": state.get("subgoal"),
+        "candidates": list(state.get("candidates") or [])[:limit],
+        "failures": list(state.get("failures") or [])[:limit],
+        "counts": state.get("counts"),
+    }
+    return _memory_jsonable(extra)
+
+
+def _identity_hits(ctx: ToolContext, query, limit: int = 5) -> list[dict]:
+    """The identity layer's answer to a retrieval (``[]`` when it is off).
+
+    An identity hit says which object instance the query is about: its
+    fingerprint (target, box, position), the relation anchor it was found
+    under, and the confirmation verdict/revision taken on it. It is returned
+    next to the episodic hits because "where was it" and "which one was it" are
+    two questions a revisit has to answer together.
+    """
+    memory = getattr(ctx, "memory", None)
+    identities = getattr(memory, "identities", None) if memory is not None else None
+    fn = getattr(identities, "query", None)
+    if not callable(fn):
+        return []
+    spec = query if isinstance(query, Mapping) else {"text": query}
+    text = spec.get("text") or spec.get("target") or spec.get("goal_target") or ""
+    try:
+        hits = fn(text, limit=max(1, min(int(limit), 8))) if text else fn({}, limit=max(1, min(int(limit), 8)))
+    except Exception:  # noqa: BLE001 - the layer is optional
+        return []
+    out = []
+    for hit in hits or []:
+        if not isinstance(hit, Mapping):
+            continue
+        item = _memory_jsonable(dict(hit))
+        item["identity"] = {
+            "identity_id": item.get("identity_id"),
+            "candidate_id": item.get("candidate_id"),
+            "target": item.get("target"),
+            "verdict": item.get("verdict"),
+            "revision": item.get("revision"),
         }
-    )
+        item["anchors"] = [item["anchor"]] if item.get("anchor") else []
+        out.append(item)
+    return out
+
+
+def _identity_index(ctx: ToolContext) -> dict:
+    """``candidate_id -> identity entry`` for attaching fields to episodic hits."""
+    memory = getattr(ctx, "memory", None)
+    identities = getattr(memory, "identities", None) if memory is not None else None
+    fn = getattr(identities, "all", None)
+    if not callable(fn):
+        return {}
+    try:
+        entries = fn()
+    except Exception:  # noqa: BLE001 - the layer is optional
+        return {}
+    index = {}
+    for entry in entries or []:
+        if not isinstance(entry, Mapping):
+            continue
+        candidate = str(entry.get("candidate_id") or "")
+        if candidate:
+            index[candidate] = entry
+    return index
+
+
+def _summary_candidates(summary: Mapping) -> list[str]:
+    """Candidate ids a model-facing hit cites (sighting / identity / use args)."""
+    candidates: list[str] = []
+    sighting_items = []
+    if isinstance(summary.get("sighting"), Mapping):
+        sighting_items.append(summary["sighting"])
+    if isinstance(summary.get("sightings"), list):
+        sighting_items.extend(
+            item for item in summary["sightings"] if isinstance(item, Mapping)
+        )
+    for source in [*sighting_items, summary.get("identity") or {}, summary.get("use") or {}]:
+        if not isinstance(source, Mapping):
+            continue
+        candidate = str(source.get("candidate") or source.get("candidate_id") or "")
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+        args = source.get("args")
+        if isinstance(args, Mapping):
+            candidate = str(args.get("candidate_id") or args.get("candidate") or "")
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def _rank_by_identity(ctx: ToolContext, summaries: list[dict]) -> int:
+    """Put identity- and anchor-bearing hits first; returns how many moved.
+
+    The order is the goal's priority: a hit that names the confirmed instance
+    (or its relation anchor) outranks a generic frame; among the rest the
+    retrieval's own score/recency order is kept exactly as it was, so this is a
+    stable partition, not a re-scoring of the episodic layer.
+    """
+    index = _identity_index(ctx)
+    if not index:
+        return 0
+    ranked = []
+    for position, summary in enumerate(summaries):
+        identity = None
+        for candidate in _summary_candidates(summary):
+            identity = index.get(candidate)
+            if identity is not None:
+                summary["identity"] = {
+                    "identity_id": identity.get("identity_id"),
+                    "candidate_id": identity.get("candidate_id"),
+                    "target": identity.get("target"),
+                    "verdict": identity.get("verdict"),
+                    "revision": identity.get("revision"),
+                }
+                if identity.get("anchor"):
+                    summary["anchor"] = identity.get("anchor")
+                    summary["anchor_source"] = identity.get("anchor_source")
+                break
+        if identity is not None and identity.get("verdict") == "accepted":
+            priority = 0
+        elif identity is not None:
+            priority = 1
+        elif summary.get("anchor"):
+            priority = 2
+        else:
+            priority = 3
+        ranked.append((priority, position, summary))
+    ranked.sort(key=lambda row: (row[0], row[1]))
+    summaries[:] = [row[2] for row in ranked]
+    return sum(1 for row in ranked if row[0] < 3)
 
 
 def query_memory(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
@@ -5191,9 +5675,20 @@ def query_memory(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
                 evidence.append(EvidenceRef(str(ref.get("kind", "observation")),
                                             str(ref["ref"]), str(ref.get("note", ""))))
         summary_hits.append(_hit_summary(hit))
+    identity_hits = _identity_hits(ctx, query)
     if not hits:
-        return ToolResult(STATUS_EMPTY, _no_match_data(ctx, memory, query), [])
+        data = _no_match_data(ctx, memory, query)
+        if identity_hits:
+            data["identities"] = identity_hits
+            data["anchors"] = [item["anchor"] for item in identity_hits if item.get("anchor")]
+            data["hint"] = (
+                "no episodic hit matches, but the identity layer remembers these "
+                "instances/anchors: use the candidate_id with compare_candidates "
+                "or approach_candidate"
+            )
+        return ToolResult(STATUS_EMPTY, data, [])
     goal_target = _goal_target_of(ctx)
+    ranked = _rank_by_identity(ctx, summary_hits)
     # what the evidence is for, best use first; then what each hit can carry
     suggestions = _suggested_use(ctx, summary_hits, goal_target)
     for summary in summary_hits:
@@ -5223,7 +5718,16 @@ def query_memory(ctx: ToolContext, args: dict, vlm: Any = None) -> ToolResult:
         "n_goal_frame_hits": sum(
             1 for hit in summary_hits if hit.get("evidence_kind") == EVIDENCE_KIND_GOAL_FRAME
         ),
+        "identity_priority_hits": ranked,
     }
+    if identity_hits:
+        data["identities"] = identity_hits
+        data["anchors"] = [item["anchor"] for item in identity_hits if item.get("anchor")]
+        data["identity_note"] = (
+            "identities/anchors first: these are the object fingerprints and "
+            "relation anchors you recorded (with the confirm verdict/revision), "
+            "not a fresh observation"
+        )
     if data["n_sighting_hits"] == 0:
         # a store without its episodic layer has no sighting to return, and the
         # hits it does answer with must not be read as one
