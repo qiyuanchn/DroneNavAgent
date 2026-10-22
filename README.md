@@ -79,7 +79,7 @@ DroneNavAgent/
 ├── scripts/                    # 运行、对比、验证、诊断与资源画像驱动
 │   ├── run_vlm_nav_tools.py  run_vlm_nav_m2_memory.py  run_vlm_nav_3dgs.py
 │   ├── run_motion_mission.py  run_mixed_mission.py  run_mixed_missions.py
-│   ├── make_mixed_mission_video.py
+│   ├── make_mixed_mission_video.py  run_semantic_corner_demo.py
 │   ├── compare_agent_configs.py  compare_decision_loop.py
 │   ├── verify_phase1.py  verify_long_horizon.py  diagnose_grounding.py
 │   ├── profile_resources.py  check_hardware_profile.py
@@ -233,6 +233,27 @@ sensor 的画质必须用 `--renderer higs`（`SplatWorldHiGS` +
 `HiGSUTRenderer`/`GaussianSplattingCamera`）。真实场景的起始位姿需要用该
 场景坐标；视频只是可视化 demo，不替代精度评测。
 
+## 一句 prompt 的语义 demo
+
+`scripts/run_semantic_corner_demo.py` 用真实 VLM 跑完整
+`search_target -> approach_candidate -> confirm_candidate -> verify_goal ->
+finish`，同时生成第一视角 MP4 和带 3DGS 点云/轨迹/目标的 XY 图：
+
+```bash
+python scripts/run_semantic_corner_demo.py \
+  --prompt "Find the mirror on the white dressing table at the right side of the bedroom and fly next to it." \
+  --ply /assets/scenes/bedroom.ply \
+  --start-pos 0.2772 -0.0595 0.1254 --start-yaw-deg 90 \
+  --renderer higs --device cuda:0 \
+  --base-url http://172.17.0.1:8000/v1 --model qwen3-vl-8b \
+  --width 640 --height 360 --out outputs/vlm_nav/semantic_demo/bedroom_mirror
+```
+
+输出 `first_person_demo.mp4`、`xy_trajectory.png`、`trajectory.npy` 和
+`summary.json`。示例实测：`cand_1`，approach `arrived`（remaining 0.02m），
+confirm `accepted`，verify `true`，finish `verified=true`。`--renderer cpu`
+可在无 GPU 环境跑同一套工具链（画质和速度较低）。
+
 ## 插件迁移、worker 与 profile（M3）
 
 - adapter plugins：`perception.core`（6 工具）、`navigation.core`（12 工具）、
@@ -318,7 +339,7 @@ python scripts/replay_accuracy.py \
 git clone git@github.com:qiyuanchn/DroneNavAgent.git
 cd DroneNavAgent
 python -m venv .venv && . .venv/bin/activate
-pip install -e '.[hf,mcp,test]'     # CPU 核心只需要 numpy/torch/Pillow
+pip install -e '.[hf,mcp,demo,test]'  # CPU 核心只需要 numpy/torch/Pillow
 
 pytest tests -q
 python -c "import vlm_nav"

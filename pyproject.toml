@@ -24,6 +24,8 @@ hf = ["transformers>=4.45", "accelerate>=0.30"]
 openai = ["requests>=2.28"]
 # stdio MCP server.
 mcp = ["mcp>=1.0", "anyio>=4.0"]
+# Mission demo videos and XY scene maps.
+demo = ["imageio>=2.31", "imageio-ffmpeg>=0.5", "matplotlib>=3.7"]
 test = ["pytest>=7.0"]
 
 [tool.setuptools.packages.find]
