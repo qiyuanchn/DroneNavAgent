@@ -43,6 +43,7 @@ import numpy as np
 import torch
 
 from vlm_nav.harness import SemanticNavHarness
+from vlm_nav.scene_combo import choose_start_pose, load_scene_combo
 from vlm_nav.vlm import make_backend
 from vlm_nav.world import (
     EnvWorld,
@@ -56,13 +57,17 @@ from vlm_nav.world import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--world", choices=["cpu", "higs", "env", "super"], default="cpu")
-    parser.add_argument("--ply", type=str, default=None, help="CPU world PLY")
+    parser.add_argument("--ply", type=str, default=None,
+                        help="CPU/HiGS 3DGS PLY/SPZ asset; optional with "
+                             "--semantic-manifest (uses its merged_ply)")
     parser.add_argument("--scene-scale", type=float, default=1.0)
     parser.add_argument("--min-opacity", type=float, default=0.0,
                         help="drop PLY Gaussians below this opacity at load")
     parser.add_argument("--combined-ply", type=str, default=None)
     parser.add_argument("--background-ply", type=str, default=None)
-    parser.add_argument("--semantic-manifest", type=str, default=None)
+    parser.add_argument("--semantic-manifest", type=str, default=None,
+                        help="DiffAero combo_*.json; supplies the merged asset, "
+                             "target, and scene bounds")
     parser.add_argument("--voxel-size", type=float, default=0.15)
     parser.add_argument("--target-name", type=str, default="target")
     parser.add_argument("--target-pos", type=float, nargs=3, default=None,
@@ -70,6 +75,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-radius", type=float, default=0.5)
     parser.add_argument("--start-pos", type=float, nargs=3, default=(0.0, 0.0, 1.0))
     parser.add_argument("--start-yaw-deg", type=float, default=0.0)
+    parser.add_argument("--auto-start", action="store_true",
+                        help="with --semantic-manifest: pick the start position/yaw "
+                             "from choose_start_pose instead of --start-pos")
     parser.add_argument("--z-min", type=float, default=0.2,
                         help="flyable floor of the splat world (FLU z, scene-centered)")
     parser.add_argument("--z-max", type=float, default=None,
@@ -121,7 +129,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-overrides", type=str, nargs="*", default=None,
                         help="extra hydra overrides for --world env")
     parser.add_argument("--target-index", type=int, default=None,
-                        help="fixed manifest target index for --world super")
+                        help="fixed manifest target index (cpu/higs/super)")
     parser.add_argument("--initial-yaw-mode", type=str, default="target",
                         choices=["target", "visible", "random"])
     parser.add_argument("--max-init-attempts", type=int, default=8,
@@ -157,24 +165,53 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.world in ("cpu", "higs"):
-        if not args.ply or not args.target_pos:
-            raise SystemExit("--world cpu/higs requires --ply and --target-pos")
-        target = TargetSpec(
-            name=args.target_name,
-            position_flu=tuple(args.target_pos),
-            radius_m=args.target_radius,
-        )
+        manifest = args.semantic_manifest
+        if not manifest and not args.ply:
+            raise SystemExit("--world cpu/higs requires --ply or --semantic-manifest")
+        if not manifest and not args.target_pos:
+            raise SystemExit(
+                "--world cpu/higs requires --target-pos or --semantic-manifest"
+            )
+        combo = load_scene_combo(manifest) if manifest else None
+        target_index = int(args.target_index or 0)
+        target = None
+        if args.target_pos:
+            target = TargetSpec(
+                name=args.target_name,
+                position_flu=tuple(args.target_pos),
+                radius_m=args.target_radius,
+            )
+        start_flu = tuple(args.start_pos)
+        start_yaw_deg = float(args.start_yaw_deg)
+        z_min = float(args.z_min)
+        z_max = args.z_max
+        if combo is not None:
+            if args.auto_start:
+                start_flu, start_yaw_deg = choose_start_pose(combo, target_index)
+                print(
+                    f"[vlm_nav] auto start pose: position_flu="
+                    f"({start_flu[0]:.2f}, {start_flu[1]:.2f}, {start_flu[2]:.2f}) "
+                    f"yaw_deg={start_yaw_deg:.1f}",
+                    flush=True,
+                )
+            ground_z = combo.ground_z_flu()
+            if z_min == 0.2:
+                z_min = ground_z + 0.2
+            if z_max is None:
+                z_max = ground_z + 4.0
         world_cls = SplatWorldHiGS if args.world == "higs" else SplatWorldCPU
         extra = {"device": args.device} if args.world == "higs" else {}
         world = world_cls(
-            ply_path=args.ply,
+            ply_path=args.ply or None,
             target=target,
-            start_flu=tuple(args.start_pos),
-            start_yaw_deg=args.start_yaw_deg,
+            semantic_manifest=manifest,
+            target_index=target_index,
+            start_flu=start_flu,
+            start_yaw_deg=start_yaw_deg,
             scene_scale=args.scene_scale,
             min_opacity=args.min_opacity,
-            z_min=args.z_min,
-            z_max=args.z_max,
+            z_min=z_min,
+            z_max=z_max,
             **extra,
         )
     else:

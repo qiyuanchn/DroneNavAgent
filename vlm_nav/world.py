@@ -51,6 +51,7 @@ from .cpu_renderer import (
     yaw_to_quat_xyzw,
 )
 from .observations import resolve_intrinsics
+from .scene_combo import load_scene_combo
 
 
 def diffaero_root() -> Path:
@@ -388,12 +389,17 @@ class _StandoffMixin:
 
 
 class SplatWorldCPU(_StandoffMixin):
-    """Kinematic drone inside a raw 3DGS PLY, rendered on CPU."""
+    """Kinematic drone inside a raw 3DGS PLY or a DiffAero combo manifest.
+
+    With ``semantic_manifest`` the manifest supplies the merged asset, the
+    target object (``target_index``) and the scene placements; ``self.combo``
+    exposes those entities to the map/annotation layers.
+    """
 
     def __init__(
         self,
-        ply_path: str | Path,
-        target: TargetSpec,
+        ply_path: str | Path | None = None,
+        target: TargetSpec | None = None,
         start_flu: tuple[float, float, float] = (0.0, 0.0, 0.0),
         start_yaw_deg: float = 0.0,
         width: int = 320,
@@ -407,7 +413,31 @@ class SplatWorldCPU(_StandoffMixin):
         z_max: float | None = None,
         bound_radius: float | None = None,
         min_opacity: float = 0.0,
+        semantic_manifest: str | Path | None = None,
+        target_index: int = 0,
     ):
+        combo = load_scene_combo(semantic_manifest) if semantic_manifest else None
+        if combo is not None:
+            if ply_path is None:
+                ply_path = combo.merged_ply
+            if target is None:
+                entity = combo.object_at(int(target_index))
+                target = TargetSpec(
+                    name=entity.name,
+                    position_flu=entity.position_flu,
+                    radius_m=max(float(entity.xy_radius_m), 0.05),
+                )
+        if ply_path is None:
+            raise ValueError(
+                "SplatWorldCPU needs a ply_path or a semantic_manifest with a merged_ply"
+            )
+        if target is None:
+            raise ValueError(
+                "SplatWorldCPU needs a target or a semantic_manifest with target objects"
+            )
+        self.combo = combo
+        self.target_index = int(target_index)
+        self.scene_manifest = combo.raw if combo is not None else None
         self.width, self.height, self.hfov_deg = int(width), int(height), float(hfov_deg)
         self._init_backend(ply_path, scene_scale=scene_scale, min_opacity=min_opacity)
         self.target = target

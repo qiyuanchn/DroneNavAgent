@@ -9,20 +9,23 @@ Pipeline (the same tools the agent uses):
 It writes:
 
 - a first-person MP4 assembled from every observation/action frame,
-- an XY scene map (coloured 3DGS points) with the flown trajectory and the
-  grounded candidate,
+- a top-down FLU XY map (coloured 3DGS points) with the flown trajectory, the
+  grounded candidate and, for a combination, every placed object/obstacle,
 - ``summary.json`` with the tool verdicts and evidence.
 
-The world can be the portable CPU renderer or DiffAero HiGS. With HiGS, run
-this script inside the GPU container with ``PYTHONPATH`` pointing at the
-DiffAero shim/repo; with CPU no GPU is needed.
+The world can be a raw 3DGS PLY or a DiffAero scene+object+obstacle
+combination manifest. A manifest supplies the merged PLY, the target object,
+the FLU placements and a search start pose that leaves the target near a room
+edge; ``--auto-start`` takes that pose, otherwise pass ``--start-pos``.
 
+    # raw PLY (the legacy bedroom defaults still apply when nothing is given)
     python scripts/run_semantic_corner_demo.py --renderer cpu \
       --ply /assets/scenes/bedroom.ply ... --out outputs/vlm_nav/semantic_demo
 
-    # inside the GPU container:
+    # DiffAero combination: ply/start/target come from the manifest
     python scripts/run_semantic_corner_demo.py --renderer higs --device cuda:0 \
-      --base-url http://172.17.0.1:8000/v1 --out outputs/vlm_nav/semantic_demo
+      --manifest /assets/combos/combo_000.json --auto-start \
+      --base-url http://172.17.0.1:8000/v1 --out outputs/vlm_nav/combo_demo
 """
 
 from __future__ import annotations
@@ -41,6 +44,12 @@ if str(REPO) not in sys.path:
 import numpy as np  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 
+from vlm_nav.scene_combo import (  # noqa: E402
+    choose_start_pose,
+    combo_summary,
+    load_scene_combo,
+    scene_flu_points,
+)
 from vlm_nav.tool_impl_navigation import register_navigation_tools  # noqa: E402
 from vlm_nav.tool_impl_perception import register_perception_tools  # noqa: E402
 from vlm_nav.tools import STATUS_FAILED, ToolContext, ToolRegistry  # noqa: E402
@@ -118,11 +127,26 @@ def _xy_map(
     prompt: str,
     width: int,
     height: int,
+    combo: Any = None,
+    target_index: int = 0,
+    scene_name: str | None = None,
 ) -> dict:
+    """Top-down FLU XY map of the scene, flight and placement annotations.
+
+    3DGS points are converted with :func:`vlm_nav.scene_combo.scene_flu_points`,
+    so the axes are the world x/y the planner uses (raw 3DGS x/y would be a
+    side view). With a ``SceneCombo`` every placed object (green square) and
+    obstacle (red triangle) is labelled, and the ground-truth target is a gold
+    star.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
+    def short(name: str, limit: int = 22) -> str:
+        text = str(name).strip() or "?"
+        return text if len(text) <= limit else text[: limit - 1] + "~"
 
     xyz = scene.xyz
     xyz = xyz.detach().float().cpu().numpy() if hasattr(xyz, "detach") else np.asarray(xyz)
@@ -136,28 +160,88 @@ def _xy_map(
         colors = colors[::step]
     if len(xyz) == 0:
         return {"error": "scene has no points"}
-    # Remove a thin floor/ceiling layer so furniture is visible from above.
-    z = xyz[:, 2]
-    z_min, z_max = float(np.percentile(z, 2)), float(np.percentile(z, 98))
-    keep = (z > z_min + 0.05) & (z < z_max - 0.05)
+    # 3DGS -> FLU; keep the furniture slab above the floor so the plan view
+    # shows objects instead of a floor/ceiling sheet.
+    points = scene_flu_points(xyz, scene.center)
+    z = points[:, 2]
+    if combo is not None:
+        ground = float(combo.ground_z_flu())
+        keep = (z > ground + 0.1) & (z < ground + 3.0)
+    else:
+        # No manifest: approximate the floor from the point cloud.
+        z_lo, z_hi = (float(v) for v in np.percentile(z, [2, 98]))
+        keep = (z > z_lo + 0.05) & (z < z_hi - 0.05)
     if keep.sum() < 100:
-        keep = np.ones(len(xyz), dtype=bool)
-    points = xyz[keep]
+        keep = np.ones(len(points), dtype=bool)
+    points = points[keep]
     point_colors = colors[keep] if colors is not None else None
+    bounds = None
+    if combo is not None:
+        # Clip to the navigable floor. The raw vertex bbox of a large scene can
+        # contain distant outliers, which would otherwise stretch the axes to
+        # hundreds of metres and hide the room.
+        (min_x, min_y), (max_x, max_y) = combo.xy_bounds_flu()
+        margin = 3.0
+        inside = (
+            (points[:, 0] >= min_x - margin) & (points[:, 0] <= max_x + margin)
+            & (points[:, 1] >= min_y - margin) & (points[:, 1] <= max_y + margin)
+        )
+        if inside.sum() >= 100:
+            points = points[inside]
+            if point_colors is not None:
+                point_colors = point_colors[inside]
+        bounds = (min_x, min_y, max_x, max_y)
+
     fig, ax = plt.subplots(figsize=(10, 8), dpi=150)
     ax.set_facecolor("#0b1018")
     fig.patch.set_facecolor("#0b1018")
-    scatter_kwargs = {"s": 1.2, "alpha": 0.5, "linewidths": 0}
+    scatter_kwargs = {"s": 1.2, "alpha": 0.5, "linewidths": 0, "zorder": 1}
     if point_colors is not None:
         scatter_kwargs["c"] = point_colors
     else:
         scatter_kwargs["c"] = "#9fb0c8"
     ax.scatter(points[:, 0], points[:, 1], **scatter_kwargs)
+    if combo is not None:
+        for index, entity in enumerate(combo.objects):
+            x, y = entity.position_flu[:2]
+            ax.scatter(
+                x, y, marker="s", s=70, c="#38e08b", edgecolors="black",
+                linewidths=0.5, zorder=4, label="placed object" if index == 0 else None,
+            )
+            ax.annotate(
+                short(entity.name), (x, y), xytext=(6, 4 + 9 * (index % 3)),
+                textcoords="offset points", color="#a9f5c8", fontsize=7, zorder=5,
+            )
+        for index, entity in enumerate(combo.obstacles):
+            x, y = entity.position_flu[:2]
+            ax.scatter(
+                x, y, marker="^", s=80, c="#ff5b5b", edgecolors="black",
+                linewidths=0.5, zorder=4, label="placed obstacle" if index == 0 else None,
+            )
+            ax.annotate(
+                short(entity.name), (x, y), xytext=(6, 4 + 9 * (index % 3)),
+                textcoords="offset points", color="#ffb3b3", fontsize=7, zorder=5,
+            )
+        if combo.objects:
+            target = combo.object_at(target_index)
+            tx, ty = target.position_flu[:2]
+            ax.scatter(
+                tx, ty, marker="*", s=240, c="#ffd700", edgecolors="black",
+                linewidths=0.7, zorder=6, label="ground-truth target",
+            )
+            ax.annotate(
+                "GT: " + short(target.name), (tx, ty), xytext=(8, -12),
+                textcoords="offset points", color="#ffe680", fontsize=8,
+                fontweight="bold", zorder=6,
+            )
     traj = np.asarray(trajectory, dtype=float).reshape(-1, 3) if trajectory else np.zeros((0, 3))
     if len(traj):
-        ax.plot(traj[:, 0], traj[:, 1], color="#ffd34d", lw=2.5, label="flown trajectory")
-        ax.scatter(traj[0, 0], traj[0, 1], c="#48e08b", s=80, marker="o", label="start")
-        ax.scatter(traj[-1, 0], traj[-1, 1], c="#ff6b8a", s=80, marker="X", label="end")
+        ax.plot(traj[:, 0], traj[:, 1], color="#ffd34d", lw=2.5, zorder=3,
+                label="flown trajectory")
+        ax.scatter(traj[0, 0], traj[0, 1], c="#48e08b", s=80, marker="o",
+                   zorder=4, label="start")
+        ax.scatter(traj[-1, 0], traj[-1, 1], c="#ff6b8a", s=80, marker="X",
+                   zorder=4, label="end")
         # heading ticks
         stride = max(1, len(traj) // 16)
         for index in range(0, len(traj) - 1, stride):
@@ -170,20 +254,29 @@ def _xy_map(
         cand = np.asarray(candidate_position, dtype=float).reshape(-1)
         if cand.size >= 2:
             ax.scatter(cand[0], cand[1], c="#ff4df0", s=140, marker="*",
-                       edgecolors="white", linewidths=0.6, label="grounded candidate")
+                       edgecolors="white", linewidths=0.6, zorder=7,
+                       label="grounded candidate")
             ax.annotate(
                 "grounded candidate", xy=(cand[0], cand[1]),
                 xytext=(8, 8), textcoords="offset points",
-                color="#ffb3f7", fontsize=8,
+                color="#ffb3f7", fontsize=8, zorder=7,
             )
+    name = scene_name or (combo.scene_name if combo is not None else "3DGS scene")
     ax.set_title(
-        "XY scene map (3DGS points coloured by RGB) + trajectory\n" + prompt[:110],
+        f"Top-down FLU XY map - {name}\n{prompt[:110]}",
         color="white", fontsize=10,
     )
-    ax.set_xlabel("x (m)", color="white")
-    ax.set_ylabel("y (m)", color="white")
+    ax.set_xlabel("x FLU (m)", color="white")
+    ax.set_ylabel("y FLU (m)", color="white")
     ax.tick_params(colors="white", labelsize=8)
-    ax.set_aspect("equal", adjustable="datalim")
+    if bounds is not None:
+        min_x, min_y, max_x, max_y = bounds
+        span = max(max_x - min_x, max_y - min_y) * 0.08
+        ax.set_xlim(min_x - span, max_x + span)
+        ax.set_ylim(min_y - span, max_y + span)
+        ax.set_aspect("equal", adjustable="box")
+    else:
+        ax.set_aspect("equal", adjustable="datalim")
     ax.grid(color="#2a3648", lw=0.4, alpha=0.5)
     legend = ax.legend(loc="upper right", fontsize=8, facecolor="#121a26", edgecolor="#4a5a70")
     for text in legend.get_texts():
@@ -197,6 +290,8 @@ def _xy_map(
         "scene_points": int(len(points)),
         "trajectory_points": int(len(traj)),
         "candidate_position": None if candidate_position is None else list(candidate_position),
+        "objects": 0 if combo is None else len(combo.objects),
+        "obstacles": 0 if combo is None else len(combo.obstacles),
     }
 
 
@@ -212,22 +307,76 @@ def run_demo(args: argparse.Namespace) -> dict:
     frames_dir.mkdir(parents=True, exist_ok=True)
     for path in frames_dir.glob("frame_*.png"):
         path.unlink()
-    target = TargetSpec("candidate", tuple(args.target_pos), radius_m=0.3)
-    if args.renderer == "higs":
-        world = SplatWorldHiGS(
-            args.ply, target,
-            start_flu=tuple(args.start_pos), start_yaw_deg=args.start_yaw_deg,
-            width=args.width, height=args.height, hfov_deg=86.0,
-            bound_radius=100.0, z_min=-20.0, z_max=20.0,
-            device=args.device,
-        )
+    combo = load_scene_combo(args.manifest) if args.manifest else None
+    if combo is not None:
+        ply = str(args.ply or combo.merged_ply)
+        if args.target_pos is None:
+            entity = combo.object_at(args.target_index)
+            radius_m = max(entity.xy_radius_m, 0.05)
+            target = TargetSpec(entity.name, entity.position_flu, radius_m=radius_m)
+            target_ground_truth = {
+                "source": "manifest",
+                "key": entity.key,
+                "name": entity.name,
+                "kind": entity.kind,
+                "target_index": args.target_index,
+                "position_flu": list(entity.position_flu),
+                "radius_m": radius_m,
+            }
+        else:
+            target = TargetSpec("candidate", tuple(args.target_pos), radius_m=0.3)
+            target_ground_truth = {
+                "source": "cli",
+                "name": "candidate",
+                "kind": "candidate",
+                "position_flu": list(args.target_pos),
+                "radius_m": 0.3,
+            }
+        if args.auto_start or args.start_pos is None:
+            start_flu, start_yaw = choose_start_pose(combo, args.target_index)
+            start_source = "auto" if args.auto_start else "combo"
+        else:
+            start_flu, start_yaw = tuple(args.start_pos), args.start_yaw_deg
+            start_source = "cli"
+        ground = combo.ground_z_flu()
+        z_min, z_max = ground + 0.2, ground + 4.0
     else:
-        world = SplatWorldCPU(
-            args.ply, target,
-            start_flu=tuple(args.start_pos), start_yaw_deg=args.start_yaw_deg,
-            width=args.width, height=args.height, hfov_deg=86.0,
-            bound_radius=100.0, z_min=-20.0, z_max=20.0,
+        ply = str(args.ply or DEFAULT_PLY)
+        target_pos = (
+            tuple(args.target_pos) if args.target_pos is not None else (0.0, 0.0, 0.0)
         )
+        target = TargetSpec("candidate", target_pos, radius_m=0.3)
+        target_ground_truth = {
+            "source": "cli" if args.target_pos is not None else "default",
+            "name": "candidate",
+            "kind": "candidate",
+            "position_flu": list(target_pos),
+            "radius_m": 0.3,
+        }
+        if args.start_pos is not None:
+            start_flu, start_source = tuple(args.start_pos), "cli"
+        else:
+            start_flu, start_source = tuple(DEFAULT_START), "default"
+        start_yaw = args.start_yaw_deg
+        z_min, z_max = -20.0, 20.0
+    world_kwargs: dict[str, Any] = {
+        "start_flu": start_flu,
+        "start_yaw_deg": start_yaw,
+        "width": args.width,
+        "height": args.height,
+        "hfov_deg": 86.0,
+        "bound_radius": 100.0,
+        "z_min": z_min,
+        "z_max": z_max,
+    }
+    if combo is not None:
+        # The world filters candidates/moves against the placed obstacles.
+        world_kwargs["semantic_manifest"] = args.manifest
+        world_kwargs["target_index"] = args.target_index
+    if args.renderer == "higs":
+        world = SplatWorldHiGS(ply, target, device=args.device, **world_kwargs)
+    else:
+        world = SplatWorldCPU(ply, target, **world_kwargs)
     vlm = OpenAIVLM(
         model=args.model, base_url=args.base_url,
         image_size=(args.width, args.height),
@@ -338,7 +487,11 @@ def run_demo(args: argparse.Namespace) -> dict:
         phase["name"] = "approach"
         task_id = ""
         for _ in range(args.approach_legs):
-            args_call = {"candidate_id": candidate_id, "max_legs": 1}
+            args_call = {
+                "candidate_id": candidate_id,
+                "max_legs": 1,
+                "standoff_m": args.approach_standoff,
+            }
             if task_id:
                 args_call = {"task_id": task_id, "max_legs": 1}
             step = registry.call("approach_candidate", args_call, ctx)
@@ -362,7 +515,12 @@ def run_demo(args: argparse.Namespace) -> dict:
         phase["name"] = "confirm"
         confirm = registry.call(
             "confirm_candidate",
-            {"candidate_id": candidate_id, "max_views": 2, "max_steps": 12},
+            {
+                "candidate_id": candidate_id,
+                "max_views": 2,
+                "max_steps": 12,
+                "standoff_m": args.approach_standoff,
+            },
             ctx,
         )
         results["confirm"] = {
@@ -428,6 +586,8 @@ def run_demo(args: argparse.Namespace) -> dict:
         world.scene, list(getattr(world, "trajectory", [])),
         candidate_position, out_dir / "xy_trajectory.png",
         prompt=args.prompt, width=args.width, height=args.height,
+        combo=combo, target_index=args.target_index,
+        scene_name=combo.scene_name if combo is not None else Path(ply).stem,
     )
     trajectory = np.asarray(getattr(world, "trajectory", []), dtype=float)
     if trajectory.size:
@@ -437,8 +597,17 @@ def run_demo(args: argparse.Namespace) -> dict:
         "prompt": args.prompt,
         "renderer": args.renderer,
         "model": args.model,
-        "start_position": list(args.start_pos),
-        "start_yaw_deg": args.start_yaw_deg,
+        "ply": ply,
+        "manifest": args.manifest,
+        "start_position": list(start_flu),
+        "start_yaw_deg": start_yaw,
+        "start_pose": {
+            "position_flu": list(start_flu),
+            "yaw_deg": start_yaw,
+            "source": start_source,
+        },
+        "target_ground_truth": target_ground_truth,
+        "combo": combo_summary(combo) if combo is not None else None,
         "candidate_id": candidate_id,
         "candidate_position": candidate_position,
         "results": results,
@@ -458,13 +627,26 @@ def run_demo(args: argparse.Namespace) -> dict:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
-    parser.add_argument("--ply", default=DEFAULT_PLY)
+    parser.add_argument("--manifest", default=None,
+                        help="DiffAero combo_*.json; supplies merged PLY, target, "
+                             "start pose and placement annotations")
+    parser.add_argument("--ply", default=None,
+                        help=f"3DGS PLY override (default: manifest merged_ply, "
+                             f"else {DEFAULT_PLY})")
+    parser.add_argument("--target-index", type=int, default=0,
+                        help="object index inside the manifest (default 0)")
+    parser.add_argument("--auto-start", action="store_true",
+                        help="use choose_start_pose(combo) instead of --start-pos "
+                             "(requires --manifest)")
     parser.add_argument("--renderer", choices=["cpu", "higs"], default="cpu")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--start-pos", type=float, nargs=3, default=DEFAULT_START)
+    parser.add_argument("--start-pos", type=float, nargs=3, default=None,
+                        help=f"start FLU position (default: combo auto-start, "
+                             f"else {DEFAULT_START})")
     parser.add_argument("--start-yaw-deg", type=float, default=90.0)
-    parser.add_argument("--target-pos", type=float, nargs=3, default=(0.0, 0.0, 0.0),
-                        help="dummy TargetSpec position (not used for grounding)")
+    parser.add_argument("--target-pos", type=float, nargs=3, default=None,
+                        help="TargetSpec position override (default: manifest object, "
+                             "else 0,0,0 dummy; not used for grounding)")
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=360)
     parser.add_argument("--fps", type=int, default=4)
@@ -479,6 +661,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scan-views", type=int, default=8)
     parser.add_argument("--search-steps", type=int, default=8)
     parser.add_argument("--approach-legs", type=int, default=10)
+    parser.add_argument("--approach-standoff", type=float, default=1.2,
+                        help="distance kept from the candidate on arrival; raise it "
+                             "for low floor objects so the confirmation view still "
+                             "contains the whole instance")
     parser.add_argument("--success-dist", type=float, default=1.8)
     parser.add_argument("--out", default=str(REPO / "outputs" / "vlm_nav" / "semantic_demo"))
     return parser

@@ -254,6 +254,78 @@ python scripts/run_semantic_corner_demo.py \
 confirm `accepted`，verify `true`，finish `verified=true`。`--renderer cpu`
 可在无 GPU 环境跑同一套工具链（画质和速度较低）。
 
+## 组合测试场景：scene + objects + obstacles
+
+`scripts/build_harness_scenes.py` 直接复用 DiffAero 的
+`third_party/diffaero/script/vlm_nav_make_scene.py` 和
+`create_scene_object_combination`：把 catalog 里的 3DGS scene、target object、
+obstacle 合并成一个 `.spz` + `combo_*.json` manifest，作为整套 harness 的
+测试环境。manifest 带 `object_positions_flu` / `obstacle_positions_flu` /
+bbox / 可导航地面网格；`vlm_nav/scene_combo.py` 解析这些字段，并用**可导航
+地面范围**（不是含远处离群点的原始 bbox）判断目标是否在场景边缘，再给出
+“背对目标、面向场景中心”的自动起点。
+
+构建（容器内；`/assets` 是 3DGS 资产库）：
+
+```bash
+docker exec -i dronenav-higs env PYTHONPATH=/tmp/diffaero_pkg:/workspace/DroneNavAgent \
+  /opt/miniconda3/envs/hyworld2/bin/python \
+  /workspace/DroneNavAgent/scripts/build_harness_scenes.py \
+  --preset warehouse_crate --seeds 0:4 --n 1 \
+  --out /workspace/DroneNavAgent/outputs/vlm_nav/harness_scenes2/warehouse
+```
+
+内置 preset：`warehouse_crate`（warehouse + wooden crate + barrier gate /
+jersey barrier）、`classroom_plant`（classroom + potted plant + broken barrier）、
+`gallery_plant`（museum gallery + potted plant + barrier gate）。每个 preset
+写出：
+
+- `<out>/<preset>/seed_<N>/combo_*.spz`、`*_background.spz`、`combo_*.json`
+- `<out>/matrix.json`：episodes 的 `combined_ply` / `background_ply` /
+  `semantic_manifest` / `target_index` / `instruction` / `start_pos` /
+  `start_yaw_deg` / `success_dist` / `target_edge_distance_m`
+- `<out>/build_summary.json`：每个 seed 的 edge、floor offset 和拒绝原因
+
+单条组合 demo 直接吃 manifest，目标、起点和场景范围都由它给出：
+
+```bash
+python scripts/run_semantic_corner_demo.py \
+  --manifest outputs/vlm_nav/harness_scenes2/warehouse/warehouse_crate/seed_1/combo_*.json \
+  --auto-start --renderer higs --device cuda:0 \
+  --base-url http://172.17.0.1:8000/v1 --model qwen3-vl-8b \
+  --width 640 --height 360 --out outputs/vlm_nav/combo_demo/warehouse_crate
+```
+
+XY 图现在是真正的 FLU 俯视图（原始 3DGS 点先做 `(-rel_z, -rel_x, rel_y)`
+变换），并标注所有放置的 object（绿方块）、obstacle（红三角）、ground-truth
+target（金色星）和 grounded candidate（品红星）。
+
+批量评测复用同一个 vLLM endpoint（同样在 GPU 容器内执行）；
+`--runner demo` 跑有界的 search→approach→confirm→verify 链路并产出视频/轨迹，
+`--runner tools` 跑完整 `AgentRuntime` 工具循环：
+
+```bash
+python scripts/run_combo_harness.py \
+  --matrix outputs/vlm_nav/harness_scenes2/matrix_all.json \
+  --out-root outputs/vlm_nav/combo_batch/run2 \
+  --runner demo --base-url http://172.17.0.1:8000/v1 \
+  --image-size 640 360
+```
+
+`matrix_summary.json` 汇总每条的 `success` / `success_evidence` /
+`finish_reason` / `final_distance_m` / `position_error_m` / `target_edge_distance_m`
+和总成功率。VLM 输入默认仍是 320×180；如果确认阶段的目标很小或贴地，
+320×180 的 identity 判定会退化，demo 建议用 640×360 渲染/确认，成本评测
+再用 320×180。
+
+实测（640×360，3 个 preset）：warehouse 和 classroom 的 finish `verified`，
+gallery 的 confirm 返回 `unverified`（但 grounded candidate 离 manifest GT
+只有 0.50m）；三条的候选位置相对 GT 平均误差 0.98m，warehouse 0.57m。
+`--runner tools` 是完整 `AgentRuntime` 的研究路径：在 16k context / 20 轮下
+它会停在 viewpoint 循环、没有收敛；组合环境的验收 demo 用 `--runner demo`。
+需要完整 runtime 时，优先提高 context 或减少 toolset，而不是每个 episode
+起一个 server。
+
 ## 插件迁移、worker 与 profile（M3）
 
 - adapter plugins：`perception.core`（6 工具）、`navigation.core`（12 工具）、
